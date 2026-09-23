@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+tessera-media.path = "crates/tessera-media"
+tessera-render.path = "crates/tessera-render"
+tessera-timeline.path = "crates/tessera-timeline"
+tessera-ui.path = "crates/tessera-ui"
+anyhow = "=1.0.104"
+ffmpeg-next = "=9.0.0"
+gpui = "=0.2.2"
+pollster = "=1.0.1"
+thiserror = "=2.0.21"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+wgpu = {
+    version = "=30.0.1",
+    default-features = false,
+    features = ["std", "parking_lot", "vulkan", "wgsl"]
+}

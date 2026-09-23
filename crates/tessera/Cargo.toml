@@ -1,0 +1,15 @@
+[package]
+name = "tessera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+tessera-media.workspace = true
+tessera-timeline.workspace = true
+tessera-ui.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

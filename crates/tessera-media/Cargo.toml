@@ -1,0 +1,11 @@
+[package]
+name = "tessera-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ffmpeg-next.workspace = true
+tessera-timeline.workspace = true
+thiserror.workspace = true
