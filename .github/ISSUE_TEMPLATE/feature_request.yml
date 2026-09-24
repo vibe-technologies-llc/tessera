@@ -1,0 +1,47 @@
+name: Feature request
+description: Suggest a new feature or an improvement to an existing one.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please search the existing issues first to see whether it has already been proposed.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what makes it hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How you would like Tessera to handle it.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: The part of Tessera the request is about.
+      multiple: true
+      options:
+        - Timeline and editing
+        - Media import and decoding
+        - Playback and viewer
+        - Effects and compositing
+        - Export and encoding
+        - Hardware acceleration
+        - User interface
+        - Other
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or workarounds you have tried, and how other editors handle it.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Mockups, screenshots, or anything else that helps explain the request.

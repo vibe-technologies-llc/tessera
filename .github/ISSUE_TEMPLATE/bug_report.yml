@@ -1,0 +1,95 @@
+name: Bug report
+description: Something in Tessera does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please search the existing issues first, and fill in as much of the form as you can.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that triggers the bug.
+      placeholder: |
+        1. Open Tessera
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected to happen instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tessera version or commit
+      description: The release version, or the output of `git rev-parse --short HEAD` if you built from source.
+    validations:
+      required: true
+  - type: input
+    id: distribution
+    attributes:
+      label: Linux distribution and kernel
+      placeholder: Arch Linux, kernel 6.10.5
+    validations:
+      required: true
+  - type: input
+    id: session
+    attributes:
+      label: Display server and desktop
+      placeholder: Wayland, GNOME 47
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: The GPU model and the Vulkan driver with its version.
+      placeholder: AMD Radeon RX 7800 XT, Mesa RADV 24.2.1
+    validations:
+      required: true
+  - type: input
+    id: ffmpeg
+    attributes:
+      label: FFmpeg version
+      description: The output of `ffmpeg -version | head -n1`.
+  - type: dropdown
+    id: hwaccel
+    attributes:
+      label: Hardware acceleration backend
+      description: The backend in use when the bug happened, if you know it.
+      options:
+        - Not sure
+        - None (software)
+        - VAAPI
+        - Vulkan
+        - CUDA
+        - QSV
+        - DRM
+  - type: textarea
+    id: media
+    attributes:
+      label: Media details
+      description: If the bug involves a specific file, its container, codecs, resolution and frame rate. `ffprobe <file>` output is ideal.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run Tessera with `RUST_LOG=debug` and paste the relevant output, including any panic message and backtrace.
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Screenshots, screen recordings, or anything else that helps.
