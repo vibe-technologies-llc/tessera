@@ -1,22 +1,29 @@
 use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div};
-use tessera_timeline::Project;
+use tessera_timeline::{Project, Timecode};
 
-use crate::theme;
+use crate::{playhead::Playhead, theme};
 
 pub struct Viewer {
     project: Entity<Project>,
+    playhead: Entity<Playhead>,
 }
 
 impl Viewer {
-    pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        project: Entity<Project>,
+        playhead: Entity<Playhead>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&project, |_, _, cx| cx.notify()).detach();
-        Self { project }
+        cx.observe(&playhead, |_, _, cx| cx.notify()).detach();
+        Self { project, playhead }
     }
 }
 
 impl Render for Viewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.project.read(cx).settings;
+        let timecode = Timecode::new(self.playhead.read(cx).time(), settings.frame_rate);
         let aspect_ratio = settings.width as f32 / settings.height as f32;
         let label = format!(
             "{}×{} · {:.3} fps",
@@ -38,9 +45,24 @@ impl Render for Viewer {
         div()
             .size_full()
             .p_4()
+            .gap_2()
             .flex()
-            .items_center()
-            .justify_center()
-            .child(frame)
+            .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(frame),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(timecode.to_string()),
+            )
     }
 }

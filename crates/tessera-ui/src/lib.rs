@@ -1,4 +1,5 @@
 mod media_bin;
+mod playhead;
 mod theme;
 mod timeline;
 mod viewer;

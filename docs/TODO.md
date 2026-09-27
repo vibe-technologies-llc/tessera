@@ -6,7 +6,6 @@
 
 ## Timeline editing
 
-- A time ruler with timecode and a playhead that can be clicked and dragged
 - Zoom and horizontal scroll, replacing the fixed `PIXELS_PER_SECOND`
 - Drag assets from the media bin onto a track
 - Select, move and trim clips while keeping the no-overlap invariant

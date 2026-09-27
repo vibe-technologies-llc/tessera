@@ -4,7 +4,9 @@ use gpui::{
 };
 use tessera_timeline::Project;
 
-use crate::{Import, media_bin::MediaBin, theme, timeline::TimelinePanel, viewer::Viewer};
+use crate::{
+    Import, media_bin::MediaBin, playhead::Playhead, theme, timeline::TimelinePanel, viewer::Viewer,
+};
 
 pub struct Workspace {
     project: Entity<Project>,
@@ -18,11 +20,12 @@ impl Workspace {
     pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        let playhead = cx.new(|_| Playhead::default());
         Self {
             focus_handle,
             media_bin: cx.new(|cx| MediaBin::new(project.clone(), cx)),
-            viewer: cx.new(|cx| Viewer::new(project.clone(), cx)),
-            timeline: cx.new(|cx| TimelinePanel::new(project.clone(), cx)),
+            viewer: cx.new(|cx| Viewer::new(project.clone(), playhead.clone(), cx)),
+            timeline: cx.new(|cx| TimelinePanel::new(project.clone(), playhead, cx)),
             project,
         }
     }

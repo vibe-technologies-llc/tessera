@@ -97,6 +97,14 @@ impl FrameRate {
         scaled.div_euclid(per_frame) as i64
     }
 
+    pub fn frame_start(self, time: Time) -> Time {
+        self.frame_to_time(self.time_to_frame(time))
+    }
+
+    pub fn nominal_frames_per_second(self) -> i64 {
+        i64::from(self.numerator.div_ceil(self.denominator.max(1)).max(1))
+    }
+
     pub fn as_f64(self) -> f64 {
         f64::from(self.numerator) / f64::from(self.denominator)
     }
@@ -168,6 +176,25 @@ mod tests {
         let almost_next = rate.frame_to_time(43) - Time::from_flicks(1);
         assert_eq!(rate.time_to_frame(start), 42);
         assert_eq!(rate.time_to_frame(almost_next), 42);
+    }
+
+    #[test]
+    fn frame_start_rounds_down_to_the_frame_boundary() {
+        let rate = FrameRate::NTSC_30;
+        let start = rate.frame_to_time(7);
+        assert_eq!(rate.frame_start(start), start);
+        assert_eq!(rate.frame_start(start + Time::from_flicks(1)), start);
+        assert_eq!(
+            rate.frame_start(start - Time::from_flicks(1)),
+            rate.frame_to_time(6)
+        );
+    }
+
+    #[test]
+    fn nominal_rate_rounds_ntsc_up() {
+        assert_eq!(FrameRate::NTSC_24.nominal_frames_per_second(), 24);
+        assert_eq!(FrameRate::NTSC_30.nominal_frames_per_second(), 30);
+        assert_eq!(FrameRate::FPS_25.nominal_frames_per_second(), 25);
     }
 
     #[test]

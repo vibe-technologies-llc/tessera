@@ -32,6 +32,10 @@ pub fn audio_clip() -> Rgba {
     rgb(0x3c8a5e)
 }
 
+pub fn playhead() -> Rgba {
+    rgb(0xf0a04b)
+}
+
 pub fn hover() -> Rgba {
     rgb(0x2d2f35)
 }
