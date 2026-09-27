@@ -1,3 +1,4 @@
+mod frame_image;
 mod media_bin;
 mod playhead;
 mod theme;

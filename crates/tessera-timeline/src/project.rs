@@ -155,6 +155,14 @@ impl Timeline {
             .max()
             .unwrap_or(Time::ZERO)
     }
+
+    pub fn top_video_clip_at(&self, time: Time) -> Option<&Clip> {
+        self.tracks
+            .iter()
+            .rev()
+            .filter(|track| track.kind == TrackKind::Video)
+            .find_map(|track| track.clip_at(time))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -414,5 +422,38 @@ mod tests {
             .place_clip(asset, 0, Time::from_seconds(-2))
             .unwrap();
         assert_eq!(clip.start, Time::ZERO);
+    }
+
+    #[test]
+    fn later_video_tracks_sit_on_top() {
+        let mut timeline = Timeline {
+            tracks: [TrackKind::Video, TrackKind::Video, TrackKind::Audio]
+                .map(Track::new)
+                .to_vec(),
+        };
+        let lower = Clip {
+            asset: AssetId(1),
+            ..clip(0, 4)
+        };
+        let upper = Clip {
+            asset: AssetId(2),
+            ..clip(2, 1)
+        };
+        let audio = Clip {
+            asset: AssetId(3),
+            ..clip(0, 8)
+        };
+        timeline.tracks[0].insert(lower).unwrap();
+        timeline.tracks[1].insert(upper).unwrap();
+        timeline.tracks[2].insert(audio).unwrap();
+        let top = |seconds| {
+            timeline
+                .top_video_clip_at(Time::from_seconds(seconds))
+                .map(|clip| clip.asset)
+        };
+        assert_eq!(top(1), Some(AssetId(1)));
+        assert_eq!(top(2), Some(AssetId(2)));
+        assert_eq!(top(3), Some(AssetId(1)));
+        assert_eq!(top(5), None);
     }
 }

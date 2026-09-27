@@ -23,13 +23,16 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   drop-frame (`;` before the frames) for the 30000/1001 and 60000/1001 rates. A `Track` keeps its
   clips sorted by start and refuses overlapping inserts. `Project::clip_for` builds the clip that
   would cover a whole asset at a start time on a track, checking the stream kind, the duration and
-  overlaps without mutating, and `Project::place_clip` inserts it.
+  overlaps without mutating, and `Project::place_clip` inserts it. Later video tracks sit on top of
+  earlier ones, so `Timeline::top_video_clip_at` searches them from the last.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and frame decode, and encode goes here.
   `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
   byte-bounded LRU cache keyed by the span each frame covers. FFmpeg types do not cross its public
-  API, apart from the `FfmpegError` re-export.
+  API, apart from the `FfmpegError` re-export. `VideoDecoder` is `Send` so it can move to a
+  background task: ffmpeg-next leaves its scaler context `!Send`, but an `SwsContext` has no thread
+  affinity and each one is owned by a single decoder, so `Scaler` implements `Send` by hand.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` (device + queue) for compositing timeline
   frames. It isn't wired into the UI yet.
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>`, and each panel
@@ -44,7 +47,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   background task, reporting failures in the bin itself. Thumbnails are UI state kept in the bin by
   `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
   previews the drop as a ghost (red where it would overlap) through `on_drag_move`, and the drop
-  places the clip at the previewed, frame-snapped start.
+  places the clip at the previewed, frame-snapped start. The `Viewer` shows the top video clip's
+  frame under the playhead, decoded at sequence size on a background task. It keeps one decoder
+  per asset and runs one decode at a time, so while scrubbing only the newest request is decoded
+  next, and it releases each replaced frame from the GPUI atlas with `Window::drop_image`.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.
 

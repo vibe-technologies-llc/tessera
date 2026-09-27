@@ -51,6 +51,8 @@ struct Scaler {
     source: (Pixel, u32, u32),
 }
 
+unsafe impl Send for Scaler {}
+
 impl VideoDecoder {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
@@ -322,6 +324,12 @@ mod tests {
 
     use super::*;
     use crate::fixture::{self, Fixture};
+
+    #[test]
+    fn decoder_moves_between_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<VideoDecoder>();
+    }
 
     fn middle_of_frame(rate: FrameRate, frame: i64) -> Time {
         rate.frame_to_time(frame) + Time::from_flicks(rate.frame_duration().flicks() / 2)

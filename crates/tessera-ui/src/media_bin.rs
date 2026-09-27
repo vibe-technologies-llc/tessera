@@ -12,7 +12,7 @@ use gpui::{
 use tessera_media::{VideoDecoder, VideoFrame, probe};
 use tessera_timeline::{Asset, AssetId, FLICKS_PER_SECOND, MediaInfo, Project, Time};
 
-use crate::theme;
+use crate::{frame_image::render_image, theme};
 
 const THUMBNAIL_WIDTH: u32 = 96;
 const THUMBNAIL_HEIGHT: u32 = 54;
@@ -348,12 +348,6 @@ fn decode_thumbnail(
             THUMBNAIL_HEIGHT * THUMBNAIL_PIXEL_DENSITY,
         )
         .frame_at(time)
-}
-
-fn render_image(frame: Arc<VideoFrame>) -> Option<Arc<RenderImage>> {
-    let frame = Arc::unwrap_or_clone(frame);
-    let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)?;
-    Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }
 
 fn duration_label(duration: Time) -> String {
