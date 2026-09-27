@@ -1,3 +1,4 @@
+mod cache;
 mod decode;
 #[cfg(test)]
 mod fixture;

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use ffmpeg_next::{Packet, Rational, codec, encoder, format, frame};
+use ffmpeg_next::{Dictionary, Packet, Rational, codec, encoder, format, frame};
 use tessera_timeline::FrameRate;
 
 pub const WIDTH: u32 = 64;
@@ -9,6 +9,7 @@ pub const FRAME_COUNT: i64 = 20;
 pub const FRAME_RATE: FrameRate = FrameRate::FPS_25;
 const KEYFRAME_INTERVAL: u32 = 5;
 const NEUTRAL_CHROMA: u8 = 128;
+const SCENE_CUT_DETECTION_OFF: &str = "1000000000";
 
 pub fn luma(index: i64) -> u8 {
     u8::try_from(20 + index * 10).expect("fixture luma stays in range")
@@ -63,7 +64,8 @@ fn encode(path: &Path) -> Result<(), ffmpeg_next::Error> {
     if global_header {
         video.set_flags(codec::Flags::GLOBAL_HEADER);
     }
-    let mut encoder = video.open_as(codec)?;
+    let options = Dictionary::from_iter([("sc_threshold", SCENE_CUT_DETECTION_OFF)]);
+    let mut encoder = video.open_as_with(codec, options)?;
     output.add_stream(codec)?.set_parameters(&encoder);
     output.write_header()?;
     let stream_time_base = output.stream(0).expect("stream was added").time_base();

@@ -1,21 +1,23 @@
 use std::{
-    mem,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use ffmpeg_next::{
     Rational, Rescale, codec, decoder,
-    ffi::AV_NOPTS_VALUE,
+    ffi::{AV_NOPTS_VALUE, AVSEEK_FLAG_BACKWARD, avformat_index_get_entry_from_timestamp},
     format::{self, Pixel},
     frame, media, rescale,
     software::scaling,
 };
 use tessera_timeline::{FLICKS_PER_SECOND, Time};
 
-use crate::Error;
+use crate::{Error, cache::FrameCache};
 
 const OUTPUT_FORMAT: Pixel = Pixel::BGRA;
 const BYTES_PER_PIXEL: usize = 4;
+const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const UNINDEXED_FORWARD_WINDOW: Time = Time::from_seconds(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFrame {
@@ -32,6 +34,14 @@ pub struct VideoDecoder {
     time_base: Rational,
     start: i64,
     decoder: decoder::Video,
+    converter: Converter,
+    current: Option<frame::Video>,
+    ahead: Option<frame::Video>,
+    drained: bool,
+    cache: FrameCache,
+}
+
+struct Converter {
     bounds: Option<(u32, u32)>,
     scaler: Option<Scaler>,
 }
@@ -71,19 +81,99 @@ impl VideoDecoder {
             time_base,
             start,
             decoder,
-            bounds: None,
-            scaler: None,
+            converter: Converter {
+                bounds: None,
+                scaler: None,
+            },
+            current: None,
+            ahead: None,
+            drained: false,
+            cache: FrameCache::new(DEFAULT_CACHE_BYTES),
         })
     }
 
     pub fn fit_within(mut self, width: u32, height: u32) -> Self {
-        self.bounds = Some((width.max(1), height.max(1)));
-        self.scaler = None;
+        self.converter = Converter {
+            bounds: Some((width.max(1), height.max(1))),
+            scaler: None,
+        };
+        self.cache.clear();
         self
     }
 
-    pub fn frame_at(&mut self, time: Time) -> Result<VideoFrame, Error> {
-        let target = self.start + to_stream_ts(time, self.time_base);
+    pub fn cache_capacity(mut self, bytes: usize) -> Self {
+        self.cache = FrameCache::new(bytes);
+        self
+    }
+
+    pub fn frame_at(&mut self, time: Time) -> Result<Arc<VideoFrame>, Error> {
+        let target = self.stream_ts(time);
+        if let Some(cached) = self.cache.get(target) {
+            return Ok(cached);
+        }
+        if self.needs_seek(target) {
+            self.seek(target)?;
+        }
+        self.decode_until(target)?;
+        let pts = |frame: &frame::Video| frame.timestamp();
+        let (frame, span) = match (&self.current, &self.ahead) {
+            (Some(current), Some(ahead)) => (current, pts(current).zip(pts(ahead))),
+            (Some(current), None) if self.drained => {
+                (current, pts(current).map(|start| (start, i64::MAX)))
+            }
+            (Some(current), None) => (current, None),
+            (None, Some(ahead)) => (ahead, None),
+            (None, None) => {
+                return Err(Error::NoFrame {
+                    path: self.path.clone(),
+                });
+            }
+        };
+        let frame_time = from_stream_ts(
+            pts(frame).unwrap_or(self.start) - self.start,
+            self.time_base,
+        );
+        let converted = Arc::new(self.converter.convert(frame, frame_time)?);
+        if let Some((start, end)) = span {
+            self.cache.insert(start..end, converted.clone());
+        }
+        Ok(converted)
+    }
+
+    fn stream_ts(&self, time: Time) -> i64 {
+        self.start + to_stream_ts(time, self.time_base)
+    }
+
+    fn needs_seek(&self, target: i64) -> bool {
+        let Some(position) = self.current.as_ref().and_then(|frame| frame.timestamp()) else {
+            return true;
+        };
+        if target < position {
+            return true;
+        }
+        if self.drained {
+            return false;
+        }
+        match self.keyframe_at_or_before(target) {
+            Some(keyframe) => keyframe > position,
+            None => target - position > to_stream_ts(UNINDEXED_FORWARD_WINDOW, self.time_base),
+        }
+    }
+
+    fn keyframe_at_or_before(&self, target: i64) -> Option<i64> {
+        let stream = self.input.stream(self.stream_index)?;
+        let entry = unsafe {
+            avformat_index_get_entry_from_timestamp(
+                stream.as_ptr().cast_mut(),
+                target,
+                AVSEEK_FLAG_BACKWARD,
+            )
+            .as_ref()
+        };
+        entry.map(|entry| entry.timestamp)
+    }
+
+    fn seek(&mut self, target: i64) -> Result<(), Error> {
         let seek_ts = target.rescale(self.time_base, rescale::TIME_BASE);
         self.input
             .seek(seek_ts, ..seek_ts)
@@ -92,48 +182,65 @@ impl VideoDecoder {
                 source,
             })?;
         self.decoder.flush();
-        let decoded = self.decode_until(target)?;
-        let frame = decoded.ok_or_else(|| Error::NoFrame {
-            path: self.path.clone(),
-        })?;
-        self.convert(&frame)
+        self.current = None;
+        self.ahead = None;
+        self.drained = false;
+        Ok(())
     }
 
-    fn decode_until(&mut self, target: i64) -> Result<Option<frame::Video>, Error> {
-        let mut candidate = None;
-        let mut decoded = frame::Video::empty();
-        let mut packets = self.input.packets();
-        loop {
-            let exhausted = match packets.next() {
-                Some((stream, _)) if stream.index() != self.stream_index => continue,
-                Some((_, packet)) => {
-                    match self.decoder.send_packet(&packet) {
-                        Ok(()) | Err(ffmpeg_next::Error::InvalidData) => {}
-                        Err(source) => return Err(Error::Decode { source }),
-                    }
-                    false
+    fn decode_until(&mut self, target: i64) -> Result<(), Error> {
+        while let Some(frame) = self.next_frame()? {
+            match frame.timestamp() {
+                Some(pts) if pts > target => {
+                    self.ahead = Some(frame);
+                    return Ok(());
                 }
+                Some(_) => self.current = Some(frame),
                 None => {
-                    self.decoder
-                        .send_eof()
-                        .map_err(|source| Error::Decode { source })?;
-                    true
-                }
-            };
-            while self.decoder.receive_frame(&mut decoded).is_ok() {
-                match decoded.timestamp() {
-                    Some(pts) if pts > target => return Ok(Some(candidate.unwrap_or(decoded))),
-                    Some(_) => candidate = Some(mem::replace(&mut decoded, frame::Video::empty())),
-                    None => return Ok(Some(decoded)),
+                    self.current = Some(frame);
+                    return Ok(());
                 }
             }
-            if exhausted {
-                return Ok(candidate);
+        }
+        Ok(())
+    }
+
+    fn next_frame(&mut self) -> Result<Option<frame::Video>, Error> {
+        if let Some(ahead) = self.ahead.take() {
+            return Ok(Some(ahead));
+        }
+        let mut frame = frame::Video::empty();
+        loop {
+            if self.decoder.receive_frame(&mut frame).is_ok() {
+                return Ok(Some(frame));
             }
+            if self.drained {
+                return Ok(None);
+            }
+            self.feed()?;
         }
     }
 
-    fn convert(&mut self, frame: &frame::Video) -> Result<VideoFrame, Error> {
+    fn feed(&mut self) -> Result<(), Error> {
+        for (stream, packet) in self.input.packets() {
+            if stream.index() != self.stream_index {
+                continue;
+            }
+            return match self.decoder.send_packet(&packet) {
+                Ok(()) | Err(ffmpeg_next::Error::InvalidData) => Ok(()),
+                Err(source) => Err(Error::Decode { source }),
+            };
+        }
+        self.decoder
+            .send_eof()
+            .map_err(|source| Error::Decode { source })?;
+        self.drained = true;
+        Ok(())
+    }
+}
+
+impl Converter {
+    fn convert(&mut self, frame: &frame::Video, time: Time) -> Result<VideoFrame, Error> {
         let source = (frame.format(), frame.width(), frame.height());
         let (width, height) = fitted_size(frame.width(), frame.height(), self.bounds);
         let scaler = match self.scaler.take() {
@@ -158,10 +265,6 @@ impl VideoDecoder {
             .context
             .run(frame, &mut scaled)
             .map_err(|source| Error::Decode { source })?;
-        let time = from_stream_ts(
-            frame.timestamp().unwrap_or(self.start) - self.start,
-            self.time_base,
-        );
         Ok(VideoFrame {
             width: scaled.width(),
             height: scaled.height(),
@@ -252,6 +355,56 @@ mod tests {
             assert_eq!(frame.time, fixture::FRAME_RATE.frame_to_time(index));
             assert_shows(&frame, index);
         }
+    }
+
+    #[test]
+    fn stepping_through_every_frame_without_a_cache() {
+        let fixture = Fixture::generate("stepping");
+        let mut decoder = VideoDecoder::open(fixture.path())
+            .unwrap()
+            .cache_capacity(0);
+        let forward = 0..fixture::FRAME_COUNT;
+        for index in forward.clone().chain(forward.rev()) {
+            let frame = decoder
+                .frame_at(fixture::FRAME_RATE.frame_to_time(index))
+                .unwrap();
+            assert_eq!(frame.time, fixture::FRAME_RATE.frame_to_time(index));
+            assert_shows(&frame, index);
+        }
+    }
+
+    #[test]
+    fn nearby_frames_decode_forward_and_distant_ones_seek() {
+        let fixture = Fixture::generate("seek_policy");
+        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let ts = |decoder: &VideoDecoder, index| {
+            decoder.stream_ts(middle_of_frame(fixture::FRAME_RATE, index))
+        };
+        assert!(decoder.needs_seek(ts(&decoder, 0)));
+        decoder
+            .frame_at(middle_of_frame(fixture::FRAME_RATE, 7))
+            .unwrap();
+        assert!(!decoder.needs_seek(ts(&decoder, 7)));
+        assert!(!decoder.needs_seek(ts(&decoder, 9)));
+        assert!(decoder.needs_seek(ts(&decoder, 6)));
+        assert!(decoder.needs_seek(ts(&decoder, 10)));
+        assert!(decoder.needs_seek(ts(&decoder, 17)));
+    }
+
+    #[test]
+    fn repeated_requests_within_a_frame_hit_the_cache() {
+        let fixture = Fixture::generate("cache_hits");
+        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let first = decoder
+            .frame_at(fixture::FRAME_RATE.frame_to_time(4))
+            .unwrap();
+        decoder
+            .frame_at(fixture::FRAME_RATE.frame_to_time(12))
+            .unwrap();
+        let again = decoder
+            .frame_at(middle_of_frame(fixture::FRAME_RATE, 4))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
     }
 
     #[test]

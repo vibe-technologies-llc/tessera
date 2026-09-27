@@ -22,9 +22,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `as_seconds_f64` exists only for drawing. A `Track` keeps its clips sorted by start and refuses
   overlapping inserts.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
-  system FFmpeg). It covers probing, hwaccel discovery and frame decode (`VideoDecoder`, which
-  seeks to the keyframe before a `Time` and returns a packed BGRA `VideoFrame`), and encode goes
-  here. FFmpeg types do not cross its public API, apart from the `FfmpegError` re-export.
+  system FFmpeg). It covers probing, hwaccel discovery and frame decode, and encode goes here.
+  `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
+  current position unless the stream index shows a keyframe past it, and keeps recent frames in a
+  byte-bounded LRU cache keyed by the span each frame covers. FFmpeg types do not cross its public
+  API, apart from the `FfmpegError` re-export.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` (device + queue) for compositing timeline
   frames. It isn't wired into the UI yet.
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>`, and each panel

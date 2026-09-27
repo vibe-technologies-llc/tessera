@@ -309,7 +309,7 @@ fn thumbnail(path: &Path, duration: Option<Time>) -> Option<Arc<RenderImage>> {
 fn decode_thumbnail(
     path: &Path,
     duration: Option<Time>,
-) -> Result<VideoFrame, tessera_media::Error> {
+) -> Result<Arc<VideoFrame>, tessera_media::Error> {
     let time = duration.map_or(Time::ZERO, |duration| {
         Time::from_flicks(duration.flicks() / THUMBNAIL_POSITION_DIVISOR)
     });
@@ -321,7 +321,8 @@ fn decode_thumbnail(
         .frame_at(time)
 }
 
-fn render_image(frame: VideoFrame) -> Option<Arc<RenderImage>> {
+fn render_image(frame: Arc<VideoFrame>) -> Option<Arc<RenderImage>> {
+    let frame = Arc::unwrap_or_clone(frame);
     let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)?;
     Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }
