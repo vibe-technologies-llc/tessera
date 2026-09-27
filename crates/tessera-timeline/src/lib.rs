@@ -1,6 +1,8 @@
+mod media;
 mod project;
 mod time;
 
+pub use media::{AudioStream, MediaInfo, Stream, VideoStream};
 pub use project::{
     Asset, AssetId, Clip, OverlappingClip, Project, SequenceSettings, Timeline, Track, TrackKind,
 };

@@ -3,7 +3,7 @@ mod probe;
 
 pub use ffmpeg_next::Error as FfmpegError;
 pub use hw::{HwAccel, available_hw_accels};
-pub use probe::{AudioStream, MediaInfo, Stream, VideoStream, probe};
+pub use probe::probe;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

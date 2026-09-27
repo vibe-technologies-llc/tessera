@@ -1,54 +1,9 @@
 use std::path::Path;
 
 use ffmpeg_next::{codec, ffi::AV_TIME_BASE, format, media};
-use tessera_timeline::{FrameRate, Time};
+use tessera_timeline::{AudioStream, FrameRate, MediaInfo, Stream, Time, VideoStream};
 
 use crate::Error;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MediaInfo {
-    pub duration: Option<Time>,
-    pub streams: Vec<Stream>,
-}
-
-impl MediaInfo {
-    pub fn video(&self) -> impl Iterator<Item = &VideoStream> {
-        self.streams.iter().filter_map(|stream| match stream {
-            Stream::Video(video) => Some(video),
-            Stream::Audio(_) => None,
-        })
-    }
-
-    pub fn audio(&self) -> impl Iterator<Item = &AudioStream> {
-        self.streams.iter().filter_map(|stream| match stream {
-            Stream::Audio(audio) => Some(audio),
-            Stream::Video(_) => None,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Stream {
-    Video(VideoStream),
-    Audio(AudioStream),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VideoStream {
-    pub index: usize,
-    pub codec: &'static str,
-    pub width: u32,
-    pub height: u32,
-    pub frame_rate: Option<FrameRate>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AudioStream {
-    pub index: usize,
-    pub codec: &'static str,
-    pub sample_rate: u32,
-    pub channels: u16,
-}
 
 pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo, Error> {
     let path = path.as_ref();
@@ -69,7 +24,7 @@ fn describe(stream: &format::stream::Stream) -> Result<Option<Stream>, Error> {
     let index = stream.index();
     let parameters = stream.parameters();
     let medium = parameters.medium();
-    let codec = parameters.id().name();
+    let codec = parameters.id().name().to_owned();
     let decoder = codec::Context::from_parameters(parameters)
         .map_err(|source| Error::Stream { index, source })?
         .decoder();

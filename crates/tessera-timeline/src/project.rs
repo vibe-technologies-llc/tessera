@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::time::{FrameRate, Time, TimeRange};
+use crate::{
+    media::MediaInfo,
+    time::{FrameRate, Time, TimeRange},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssetId(pub u64);
@@ -11,7 +14,7 @@ pub struct AssetId(pub u64);
 pub struct Asset {
     pub id: AssetId,
     pub path: PathBuf,
-    pub duration: Time,
+    pub info: MediaInfo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +154,7 @@ impl Project {
         self.assets.iter().find(|asset| asset.id == id)
     }
 
-    pub fn add_asset(&mut self, path: PathBuf, duration: Time) -> AssetId {
+    pub fn add_asset(&mut self, path: PathBuf, info: MediaInfo) -> AssetId {
         let id = AssetId(
             self.assets
                 .iter()
@@ -159,7 +162,7 @@ impl Project {
                 .max()
                 .unwrap_or(0),
         );
-        self.assets.push(Asset { id, path, duration });
+        self.assets.push(Asset { id, path, info });
         id
     }
 }
@@ -226,8 +229,8 @@ mod tests {
     #[test]
     fn asset_ids_are_unique() {
         let mut project = Project::new("test");
-        let a = project.add_asset("a.mkv".into(), Time::from_seconds(1));
-        let b = project.add_asset("b.mkv".into(), Time::from_seconds(1));
+        let a = project.add_asset("a.mkv".into(), MediaInfo::default());
+        let b = project.add_asset("b.mkv".into(), MediaInfo::default());
         assert_ne!(a, b);
         assert_eq!(
             project.asset(b).map(|asset| asset.path.clone()),

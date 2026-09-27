@@ -14,11 +14,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
 `tessera-timeline` ← `tessera-media`, `tessera-render` ← `tessera-ui` ← `tessera` (the binary).
 
 - **`tessera-timeline`** is the pure project model (`Project`, `Timeline`, `Track`, `Clip`,
-  `Asset`). It has no IO and no GPU, and it depends only on `thiserror`. Time is `Time(i64)` in
-  flicks (1/705 600 000 s). Every common frame rate, the NTSC 1000/1001 rates included, has an
-  integral frame duration in flicks, so frame ↔ time conversion through `FrameRate` stays exact.
-  Never store time as floating-point seconds; `as_seconds_f64` exists only for drawing. A `Track`
-  keeps its clips sorted by start and refuses overlapping inserts.
+  `Asset`). Each `Asset` carries its probed `MediaInfo` (duration and streams), so nothing outside
+  `tessera-media` has to call into FFmpeg to describe a clip. It has no IO and no GPU, and it
+  depends only on `thiserror`. Time is `Time(i64)` in flicks (1/705 600 000 s). Every common frame
+  rate, the NTSC 1000/1001 rates included, has an integral frame duration in flicks, so frame ↔ time
+  conversion through `FrameRate` stays exact. Never store time as floating-point seconds;
+  `as_seconds_f64` exists only for drawing. A `Track` keeps its clips sorted by start and refuses
+  overlapping inserts.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing and hwaccel discovery, and decode/encode goes here. FFmpeg types
   do not cross its public API, apart from the `FfmpegError` re-export.
@@ -27,7 +29,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>`, and each panel
   (`MediaBin`, `Viewer`, `TimelinePanel`) gets a clone of it and re-renders through
   `cx.observe(&project, …)`. Mutate the project through the entity so every panel updates.
-  Global actions and keybindings are registered in `tessera_ui::init`.
+  Global actions and keybindings are registered in `tessera_ui::init`; actions that need the
+  project are handled on the focused `Workspace`. `MediaBin` owns importing (dialog and drops) and
+  probes each file on a background task, reporting failures in the bin itself.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.
 

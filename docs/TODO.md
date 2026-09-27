@@ -1,10 +1,5 @@
 ## Import
 
-- Import files through a native file dialog and by dropping them onto the media bin
-- Probe imported files on a background task instead of the UI thread
-- Keep each asset's probed stream info on `Asset`, so the UI never needs `tessera-media` to describe
-  a clip
-- Report files that fail to probe in the UI, not only in the log
 - Show a thumbnail and the duration for each asset in the media bin
 
 ## Decode

@@ -31,3 +31,15 @@ pub fn video_clip() -> Rgba {
 pub fn audio_clip() -> Rgba {
     rgb(0x3c8a5e)
 }
+
+pub fn hover() -> Rgba {
+    rgb(0x2d2f35)
+}
+
+pub fn drop_target() -> Rgba {
+    rgb(0x263349)
+}
+
+pub fn error() -> Rgba {
+    rgb(0xe06c75)
+}
