@@ -22,8 +22,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `as_seconds_f64` exists only for drawing. A `Track` keeps its clips sorted by start and refuses
   overlapping inserts.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
-  system FFmpeg). It covers probing and hwaccel discovery, and decode/encode goes here. FFmpeg types
-  do not cross its public API, apart from the `FfmpegError` re-export.
+  system FFmpeg). It covers probing, hwaccel discovery and frame decode (`VideoDecoder`, which
+  seeks to the keyframe before a `Time` and returns a packed BGRA `VideoFrame`), and encode goes
+  here. FFmpeg types do not cross its public API, apart from the `FfmpegError` re-export.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` (device + queue) for compositing timeline
   frames. It isn't wired into the UI yet.
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>`, and each panel
@@ -31,7 +32,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `cx.observe(&project, …)`. Mutate the project through the entity so every panel updates.
   Global actions and keybindings are registered in `tessera_ui::init`; actions that need the
   project are handled on the focused `Workspace`. `MediaBin` owns importing (dialog and drops) and
-  probes each file on a background task, reporting failures in the bin itself.
+  probes each file and decodes its thumbnail on a background task, reporting failures in the bin
+  itself. Thumbnails are UI state kept in the bin by `AssetId`, not part of the project model.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.
 

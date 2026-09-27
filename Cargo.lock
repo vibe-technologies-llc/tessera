@@ -5628,6 +5628,7 @@ name = "tessera-ui"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "image",
  "tessera-media",
  "tessera-timeline",
  "tracing",

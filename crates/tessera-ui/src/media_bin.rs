@@ -1,14 +1,29 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, ExternalPaths, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, PathPromptOptions, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div,
+    IntoElement, ObjectFit, ParentElement, PathPromptOptions, Render, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px,
 };
-use tessera_media::probe;
-use tessera_timeline::{MediaInfo, Project};
+use tessera_media::{VideoDecoder, VideoFrame, probe};
+use tessera_timeline::{Asset, AssetId, FLICKS_PER_SECOND, MediaInfo, Project, Time};
 
 use crate::theme;
+
+const THUMBNAIL_WIDTH: u32 = 96;
+const THUMBNAIL_HEIGHT: u32 = 54;
+const THUMBNAIL_PIXEL_DENSITY: u32 = 2;
+const THUMBNAIL_POSITION_DIVISOR: i64 = 10;
+const UNKNOWN_DURATION: &str = "--:--";
+
+struct Imported {
+    info: MediaInfo,
+    thumbnail: Option<Arc<RenderImage>>,
+}
 
 struct ImportFailure {
     source: SharedString,
@@ -19,6 +34,7 @@ pub struct MediaBin {
     project: Entity<Project>,
     probing: Vec<PathBuf>,
     failures: Vec<ImportFailure>,
+    thumbnails: HashMap<AssetId, Arc<RenderImage>>,
 }
 
 impl MediaBin {
@@ -28,6 +44,7 @@ impl MediaBin {
             project,
             probing: Vec::new(),
             failures: Vec::new(),
+            thumbnails: HashMap::new(),
         }
     }
 
@@ -67,7 +84,7 @@ impl MediaBin {
             self.probing.push(path.clone());
             let probed = cx.background_spawn({
                 let path = path.clone();
-                async move { probe(path) }
+                async move { import_file(&path) }
             });
             cx.spawn(async move |this, cx| {
                 let probed = probed.await;
@@ -82,18 +99,23 @@ impl MediaBin {
     fn finish_probe(
         &mut self,
         path: PathBuf,
-        probed: Result<MediaInfo, tessera_media::Error>,
+        probed: Result<Imported, tessera_media::Error>,
         cx: &mut Context<Self>,
     ) {
         self.probing.retain(|probing| *probing != path);
         match probed {
-            Ok(info) if info.streams.is_empty() => {
+            Ok(imported) if imported.info.streams.is_empty() => {
                 self.fail(file_name(&path), "no audio or video streams".into(), cx);
             }
-            Ok(info) => self.project.update(cx, |project, cx| {
-                project.add_asset(path, info);
-                cx.notify();
-            }),
+            Ok(Imported { info, thumbnail }) => {
+                let id = self.project.update(cx, |project, cx| {
+                    cx.notify();
+                    project.add_asset(path, info)
+                });
+                if let Some(thumbnail) = thumbnail {
+                    self.thumbnails.insert(id, thumbnail);
+                }
+            }
             Err(error) => self.fail(file_name(&path), error.to_string(), cx),
         }
         cx.notify();
@@ -128,7 +150,7 @@ impl MediaBin {
         }
         let assets = assets
             .iter()
-            .map(|asset| row(file_name(&asset.path)).into_any_element());
+            .map(|asset| asset_row(asset, self.thumbnails.get(&asset.id)).into_any_element());
         let probing = self.probing.iter().map(|path| {
             row(file_name(path))
                 .flex()
@@ -215,6 +237,105 @@ fn row(name: SharedString) -> gpui::Div {
     div().px_3().py_1().child(name)
 }
 
+fn asset_row(asset: &Asset, thumbnail: Option<&Arc<RenderImage>>) -> impl IntoElement {
+    let duration = asset
+        .info
+        .duration
+        .map_or_else(|| UNKNOWN_DURATION.to_owned(), duration_label);
+    div()
+        .px_3()
+        .py_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(thumbnail_frame(asset, thumbnail))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(div().truncate().child(file_name(&asset.path)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(duration),
+                ),
+        )
+}
+
+fn thumbnail_frame(asset: &Asset, thumbnail: Option<&Arc<RenderImage>>) -> impl IntoElement {
+    let frame = div()
+        .w(px(THUMBNAIL_WIDTH as f32))
+        .h(px(THUMBNAIL_HEIGHT as f32))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .overflow_hidden()
+        .bg(theme::frame())
+        .text_xs()
+        .text_color(theme::text_muted());
+    match thumbnail {
+        Some(thumbnail) => frame.child(
+            img(thumbnail.clone())
+                .size_full()
+                .object_fit(ObjectFit::Contain),
+        ),
+        None if asset.info.video().next().is_none() => frame.child("Audio"),
+        None => frame,
+    }
+}
+
+fn import_file(path: &Path) -> Result<Imported, tessera_media::Error> {
+    let info = probe(path)?;
+    let has_video = info.video().next().is_some();
+    let thumbnail = has_video.then(|| thumbnail(path, info.duration)).flatten();
+    Ok(Imported { info, thumbnail })
+}
+
+fn thumbnail(path: &Path, duration: Option<Time>) -> Option<Arc<RenderImage>> {
+    match decode_thumbnail(path, duration) {
+        Ok(frame) => render_image(frame),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "thumbnail failed");
+            None
+        }
+    }
+}
+
+fn decode_thumbnail(
+    path: &Path,
+    duration: Option<Time>,
+) -> Result<VideoFrame, tessera_media::Error> {
+    let time = duration.map_or(Time::ZERO, |duration| {
+        Time::from_flicks(duration.flicks() / THUMBNAIL_POSITION_DIVISOR)
+    });
+    VideoDecoder::open(path)?
+        .fit_within(
+            THUMBNAIL_WIDTH * THUMBNAIL_PIXEL_DENSITY,
+            THUMBNAIL_HEIGHT * THUMBNAIL_PIXEL_DENSITY,
+        )
+        .frame_at(time)
+}
+
+fn render_image(frame: VideoFrame) -> Option<Arc<RenderImage>> {
+    let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)?;
+    Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
+}
+
+fn duration_label(duration: Time) -> String {
+    let seconds = (duration.flicks() + FLICKS_PER_SECOND / 2).div_euclid(FLICKS_PER_SECOND);
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 fn file_name(path: &Path) -> SharedString {
     path.file_name()
         .map_or_else(
@@ -222,4 +343,20 @@ fn file_name(path: &Path) -> SharedString {
             |name| name.to_string_lossy().into_owned(),
         )
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_round_to_the_nearest_second() {
+        let label = |flicks| duration_label(Time::from_flicks(flicks));
+        assert_eq!(label(0), "0:00");
+        assert_eq!(label(FLICKS_PER_SECOND / 2 - 1), "0:00");
+        assert_eq!(label(FLICKS_PER_SECOND / 2), "0:01");
+        assert_eq!(duration_label(Time::from_seconds(59)), "0:59");
+        assert_eq!(duration_label(Time::from_seconds(61)), "1:01");
+        assert_eq!(duration_label(Time::from_seconds(3600 + 62)), "1:01:02");
+    }
 }

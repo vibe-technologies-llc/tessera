@@ -1,7 +1,3 @@
-## Import
-
-- Show a thumbnail and the duration for each asset in the media bin
-
 ## Decode
 
 - A cache of recent frames for scrubbing, and decoding forward instead of seeking when the requested
