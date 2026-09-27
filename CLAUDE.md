@@ -65,3 +65,6 @@ and a Vulkan driver.
   let it settle the rest.
 - **Large work is split into waves across conversations.** Each conversation lands a small,
   self-contained piece that builds and passes the checks above, rather than one sweeping change.
+- **`docs/TODO.md` is the roadmap.** It is a list of `## entry` headings, each with `- item`
+  bullets. Remove an item in the same change that completes it, and an entry once it has no items
+  left.
