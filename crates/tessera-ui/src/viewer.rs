@@ -12,7 +12,11 @@ use gpui::{
 use tessera_media::VideoDecoder;
 use tessera_timeline::{AssetId, Project, Time, Timecode};
 
-use crate::{frame_image::render_image, playhead::Playhead, theme};
+use crate::{
+    frame_image::render_image,
+    playhead::{Playhead, Speed},
+    theme,
+};
 
 type Decoders = HashMap<AssetId, VideoDecoder>;
 
@@ -152,7 +156,9 @@ impl Render for Viewer {
             }
         }
         let settings = self.project.read(cx).settings;
-        let timecode = Timecode::new(self.playhead.read(cx).time(), settings.frame_rate);
+        let playhead = self.playhead.read(cx);
+        let timecode = Timecode::new(playhead.time(), settings.frame_rate);
+        let speed = speed_label(playhead.speed());
         let aspect_ratio = settings.width as f32 / settings.height as f32;
         let placeholder = format!(
             "{}×{} · {:.3} fps",
@@ -192,8 +198,19 @@ impl Render for Viewer {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(timecode.to_string()),
+                    .gap_3()
+                    .child(timecode.to_string())
+                    .children(speed.map(|speed| div().text_color(theme::playhead()).child(speed))),
             )
+    }
+}
+
+fn speed_label(speed: Speed) -> Option<String> {
+    let factor = speed.factor();
+    match factor {
+        0 => None,
+        1.. => Some(format!("▶ {factor}×")),
+        _ => Some(format!("◀ {}×", factor.unsigned_abs())),
     }
 }
 

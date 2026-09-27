@@ -39,10 +39,16 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   (`MediaBin`, `Viewer`, `TimelinePanel`) gets a clone of it and re-renders through
   `cx.observe(&project, …)`. Mutate the project through the entity so every panel updates. Global
   actions and keybindings are registered in `tessera_ui::init`; actions that need the project are
-  handled on the focused `Workspace`. The `Workspace` also owns an `Entity<Playhead>` shared the
-  same way: the playhead is UI state, not part of the project, and scrubbing snaps it to frame
-  starts. The timeline's ruler is a `canvas` that paints its ticks and timecode labels and scrubs
-  the playhead through window mouse listeners, so a drag keeps tracking outside the ruler.
+  handled on the focused `Workspace`, whose key context (`WORKSPACE_CONTEXT`) scopes the
+  single-key transport bindings. The `Workspace` also owns an `Entity<Playhead>` shared the same
+  way: the playhead is UI state, not part of the project, and scrubbing snaps it to frame starts.
+  The playhead also runs the transport: space plays and pauses, J/K/L shuttle (each press doubles
+  the speed up to 8× in that direction) and the arrow keys step one frame. Playing anchors a wall
+  clock at the start time and a ticker task moves the playhead to the frame start under
+  `anchor + elapsed × speed`, so it never drifts, and stops on the timeline's last frame or at
+  zero. Any seek or step pauses playback. The timeline's ruler is a `canvas` that paints its ticks
+  and timecode labels and scrubs the playhead through window mouse listeners, so a drag keeps
+  tracking outside the ruler.
   `MediaBin` owns importing (dialog and drops) and probes each file and decodes its thumbnail on a
   background task, reporting failures in the bin itself. Thumbnails are UI state kept in the bin by
   `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane

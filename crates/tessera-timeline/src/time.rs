@@ -1,5 +1,5 @@
 use std::{
-    ops::{Add, Sub},
+    ops::{Add, Mul, Sub},
     time::Duration,
 };
 
@@ -33,6 +33,11 @@ impl Time {
         self.0 as f64 / FLICKS_PER_SECOND as f64
     }
 
+    pub fn from_duration(duration: Duration) -> Self {
+        let flicks = duration.as_nanos() * FLICKS_PER_SECOND as u128 / 1_000_000_000;
+        Self(i64::try_from(flicks).unwrap_or(i64::MAX))
+    }
+
     pub fn to_duration(self) -> Duration {
         let flicks = self.0.max(0);
         let seconds = flicks / FLICKS_PER_SECOND;
@@ -47,6 +52,14 @@ impl Add for Time {
 
     fn add(self, other: Self) -> Self {
         Self(self.0 + other.0)
+    }
+}
+
+impl Mul<i64> for Time {
+    type Output = Self;
+
+    fn mul(self, factor: i64) -> Self {
+        Self(self.0 * factor)
     }
 }
 
@@ -137,6 +150,25 @@ impl TimeRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_convert_to_flicks_and_back() {
+        let duration = Duration::from_millis(1_500);
+        let time = Time::from_duration(duration);
+        assert_eq!(time, Time::from_flicks(FLICKS_PER_SECOND * 3 / 2));
+        assert_eq!(time.to_duration(), duration);
+        assert_eq!(Time::from_duration(Duration::from_nanos(1)), Time::ZERO);
+        assert_eq!(
+            Time::from_duration(Duration::MAX),
+            Time::from_flicks(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn times_scale_by_signed_factors() {
+        assert_eq!(Time::from_seconds(2) * 4, Time::from_seconds(8));
+        assert_eq!(Time::from_seconds(2) * -1, Time::from_seconds(-2));
+    }
 
     const RATES: [FrameRate; 7] = [
         FrameRate::FPS_24,

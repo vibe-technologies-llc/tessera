@@ -15,13 +15,33 @@ pub use workspace::Workspace;
 
 pub const APP_ID: &str = "tessera";
 
-actions!(tessera, [Quit, Import]);
+pub const WORKSPACE_CONTEXT: &str = "Workspace";
+
+actions!(
+    tessera,
+    [
+        Quit,
+        Import,
+        PlayPause,
+        ShuttleBackward,
+        Pause,
+        ShuttleForward,
+        StepBackward,
+        StepForward
+    ]
+);
 
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.bind_keys([
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("ctrl-i", Import, None),
+        KeyBinding::new("space", PlayPause, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("j", ShuttleBackward, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("k", Pause, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("l", ShuttleForward, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("left", StepBackward, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("right", StepForward, Some(WORKSPACE_CONTEXT)),
     ]);
 }
 

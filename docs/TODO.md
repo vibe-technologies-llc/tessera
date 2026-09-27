@@ -15,7 +15,6 @@
 
 ## Playback
 
-- Play, pause, JKL shuttle and frame stepping
 - Audio output through PipeWire, with the audio clock driving A/V sync
 - Drop frames rather than drift when decode or compositing falls behind
 
