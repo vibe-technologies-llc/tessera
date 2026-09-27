@@ -7,7 +7,6 @@
 ## Timeline editing
 
 - Zoom and horizontal scroll, replacing the fixed `PIXELS_PER_SECOND`
-- Drag assets from the media bin onto a track
 - Select, move and trim clips while keeping the no-overlap invariant
 - Split at the playhead, delete and ripple delete
 - Add, remove and reorder tracks

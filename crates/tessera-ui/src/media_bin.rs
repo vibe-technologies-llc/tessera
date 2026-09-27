@@ -20,6 +20,27 @@ const THUMBNAIL_PIXEL_DENSITY: u32 = 2;
 const THUMBNAIL_POSITION_DIVISOR: i64 = 10;
 const UNKNOWN_DURATION: &str = "--:--";
 
+#[derive(Clone)]
+pub struct DraggedAsset {
+    pub id: AssetId,
+    name: SharedString,
+}
+
+impl Render for DraggedAsset {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::hover())
+            .text_sm()
+            .text_color(theme::text())
+            .child(self.name.clone())
+    }
+}
+
 struct Imported {
     info: MediaInfo,
     thumbnail: Option<Arc<RenderImage>>,
@@ -242,12 +263,20 @@ fn asset_row(asset: &Asset, thumbnail: Option<&Arc<RenderImage>>) -> impl IntoEl
         .info
         .duration
         .map_or_else(|| UNKNOWN_DURATION.to_owned(), duration_label);
+    let dragged = DraggedAsset {
+        id: asset.id,
+        name: file_name(&asset.path),
+    };
     div()
+        .id(("asset", asset.id.0))
         .px_3()
         .py_1()
         .flex()
         .items_center()
         .gap_2()
+        .cursor_grab()
+        .hover(|style| style.bg(theme::hover()))
+        .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
         .child(thumbnail_frame(asset, thumbnail))
         .child(
             div()
@@ -337,7 +366,7 @@ fn duration_label(duration: Time) -> String {
     }
 }
 
-fn file_name(path: &Path) -> SharedString {
+pub fn file_name(path: &Path) -> SharedString {
     path.file_name()
         .map_or_else(
             || path.display().to_string(),

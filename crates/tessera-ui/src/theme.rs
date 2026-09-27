@@ -1,4 +1,4 @@
-use gpui::{Rgba, rgb};
+use gpui::{Rgba, rgb, rgba};
 
 pub fn background() -> Rgba {
     rgb(0x1a1b1e)
@@ -46,4 +46,12 @@ pub fn drop_target() -> Rgba {
 
 pub fn error() -> Rgba {
     rgb(0xe06c75)
+}
+
+pub fn drop_ghost() -> Rgba {
+    rgba(0xe4e5e959)
+}
+
+pub fn drop_ghost_blocked() -> Rgba {
+    rgba(0xe06c7566)
 }

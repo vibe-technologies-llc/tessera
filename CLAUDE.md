@@ -21,7 +21,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   conversion through `FrameRate` stays exact. Never store time as floating-point seconds;
   `as_seconds_f64` exists only for drawing. `Timecode` labels a time at a frame rate, using
   drop-frame (`;` before the frames) for the 30000/1001 and 60000/1001 rates. A `Track` keeps its
-  clips sorted by start and refuses overlapping inserts.
+  clips sorted by start and refuses overlapping inserts. `Project::clip_for` builds the clip that
+  would cover a whole asset at a start time on a track, checking the stream kind, the duration and
+  overlaps without mutating, and `Project::place_clip` inserts it.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and frame decode, and encode goes here.
   `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
@@ -40,7 +42,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   the playhead through window mouse listeners, so a drag keeps tracking outside the ruler.
   `MediaBin` owns importing (dialog and drops) and probes each file and decodes its thumbnail on a
   background task, reporting failures in the bin itself. Thumbnails are UI state kept in the bin by
-  `AssetId`, not part of the project model.
+  `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
+  previews the drop as a ghost (red where it would overlap) through `on_drag_move`, and the drop
+  places the clip at the previewed, frame-snapped start.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.
 

@@ -17,6 +17,15 @@ pub struct Asset {
     pub info: MediaInfo,
 }
 
+impl Asset {
+    pub fn has_stream(&self, kind: TrackKind) -> bool {
+        match kind {
+            TrackKind::Video => self.info.video().next().is_some(),
+            TrackKind::Audio => self.info.audio().next().is_some(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SequenceSettings {
     pub width: u32,
@@ -66,6 +75,20 @@ pub struct OverlappingClip {
     pub existing: TimeRange,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum PlaceClipError {
+    #[error("there is no asset {0:?}")]
+    UnknownAsset(AssetId),
+    #[error("there is no track {0}")]
+    UnknownTrack(usize),
+    #[error("the asset has no known duration")]
+    NoDuration,
+    #[error("the asset has no {0:?} stream")]
+    MissingStream(TrackKind),
+    #[error(transparent)]
+    Overlapping(#[from] OverlappingClip),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Track {
     pub kind: TrackKind,
@@ -84,16 +107,20 @@ impl Track {
         &self.clips
     }
 
-    pub fn insert(&mut self, clip: Clip) -> Result<(), OverlappingClip> {
-        let inserted = clip.timeline_range();
-        if let Some(existing) = self
+    pub fn check_free(&self, inserted: TimeRange) -> Result<(), OverlappingClip> {
+        match self
             .clips
             .iter()
             .map(Clip::timeline_range)
             .find(|existing| existing.overlaps(inserted))
         {
-            return Err(OverlappingClip { inserted, existing });
+            Some(existing) => Err(OverlappingClip { inserted, existing }),
+            None => Ok(()),
         }
+    }
+
+    pub fn insert(&mut self, clip: Clip) -> Result<(), OverlappingClip> {
+        self.check_free(clip.timeline_range())?;
         let index = self.clips.partition_point(|other| other.start < clip.start);
         self.clips.insert(index, clip);
         Ok(())
@@ -165,11 +192,54 @@ impl Project {
         self.assets.push(Asset { id, path, info });
         id
     }
+
+    pub fn clip_for(
+        &self,
+        asset: AssetId,
+        track: usize,
+        start: Time,
+    ) -> Result<Clip, PlaceClipError> {
+        let asset = self
+            .asset(asset)
+            .ok_or(PlaceClipError::UnknownAsset(asset))?;
+        let track_ref = self
+            .timeline
+            .tracks
+            .get(track)
+            .ok_or(PlaceClipError::UnknownTrack(track))?;
+        if !asset.has_stream(track_ref.kind) {
+            return Err(PlaceClipError::MissingStream(track_ref.kind));
+        }
+        let duration = asset
+            .info
+            .duration
+            .filter(|duration| *duration > Time::ZERO)
+            .ok_or(PlaceClipError::NoDuration)?;
+        let clip = Clip {
+            asset: asset.id,
+            source: TimeRange::new(Time::ZERO, duration),
+            start: start.max(Time::ZERO),
+        };
+        track_ref.check_free(clip.timeline_range())?;
+        Ok(clip)
+    }
+
+    pub fn place_clip(
+        &mut self,
+        asset: AssetId,
+        track: usize,
+        start: Time,
+    ) -> Result<Clip, PlaceClipError> {
+        let clip = self.clip_for(asset, track, start)?;
+        self.timeline.tracks[track].insert(clip)?;
+        Ok(clip)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::{AudioStream, Stream, VideoStream};
 
     fn clip(start: i64, duration: i64) -> Clip {
         Clip {
@@ -236,5 +306,113 @@ mod tests {
             project.asset(b).map(|asset| asset.path.clone()),
             Some("b.mkv".into())
         );
+    }
+
+    fn video_info(seconds: i64) -> MediaInfo {
+        MediaInfo {
+            duration: Some(Time::from_seconds(seconds)),
+            streams: vec![Stream::Video(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                width: 1280,
+                height: 720,
+                frame_rate: Some(FrameRate::FPS_30),
+            })],
+        }
+    }
+
+    fn audio_info(seconds: i64) -> MediaInfo {
+        MediaInfo {
+            duration: Some(Time::from_seconds(seconds)),
+            streams: vec![Stream::Audio(AudioStream {
+                index: 0,
+                codec: "opus".into(),
+                sample_rate: 48_000,
+                channels: 2,
+            })],
+        }
+    }
+
+    #[test]
+    fn placed_clip_covers_the_whole_asset() {
+        let mut project = Project::new("test");
+        let asset = project.add_asset("a.mkv".into(), video_info(3));
+        let clip = project.place_clip(asset, 0, Time::from_seconds(2)).unwrap();
+        assert_eq!(
+            clip.source,
+            TimeRange::new(Time::ZERO, Time::from_seconds(3))
+        );
+        assert_eq!(clip.start, Time::from_seconds(2));
+        assert_eq!(project.timeline.tracks[0].clips(), [clip]);
+        assert_eq!(project.timeline.duration(), Time::from_seconds(5));
+    }
+
+    #[test]
+    fn placement_needs_a_matching_stream() {
+        let mut project = Project::new("test");
+        let video = project.add_asset("a.mkv".into(), video_info(3));
+        let audio = project.add_asset("b.opus".into(), audio_info(3));
+        assert_eq!(
+            project.place_clip(video, 1, Time::ZERO),
+            Err(PlaceClipError::MissingStream(TrackKind::Audio))
+        );
+        assert_eq!(
+            project.place_clip(audio, 0, Time::ZERO),
+            Err(PlaceClipError::MissingStream(TrackKind::Video))
+        );
+        assert!(project.place_clip(audio, 1, Time::ZERO).is_ok());
+    }
+
+    #[test]
+    fn placement_refuses_unknown_targets_and_durations() {
+        let mut project = Project::new("test");
+        let asset = project.add_asset("a.mkv".into(), video_info(3));
+        let untimed = project.add_asset(
+            "b.mkv".into(),
+            MediaInfo {
+                duration: None,
+                ..video_info(0)
+            },
+        );
+        assert_eq!(
+            project.place_clip(AssetId(9), 0, Time::ZERO),
+            Err(PlaceClipError::UnknownAsset(AssetId(9)))
+        );
+        assert_eq!(
+            project.place_clip(asset, 7, Time::ZERO),
+            Err(PlaceClipError::UnknownTrack(7))
+        );
+        assert_eq!(
+            project.place_clip(untimed, 0, Time::ZERO),
+            Err(PlaceClipError::NoDuration)
+        );
+    }
+
+    #[test]
+    fn placement_keeps_clips_apart() {
+        let mut project = Project::new("test");
+        let asset = project.add_asset("a.mkv".into(), video_info(3));
+        project.place_clip(asset, 0, Time::ZERO).unwrap();
+        let before = project.timeline.clone();
+        assert!(matches!(
+            project.clip_for(asset, 0, Time::from_seconds(2)),
+            Err(PlaceClipError::Overlapping(_))
+        ));
+        assert!(matches!(
+            project.place_clip(asset, 0, Time::from_seconds(2)),
+            Err(PlaceClipError::Overlapping(_))
+        ));
+        assert_eq!(project.timeline, before);
+        assert!(project.place_clip(asset, 0, Time::from_seconds(3)).is_ok());
+    }
+
+    #[test]
+    fn placement_clamps_to_the_timeline_start() {
+        let mut project = Project::new("test");
+        let asset = project.add_asset("a.mkv".into(), video_info(1));
+        let clip = project
+            .place_clip(asset, 0, Time::from_seconds(-2))
+            .unwrap();
+        assert_eq!(clip.start, Time::ZERO);
     }
 }
