@@ -4,9 +4,8 @@
 
 ## Decode
 
-- Decode the video frame at a given `Time` in `tessera-media`, returned as a frame type that does not
-  expose FFmpeg
-- Seek to the nearest keyframe and decode forward, with a cache of recent frames for scrubbing
+- A cache of recent frames for scrubbing, and decoding forward instead of seeking when the requested
+  frame is shortly ahead of the last one
 - Hardware decode through the discovered accelerators, VAAPI and Vulkan Video first, falling back to
   software
 - Decode audio and resample it to a project-wide sample rate

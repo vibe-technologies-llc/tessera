@@ -1,6 +1,10 @@
+mod decode;
+#[cfg(test)]
+mod fixture;
 mod hw;
 mod probe;
 
+pub use decode::{VideoDecoder, VideoFrame};
 pub use ffmpeg_next::Error as FfmpegError;
 pub use hw::{HwAccel, available_hw_accels};
 pub use probe::probe;
@@ -22,6 +26,21 @@ pub enum Error {
         #[source]
         source: FfmpegError,
     },
+    #[error("{path} has no video stream")]
+    NoVideo { path: std::path::PathBuf },
+    #[error("failed to seek in {path}: {source}")]
+    Seek {
+        path: std::path::PathBuf,
+        #[source]
+        source: FfmpegError,
+    },
+    #[error("failed to decode video: {source}")]
+    Decode {
+        #[source]
+        source: FfmpegError,
+    },
+    #[error("no video frame could be decoded from {path}")]
+    NoFrame { path: std::path::PathBuf },
 }
 
 pub fn init() -> Result<(), Error> {
