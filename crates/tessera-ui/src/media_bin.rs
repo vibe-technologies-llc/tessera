@@ -10,9 +10,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px,
 };
 use tessera_media::{VideoDecoder, VideoFrame, probe};
-use tessera_timeline::{Asset, AssetId, FLICKS_PER_SECOND, MediaInfo, Project, Time};
+use tessera_timeline::{Asset, AssetId, Command, FLICKS_PER_SECOND, MediaInfo, Project, Time};
 
-use crate::{frame_image::render_image, theme};
+use crate::{editor::ProjectEditor, frame_image::render_image, theme};
 
 const THUMBNAIL_WIDTH: u32 = 96;
 const THUMBNAIL_HEIGHT: u32 = 54;
@@ -52,6 +52,7 @@ struct ImportFailure {
 }
 
 pub struct MediaBin {
+    editor: ProjectEditor,
     project: Entity<Project>,
     probing: Vec<PathBuf>,
     failures: Vec<ImportFailure>,
@@ -59,9 +60,11 @@ pub struct MediaBin {
 }
 
 impl MediaBin {
-    pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+    pub fn new(editor: ProjectEditor, cx: &mut Context<Self>) -> Self {
+        let project = editor.project().clone();
         cx.observe(&project, |_, _, cx| cx.notify()).detach();
         Self {
+            editor,
             project,
             probing: Vec::new(),
             failures: Vec::new(),
@@ -129,13 +132,13 @@ impl MediaBin {
                 self.fail(file_name(&path), "no audio or video streams".into(), cx);
             }
             Ok(Imported { info, thumbnail }) => {
-                let id = self.project.update(cx, |project, cx| {
-                    cx.notify();
+                let id = self.editor.perform(Command::ImportMedia, cx, |project| {
                     project.add_asset(path, info)
                 });
-                if let Some(thumbnail) = thumbnail {
-                    self.thumbnails.insert(id, thumbnail);
-                }
+                match thumbnail {
+                    Some(thumbnail) => self.thumbnails.insert(id, thumbnail),
+                    None => self.thumbnails.remove(&id),
+                };
             }
             Err(error) => self.fail(file_name(&path), error.to_string(), cx),
         }

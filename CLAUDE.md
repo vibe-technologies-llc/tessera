@@ -34,7 +34,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   track after the last one of its kind. `remove_track` only takes an empty track that isn't the
   last of its kind, and `swap_tracks` only swaps tracks of the same kind. Later video tracks sit on
   top of earlier ones, so
-  `Timeline::top_video_clip_at` searches them from the last.
+  `Timeline::top_video_clip_at` searches them from the last. `History` is the undo stack:
+  `History::apply` runs one edit as a `Command`, keeps a snapshot of the project from before it
+  when the edit succeeds and changes something, and rolls the project back when the edit fails.
+  `undo` and `redo` swap those snapshots in, the stack keeps the last `HISTORY_DEPTH` commands,
+  and a new command clears the redo stack.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and frame decode, and encode goes here.
   `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
@@ -45,9 +49,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   affinity and each one is owned by a single decoder, so `Scaler` implements `Send` by hand.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` (device + queue) for compositing timeline
   frames. It isn't wired into the UI yet.
-- **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>`, and each panel
+- **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>` through its `ProjectEditor`, and each panel
   (`MediaBin`, `Viewer`, `TimelinePanel`) gets a clone of it and re-renders through
-  `cx.observe(&project, …)`. Mutate the project through the entity so every panel updates. Global
+  `cx.observe(&project, …)`. Every edit goes through the `ProjectEditor` (`editor.rs`), which
+  pairs the project entity with its `Entity<History>`: `apply` and `perform` record the edit as a
+  command and notify the project, so every panel updates and Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y can
+  undo and redo it. The `MediaBin` and `TimelinePanel` get a clone of it, and imports are commands
+  too. Never mutate the project entity directly. Global
   actions and keybindings are registered in `tessera_ui::init`; actions that need the project are
   handled on the focused `Workspace`, whose key context (`WORKSPACE_CONTEXT`) scopes the
   single-key transport bindings. The `Workspace` also owns an `Entity<Playhead>` shared the same

@@ -1,8 +1,10 @@
+mod history;
 mod media;
 mod project;
 mod time;
 mod timecode;
 
+pub use history::{Command, HISTORY_DEPTH, History};
 pub use media::{AudioStream, MediaInfo, Stream, VideoStream};
 pub use project::{
     Asset, AssetId, Clip, ClipEdge, ClipId, EditError, OverlappingClip, Project, SequenceSettings,

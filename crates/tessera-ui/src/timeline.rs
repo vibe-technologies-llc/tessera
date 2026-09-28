@@ -10,8 +10,8 @@ use gpui::{
     px, size,
 };
 use tessera_timeline::{
-    Clip, ClipEdge, ClipId, EditError, FrameRate, Project, Time, TimeRange, Timecode, Timeline,
-    Track, TrackKind,
+    Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Project, Time, TimeRange, Timecode,
+    Timeline, Track, TrackKind,
 };
 
 use self::{
@@ -20,6 +20,7 @@ use self::{
     viewport::Viewport,
 };
 use crate::{
+    editor::ProjectEditor,
     media_bin::{DraggedAsset, file_name},
     playhead::Playhead,
     theme,
@@ -139,6 +140,7 @@ impl Render for DraggedClip {
 }
 
 pub struct TimelinePanel {
+    editor: ProjectEditor,
     project: Entity<Project>,
     playhead: Entity<Playhead>,
     scrubbing: bool,
@@ -153,11 +155,8 @@ pub struct TimelinePanel {
 }
 
 impl TimelinePanel {
-    pub fn new(
-        project: Entity<Project>,
-        playhead: Entity<Playhead>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(editor: ProjectEditor, playhead: Entity<Playhead>, cx: &mut Context<Self>) -> Self {
+        let project = editor.project().clone();
         cx.observe(&project, |_, _, cx| cx.notify()).detach();
         cx.observe(&playhead, |panel, _, cx| {
             panel.follow_playhead(cx);
@@ -165,6 +164,7 @@ impl TimelinePanel {
         })
         .detach();
         Self {
+            editor,
             project,
             playhead,
             scrubbing: false,
@@ -199,82 +199,86 @@ impl TimelinePanel {
 
     pub fn split_at_playhead(&mut self, cx: &mut Context<Self>) {
         let time = self.playhead.read(cx).time();
-        let selection = self.selection;
-        self.project.update(cx, |project, cx| {
-            let selected = selection
-                .and_then(|id| project.find_clip(id))
-                .map(|(_, clip)| *clip)
-                .filter(|clip| clip.is_cut_by(time));
-            let targets: Vec<ClipId> = match selected {
-                Some(clip) => vec![clip.id],
-                None => project
-                    .timeline
-                    .clips_cut_by(time)
-                    .map(|clip| clip.id)
-                    .collect(),
-            };
-            let mut split = false;
-            for id in targets {
-                match project.split_clip(id, time) {
-                    Ok(_) => split = true,
-                    Err(error) => tracing::warn!(%error, "could not split the clip"),
-                }
-            }
-            if split {
-                cx.notify();
-            }
+        let project = self.project.read(cx);
+        let selected = self
+            .selection
+            .and_then(|id| project.find_clip(id))
+            .map(|(_, clip)| *clip)
+            .filter(|clip| clip.is_cut_by(time));
+        let targets: Vec<ClipId> = match selected {
+            Some(clip) => vec![clip.id],
+            None => project
+                .timeline
+                .clips_cut_by(time)
+                .map(|clip| clip.id)
+                .collect(),
+        };
+        let split = self.editor.apply(Command::SplitClips, cx, |project| {
+            targets
+                .into_iter()
+                .try_for_each(|id| project.split_clip(id, time).map(drop))
         });
+        if let Err(error) = split {
+            tracing::warn!(%error, "could not split the clips");
+        }
     }
 
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
-        self.remove_selection(Project::delete_clip, cx);
+        self.remove_selection(Command::DeleteClip, Project::delete_clip, cx);
     }
 
     pub fn ripple_delete_selection(&mut self, cx: &mut Context<Self>) {
-        self.remove_selection(Project::ripple_delete_clip, cx);
+        self.remove_selection(Command::RippleDeleteClip, Project::ripple_delete_clip, cx);
     }
 
     fn remove_selection(
         &mut self,
+        command: Command,
         remove: impl FnOnce(&mut Project, ClipId) -> Result<Clip, EditError>,
         cx: &mut Context<Self>,
     ) {
         let Some(id) = self.selection.take() else {
             return;
         };
-        self.project
-            .update(cx, |project, cx| match remove(project, id) {
-                Ok(_) => cx.notify(),
-                Err(error) => tracing::warn!(%error, "could not delete the clip"),
-            });
+        if let Err(error) = self
+            .editor
+            .apply(command, cx, |project| remove(project, id))
+        {
+            tracing::warn!(%error, "could not delete the clip");
+        }
         cx.notify();
     }
 
     fn add_track(&mut self, kind: TrackKind, cx: &mut Context<Self>) {
-        self.project.update(cx, |project, cx| {
-            project.timeline.add_track(kind);
-            cx.notify();
+        self.editor.perform(Command::AddTrack, cx, |project| {
+            project.timeline.add_track(kind)
         });
     }
 
     fn remove_track(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.edit_tracks(cx, |timeline| timeline.remove_track(index).map(drop));
+        self.edit_tracks(Command::RemoveTrack, cx, |timeline| {
+            timeline.remove_track(index).map(drop)
+        });
     }
 
     fn swap_tracks(&mut self, first: usize, second: usize, cx: &mut Context<Self>) {
-        self.edit_tracks(cx, |timeline| timeline.swap_tracks(first, second));
+        self.edit_tracks(Command::SwapTracks, cx, |timeline| {
+            timeline.swap_tracks(first, second)
+        });
     }
 
     fn edit_tracks(
         &mut self,
+        command: Command,
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut Timeline) -> Result<(), EditError>,
     ) {
-        self.project
-            .update(cx, |project, cx| match edit(&mut project.timeline) {
-                Ok(()) => cx.notify(),
-                Err(error) => tracing::warn!(%error, "could not change the tracks"),
-            });
+        let edited = self
+            .editor
+            .apply(command, cx, |project| edit(&mut project.timeline));
+        if let Err(error) = edited {
+            tracing::warn!(%error, "could not change the tracks");
+        }
     }
 
     fn scroll_tracks(&mut self, delta: Pixels, rows: usize, cx: &mut Context<Self>) {
@@ -443,6 +447,7 @@ impl TimelinePanel {
     fn drop_asset_on_lane(&mut self, track: usize, dragged: &DraggedAsset, cx: &mut Context<Self>) {
         let asset = dragged.id;
         self.commit_preview(
+            Command::PlaceClip,
             |preview| preview.track == track,
             cx,
             |project, preview| project.place_clip(asset, preview.track, preview.range.start),
@@ -451,7 +456,12 @@ impl TimelinePanel {
 
     fn drop_clip_on_lane(&mut self, track: usize, dragged: &DraggedClip, cx: &mut Context<Self>) {
         let DraggedClip { id, grip } = *dragged;
+        let command = match grip {
+            Grip::Body => Command::MoveClip,
+            Grip::Edge(_) => Command::TrimClip,
+        };
         self.commit_preview(
+            command,
             |preview| grip != Grip::Body || preview.track == track,
             cx,
             |project, preview| match grip {
@@ -468,6 +478,7 @@ impl TimelinePanel {
 
     fn commit_preview(
         &mut self,
+        command: Command,
         accepts: impl FnOnce(&DropPreview) -> bool,
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut Project, DropPreview) -> Result<Clip, EditError>,
@@ -477,14 +488,10 @@ impl TimelinePanel {
             .take()
             .filter(|preview| preview.fits && accepts(preview));
         if let Some(preview) = preview {
-            let edited = self.project.update(cx, |project, cx| {
-                let edited = edit(project, preview);
-                if edited.is_ok() {
-                    cx.notify();
-                }
-                edited
-            });
-            match edited {
+            match self
+                .editor
+                .apply(command, cx, |project| edit(project, preview))
+            {
                 Ok(clip) => self.selection = Some(clip.id),
                 Err(error) => tracing::warn!(%error, "could not edit the timeline"),
             }
@@ -1035,7 +1042,7 @@ mod tests {
         let project = cx.new(|_| project);
         let (panel, cx) = cx.add_window_view(|_, cx| {
             let playhead = cx.new(|_| Playhead::new(project.clone()));
-            TimelinePanel::new(project, playhead, cx)
+            TimelinePanel::new(ProjectEditor::new(project, cx), playhead, cx)
         });
         (panel, cx, clips)
     }

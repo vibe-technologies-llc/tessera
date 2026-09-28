@@ -4,10 +4,6 @@
   software
 - Decode audio and resample it to a project-wide sample rate
 
-## Timeline editing
-
-- Undo and redo as a command history over `Project`
-
 ## Playback
 
 - Audio output through PipeWire, with the audio clock driving A/V sync

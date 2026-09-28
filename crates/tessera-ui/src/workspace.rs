@@ -5,14 +5,14 @@ use gpui::{
 use tessera_timeline::Project;
 
 use crate::{
-    DeleteClip, Import, Pause, PlayPause, RippleDeleteClip, ShuttleBackward, ShuttleForward,
-    SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
-    ZoomToFit, media_bin::MediaBin, playhead::Playhead, theme, timeline::TimelinePanel,
-    viewer::Viewer,
+    DeleteClip, Import, Pause, PlayPause, Redo, RippleDeleteClip, ShuttleBackward, ShuttleForward,
+    SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn,
+    ZoomOut, ZoomToFit, editor::ProjectEditor, media_bin::MediaBin, playhead::Playhead, theme,
+    timeline::TimelinePanel, viewer::Viewer,
 };
 
 pub struct Workspace {
-    project: Entity<Project>,
+    editor: ProjectEditor,
     focus_handle: FocusHandle,
     playhead: Entity<Playhead>,
     media_bin: Entity<MediaBin>,
@@ -25,18 +25,19 @@ impl Workspace {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
         let playhead = cx.new(|_| Playhead::new(project.clone()));
+        let editor = ProjectEditor::new(project.clone(), cx);
         Self {
             focus_handle,
-            media_bin: cx.new(|cx| MediaBin::new(project.clone(), cx)),
-            viewer: cx.new(|cx| Viewer::new(project.clone(), playhead.clone(), cx)),
-            timeline: cx.new(|cx| TimelinePanel::new(project.clone(), playhead.clone(), cx)),
+            media_bin: cx.new(|cx| MediaBin::new(editor.clone(), cx)),
+            viewer: cx.new(|cx| Viewer::new(project, playhead.clone(), cx)),
+            timeline: cx.new(|cx| TimelinePanel::new(editor.clone(), playhead.clone(), cx)),
             playhead,
-            project,
+            editor,
         }
     }
 
     pub fn project(&self) -> &Entity<Project> {
-        &self.project
+        self.editor.project()
     }
 
     fn transport(
@@ -105,6 +106,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|workspace, _: &ToggleSnapping, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::toggle_snapping);
             }))
+            .on_action(cx.listener(|workspace, _: &Undo, _, cx| workspace.editor.undo(cx)))
+            .on_action(cx.listener(|workspace, _: &Redo, _, cx| workspace.editor.redo(cx)))
             .size_full()
             .flex()
             .flex_col()
@@ -151,7 +154,7 @@ mod tests {
 
     fn starts(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<Time> {
         cx.read(|cx| {
-            workspace.read(cx).project.read(cx).timeline.tracks[0]
+            workspace.read(cx).project().read(cx).timeline.tracks[0]
                 .clips()
                 .iter()
                 .map(|clip| clip.start)
@@ -205,6 +208,15 @@ mod tests {
 
         click_v1(cx, 2.);
         cx.simulate_keystrokes("shift-backspace");
+        assert_eq!(starts(&workspace, cx), seconds(&[7]));
+
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(starts(&workspace, cx), seconds(&[1, 10]));
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(starts(&workspace, cx), seconds(&[1, 4, 10]));
+        cx.simulate_keystrokes("ctrl-shift-z");
+        assert_eq!(starts(&workspace, cx), seconds(&[1, 10]));
+        cx.simulate_keystrokes("ctrl-y");
         assert_eq!(starts(&workspace, cx), seconds(&[7]));
     }
 }
