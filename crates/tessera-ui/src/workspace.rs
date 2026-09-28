@@ -6,8 +6,8 @@ use tessera_timeline::Project;
 
 use crate::{
     Import, Pause, PlayPause, ShuttleBackward, ShuttleForward, StepBackward, StepForward,
-    WORKSPACE_CONTEXT, media_bin::MediaBin, playhead::Playhead, theme, timeline::TimelinePanel,
-    viewer::Viewer,
+    WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit, media_bin::MediaBin, playhead::Playhead, theme,
+    timeline::TimelinePanel, viewer::Viewer,
 };
 
 pub struct Workspace {
@@ -45,6 +45,14 @@ impl Workspace {
     ) {
         self.playhead.update(cx, control);
     }
+
+    fn zoom(
+        &mut self,
+        cx: &mut Context<Self>,
+        zoom: impl FnOnce(&mut TimelinePanel, &mut Context<TimelinePanel>),
+    ) {
+        self.timeline.update(cx, zoom);
+    }
 }
 
 impl Render for Workspace {
@@ -74,6 +82,15 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &StepForward, _, cx| {
                 workspace.transport(cx, |playhead, cx| playhead.step(1, cx));
+            }))
+            .on_action(cx.listener(|workspace, _: &ZoomIn, _, cx| {
+                workspace.zoom(cx, TimelinePanel::zoom_in);
+            }))
+            .on_action(cx.listener(|workspace, _: &ZoomOut, _, cx| {
+                workspace.zoom(cx, TimelinePanel::zoom_out);
+            }))
+            .on_action(cx.listener(|workspace, _: &ZoomToFit, _, cx| {
+                workspace.zoom(cx, TimelinePanel::zoom_to_fit);
             }))
             .size_full()
             .flex()

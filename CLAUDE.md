@@ -48,7 +48,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `anchor + elapsed × speed`, so it never drifts, and stops on the timeline's last frame or at
   zero. Any seek or step pauses playback. The timeline's ruler is a `canvas` that paints its ticks
   and timecode labels and scrubs the playhead through window mouse listeners, so a drag keeps
-  tracking outside the ruler.
+  tracking outside the ruler. The timeline maps time to pixels through a `Viewport` (zoom as
+  pixels per second, plus the time at the left edge). The wheel scrolls it, Ctrl+wheel zooms
+  around the pointer, and `=`, `-` and Shift+Z zoom in or out around the playhead or fit the
+  timeline. The ruler steps down to single frames at deep zoom. Outside a scrub, the view pages
+  to the playhead whenever it leaves the visible range.
   `MediaBin` owns importing (dialog and drops) and probes each file and decodes its thumbnail on a
   background task, reporting failures in the bin itself. Thumbnails are UI state kept in the bin by
   `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane

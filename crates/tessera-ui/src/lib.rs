@@ -27,7 +27,10 @@ actions!(
         Pause,
         ShuttleForward,
         StepBackward,
-        StepForward
+        StepForward,
+        ZoomIn,
+        ZoomOut,
+        ZoomToFit
     ]
 );
 
@@ -42,6 +45,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("l", ShuttleForward, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("left", StepBackward, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("right", StepForward, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("=", ZoomIn, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("-", ZoomOut, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("shift-z", ZoomToFit, Some(WORKSPACE_CONTEXT)),
     ]);
 }
 

@@ -1,21 +1,24 @@
+mod viewport;
+
 use gpui::{
     App, Bounds, Context, DispatchPhase, DragMoveEvent, Entity, Hitbox, HitboxBehavior,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, Rgba, SharedString, Styled, Window, canvas, div, fill, point,
-    px, size,
+    ParentElement, Pixels, Render, Rgba, ScrollWheelEvent, SharedString, Styled, Window, canvas,
+    div, fill, point, px, size,
 };
 use tessera_timeline::{
-    AssetId, Clip, FLICKS_PER_SECOND, FrameRate, PlaceClipError, Project, Time, TimeRange,
-    Timecode, Track, TrackKind,
+    AssetId, Clip, FrameRate, PlaceClipError, Project, Time, TimeRange, Timecode, Track, TrackKind,
 };
 
+use self::viewport::Viewport;
 use crate::{
     media_bin::{DraggedAsset, file_name},
     playhead::Playhead,
     theme,
 };
 
-const PIXELS_PER_SECOND: f32 = 48.;
+const ZOOM_STEP: f32 = 2.;
+const WHEEL_PIXELS_PER_DOUBLING: f32 = 120.;
 const TRACK_HEADER_WIDTH: f32 = 96.;
 const TRACK_HEIGHT: f32 = 48.;
 const RULER_HEIGHT: f32 = 24.;
@@ -30,34 +33,62 @@ const PLAYHEAD_CAP_HEIGHT: f32 = 8.;
 const CLIP_INSET: f32 = 4.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RulerSpan {
+    Frames(i64),
+    Seconds(i64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RulerStep {
-    seconds: i64,
+    span: RulerSpan,
     subdivisions: i64,
 }
 
 impl RulerStep {
-    const fn new(seconds: i64, subdivisions: i64) -> Self {
+    const fn frames(frames: i64, subdivisions: i64) -> Self {
         Self {
-            seconds,
+            span: RulerSpan::Frames(frames),
             subdivisions,
         }
     }
+
+    const fn seconds(seconds: i64, subdivisions: i64) -> Self {
+        Self {
+            span: RulerSpan::Seconds(seconds),
+            subdivisions,
+        }
+    }
+
+    fn major(self, frame_rate: FrameRate) -> Time {
+        match self.span {
+            RulerSpan::Frames(frames) => frame_rate.frame_to_time(frames),
+            RulerSpan::Seconds(seconds) => Time::from_seconds(seconds),
+        }
+    }
+
+    fn minor(self, frame_rate: FrameRate) -> Time {
+        Time::from_flicks(self.major(frame_rate).flicks() / self.subdivisions)
+    }
 }
 
-const COARSEST_RULER_STEP: RulerStep = RulerStep::new(3600, 4);
-const RULER_STEPS: [RulerStep; 13] = [
-    RulerStep::new(1, 4),
-    RulerStep::new(2, 4),
-    RulerStep::new(5, 5),
-    RulerStep::new(10, 5),
-    RulerStep::new(15, 3),
-    RulerStep::new(30, 6),
-    RulerStep::new(60, 4),
-    RulerStep::new(120, 4),
-    RulerStep::new(300, 5),
-    RulerStep::new(600, 5),
-    RulerStep::new(900, 3),
-    RulerStep::new(1800, 6),
+const COARSEST_RULER_STEP: RulerStep = RulerStep::seconds(3600, 4);
+const RULER_STEPS: [RulerStep; 17] = [
+    RulerStep::frames(1, 1),
+    RulerStep::frames(2, 2),
+    RulerStep::frames(5, 5),
+    RulerStep::frames(10, 5),
+    RulerStep::seconds(1, 4),
+    RulerStep::seconds(2, 4),
+    RulerStep::seconds(5, 5),
+    RulerStep::seconds(10, 5),
+    RulerStep::seconds(15, 3),
+    RulerStep::seconds(30, 6),
+    RulerStep::seconds(60, 4),
+    RulerStep::seconds(120, 4),
+    RulerStep::seconds(300, 5),
+    RulerStep::seconds(600, 5),
+    RulerStep::seconds(900, 3),
+    RulerStep::seconds(1800, 6),
     COARSEST_RULER_STEP,
 ];
 
@@ -73,6 +104,8 @@ pub struct TimelinePanel {
     playhead: Entity<Playhead>,
     scrubbing: bool,
     drop_preview: Option<DropPreview>,
+    viewport: Viewport,
+    lanes: Bounds<Pixels>,
 }
 
 impl TimelinePanel {
@@ -82,12 +115,78 @@ impl TimelinePanel {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&project, |_, _, cx| cx.notify()).detach();
-        cx.observe(&playhead, |_, _, cx| cx.notify()).detach();
+        cx.observe(&playhead, |panel, _, cx| {
+            panel.follow_playhead(cx);
+            cx.notify();
+        })
+        .detach();
         Self {
             project,
             playhead,
             scrubbing: false,
             drop_preview: None,
+            viewport: Viewport::default(),
+            lanes: Bounds::default(),
+        }
+    }
+
+    pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.zoom_around_playhead(ZOOM_STEP, cx);
+    }
+
+    pub fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.zoom_around_playhead(ZOOM_STEP.recip(), cx);
+    }
+
+    pub fn zoom_to_fit(&mut self, cx: &mut Context<Self>) {
+        let duration = self.project.read(cx).timeline.duration();
+        self.set_viewport(Viewport::fitting(duration, self.lanes.size.width), cx);
+    }
+
+    fn zoom_around_playhead(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let playhead = self.playhead.read(cx).time();
+        let anchor = self
+            .viewport
+            .x_at(playhead)
+            .clamp(px(0.), self.lanes.size.width);
+        let viewport = self.viewport.zoomed(factor, anchor, self.scroll_limit(cx));
+        self.set_viewport(viewport, cx);
+    }
+
+    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let limit = self.scroll_limit(cx);
+        let viewport = if event.modifiers.control {
+            let factor = 2_f32.powf(f32::from(delta.y) / WHEEL_PIXELS_PER_DOUBLING);
+            let anchor = event.position.x - self.lanes.left();
+            self.viewport.zoomed(factor, anchor, limit)
+        } else {
+            self.viewport.scrolled_by(-(delta.x + delta.y), limit)
+        };
+        self.set_viewport(viewport, cx);
+        cx.stop_propagation();
+    }
+
+    fn follow_playhead(&mut self, cx: &App) {
+        let followed_width = self.lanes.size.width - px(PLAYHEAD_CAP_WIDTH);
+        if self.scrubbing || followed_width <= px(0.) {
+            return;
+        }
+        let playhead = self.playhead.read(cx).time();
+        self.viewport = self
+            .viewport
+            .following(playhead, followed_width, self.scroll_limit(cx));
+    }
+
+    fn scroll_limit(&self, cx: &App) -> Time {
+        let duration = self.project.read(cx).timeline.duration();
+        duration.max(self.playhead.read(cx).time())
+    }
+
+    fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
+        if viewport != self.viewport {
+            self.viewport = viewport;
+            cx.notify();
         }
     }
 
@@ -123,7 +222,10 @@ impl TimelinePanel {
         cx: &App,
     ) -> Option<DropPreview> {
         let project = self.project.read(cx);
-        let start = project.settings.frame_rate.frame_start(time_at(offset));
+        let start = project
+            .settings
+            .frame_rate
+            .frame_start(self.viewport.time_at(offset));
         let (range, fits) = match project.clip_for(asset, track, start) {
             Ok(clip) => (clip.timeline_range(), true),
             Err(PlaceClipError::Overlapping(overlap)) => (overlap.inserted, false),
@@ -152,7 +254,7 @@ impl TimelinePanel {
 
     fn scrub_to(&mut self, offset: Pixels, cx: &mut Context<Self>) {
         let frame_rate = self.project.read(cx).settings.frame_rate;
-        let time = frame_rate.frame_start(time_at(offset));
+        let time = frame_rate.frame_start(self.viewport.time_at(offset));
         self.playhead
             .update(cx, |playhead, cx| playhead.seek(time, cx));
     }
@@ -165,6 +267,7 @@ impl Render for TimelinePanel {
         }
         let panel = cx.entity();
         let drop_preview = self.drop_preview;
+        let viewport = self.viewport;
         let playhead = self.playhead.read(cx).time();
         let project = self.project.read(cx);
         let frame_rate = project.settings.frame_rate;
@@ -192,13 +295,14 @@ impl Render for TimelinePanel {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .child(ruler(panel, frame_rate))
-                    .children(
-                        tracks.iter().enumerate().map(|(index, track)| {
-                            track_lane(index, track, project, drop_preview, cx)
-                        }),
-                    )
-                    .child(playhead_marker(playhead)),
+                    .on_scroll_wheel(cx.listener(|panel, event, window, cx| {
+                        panel.scroll_wheel(event, window, cx);
+                    }))
+                    .child(ruler(panel, viewport, frame_rate))
+                    .children(tracks.iter().enumerate().map(|(index, track)| {
+                        track_lane(index, track, project, viewport, drop_preview, cx)
+                    }))
+                    .child(playhead_marker(viewport.x_at(playhead))),
             )
     }
 }
@@ -233,6 +337,7 @@ fn track_lane(
     index: usize,
     track: &Track,
     project: &Project,
+    viewport: Viewport,
     drop_preview: Option<DropPreview>,
     cx: &Context<TimelinePanel>,
 ) -> impl IntoElement {
@@ -242,7 +347,7 @@ fn track_lane(
     };
     let ghost = drop_preview
         .filter(|preview| preview.track == index)
-        .map(drop_ghost);
+        .map(|preview| drop_ghost(preview, viewport));
     div()
         .h(px(TRACK_HEIGHT))
         .flex_none()
@@ -259,7 +364,7 @@ fn track_lane(
             track
                 .clips()
                 .iter()
-                .map(|clip| clip_block(clip, clip_label(project, clip), color)),
+                .map(|clip| clip_block(clip, clip_label(project, clip), color, viewport)),
         )
         .children(ghost)
 }
@@ -271,23 +376,23 @@ fn clip_label(project: &Project, clip: &Clip) -> SharedString {
         .unwrap_or_default()
 }
 
-fn clip_frame(range: TimeRange) -> gpui::Div {
+fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
     div()
         .absolute()
         .top(px(CLIP_INSET))
         .bottom(px(CLIP_INSET))
-        .left(x_at(range.start))
-        .w(x_at(range.duration))
+        .left(viewport.x_at(range.start))
+        .w(viewport.width_of(range.duration))
         .rounded_sm()
 }
 
-fn drop_ghost(preview: DropPreview) -> impl IntoElement {
+fn drop_ghost(preview: DropPreview, viewport: Viewport) -> impl IntoElement {
     let color = if preview.fits {
         theme::drop_ghost()
     } else {
         theme::drop_ghost_blocked()
     };
-    clip_frame(preview.range).bg(color)
+    clip_frame(preview.range, viewport).bg(color)
 }
 
 fn track_labels(tracks: &[Track]) -> impl Iterator<Item = String> {
@@ -305,8 +410,13 @@ fn track_labels(tracks: &[Track]) -> impl Iterator<Item = String> {
     })
 }
 
-fn clip_block(clip: &Clip, label: SharedString, color: Rgba) -> impl IntoElement {
-    clip_frame(clip.timeline_range())
+fn clip_block(
+    clip: &Clip,
+    label: SharedString,
+    color: Rgba,
+    viewport: Viewport,
+) -> impl IntoElement {
+    clip_frame(clip.timeline_range(), viewport)
         .overflow_hidden()
         .px_1()
         .bg(color)
@@ -315,7 +425,11 @@ fn clip_block(clip: &Clip, label: SharedString, color: Rgba) -> impl IntoElement
         .child(div().truncate().child(label))
 }
 
-fn ruler(panel: Entity<TimelinePanel>, frame_rate: FrameRate) -> impl IntoElement {
+fn ruler(
+    panel: Entity<TimelinePanel>,
+    viewport: Viewport,
+    frame_rate: FrameRate,
+) -> impl IntoElement {
     div()
         .h(px(RULER_HEIGHT))
         .flex_none()
@@ -325,9 +439,15 @@ fn ruler(panel: Entity<TimelinePanel>, frame_rate: FrameRate) -> impl IntoElemen
         .text_color(theme::text_muted())
         .child(
             canvas(
-                |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                {
+                    let panel = panel.clone();
+                    move |bounds, window, cx| {
+                        panel.update(cx, |panel, _| panel.lanes = bounds);
+                        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+                    }
+                },
                 move |bounds, hitbox, window, cx| {
-                    paint_ticks(bounds, frame_rate, window, cx);
+                    paint_ticks(bounds, viewport, frame_rate, window, cx);
                     listen_for_scrub(panel, bounds, hitbox, window);
                 },
             )
@@ -335,17 +455,24 @@ fn ruler(panel: Entity<TimelinePanel>, frame_rate: FrameRate) -> impl IntoElemen
         )
 }
 
-fn paint_ticks(bounds: Bounds<Pixels>, frame_rate: FrameRate, window: &mut Window, cx: &mut App) {
-    let step = ruler_step(PIXELS_PER_SECOND);
-    let minor_spacing = step.seconds as f32 * PIXELS_PER_SECOND / step.subdivisions as f32;
+fn paint_ticks(
+    bounds: Bounds<Pixels>,
+    viewport: Viewport,
+    frame_rate: FrameRate,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let step = ruler_step(viewport.pixels_per_second(), frame_rate);
+    let minor = step.minor(frame_rate);
     let text_style = window.text_style();
     let font_size = text_style.font_size.to_pixels(window.rem_size());
     let line_height = window.line_height();
-    let offsets = (0..)
-        .map(|index| (index, px(minor_spacing * index as f32)))
-        .take_while(|&(_, offset)| offset <= bounds.size.width);
-    for (index, offset) in offsets {
-        let x = bounds.left() + offset;
+    let first = viewport.start().flicks().div_euclid(minor.flicks());
+    let ticks = (first..)
+        .map(|index| (index, minor * index))
+        .take_while(|&(_, time)| viewport.x_at(time) <= bounds.size.width);
+    for (index, time) in ticks {
+        let x = bounds.left() + viewport.x_at(time);
         let major = index % step.subdivisions == 0;
         let height = px(if major {
             MAJOR_TICK_HEIGHT
@@ -360,7 +487,6 @@ fn paint_ticks(bounds: Bounds<Pixels>, frame_rate: FrameRate, window: &mut Windo
             text_style.color,
         ));
         if major {
-            let time = Time::from_seconds(step.seconds * (index / step.subdivisions));
             let label = SharedString::from(Timecode::new(time, frame_rate).to_string());
             let run = text_style.to_run(label.len());
             let line = window
@@ -415,12 +541,12 @@ fn listen_for_scrub(
     });
 }
 
-fn playhead_marker(time: Time) -> impl IntoElement {
+fn playhead_marker(x: Pixels) -> impl IntoElement {
     div()
         .absolute()
         .top_0()
         .bottom_0()
-        .left(x_at(time) - px(PLAYHEAD_CAP_WIDTH / 2.))
+        .left(x - px(PLAYHEAD_CAP_WIDTH / 2.))
         .w(px(PLAYHEAD_CAP_WIDTH))
         .flex()
         .flex_col()
@@ -436,20 +562,14 @@ fn playhead_marker(time: Time) -> impl IntoElement {
         .child(div().flex_1().w(px(PLAYHEAD_WIDTH)).bg(theme::playhead()))
 }
 
-fn ruler_step(pixels_per_second: f32) -> RulerStep {
+fn ruler_step(pixels_per_second: f32, frame_rate: FrameRate) -> RulerStep {
     RULER_STEPS
         .into_iter()
-        .find(|step| step.seconds as f32 * pixels_per_second >= MIN_MAJOR_TICK_SPACING)
+        .find(|step| {
+            step.major(frame_rate).as_seconds_f64() as f32 * pixels_per_second
+                >= MIN_MAJOR_TICK_SPACING
+        })
         .unwrap_or(COARSEST_RULER_STEP)
-}
-
-fn x_at(time: Time) -> Pixels {
-    px(time.as_seconds_f64() as f32 * PIXELS_PER_SECOND)
-}
-
-fn time_at(offset: Pixels) -> Time {
-    let seconds = f64::from(f32::from(offset)) / f64::from(PIXELS_PER_SECOND);
-    Time::from_flicks((seconds * FLICKS_PER_SECOND as f64).round() as i64)
 }
 
 #[cfg(test)]
@@ -458,24 +578,38 @@ mod tests {
 
     #[test]
     fn ruler_step_keeps_major_ticks_apart() {
-        assert_eq!(ruler_step(MIN_MAJOR_TICK_SPACING), RULER_STEPS[0]);
-        assert_eq!(ruler_step(PIXELS_PER_SECOND), RulerStep::new(2, 4));
+        let rate = FrameRate::FPS_30;
         assert_eq!(
-            ruler_step(MIN_MAJOR_TICK_SPACING / 7.),
-            RulerStep::new(10, 5)
+            ruler_step(MIN_MAJOR_TICK_SPACING * 31., rate),
+            RULER_STEPS[0]
         );
-        assert_eq!(ruler_step(0.001), COARSEST_RULER_STEP);
+        assert_eq!(
+            ruler_step(MIN_MAJOR_TICK_SPACING * 3.5, rate),
+            RulerStep::frames(10, 5)
+        );
+        assert_eq!(
+            ruler_step(MIN_MAJOR_TICK_SPACING * 1.1, rate),
+            RulerStep::seconds(1, 4)
+        );
+        assert_eq!(ruler_step(48., rate), RulerStep::seconds(2, 4));
+        assert_eq!(
+            ruler_step(MIN_MAJOR_TICK_SPACING / 7., rate),
+            RulerStep::seconds(10, 5)
+        );
+        assert_eq!(ruler_step(0.001, rate), COARSEST_RULER_STEP);
     }
 
     #[test]
-    fn offsets_and_times_convert_both_ways() {
-        let time = Time::from_seconds(3);
-        assert_eq!(x_at(time), px(3. * PIXELS_PER_SECOND));
-        assert_eq!(time_at(x_at(time)), time);
-        assert_eq!(
-            time_at(px(PIXELS_PER_SECOND / 2.)),
-            Time::from_flicks(FLICKS_PER_SECOND / 2)
-        );
+    fn ruler_subdivisions_are_exact() {
+        for rate in [FrameRate::FPS_25, FrameRate::NTSC_30, FrameRate::NTSC_60] {
+            for step in RULER_STEPS {
+                assert_eq!(
+                    step.minor(rate).flicks() * step.subdivisions,
+                    step.major(rate).flicks(),
+                    "{step:?} at {rate:?}"
+                );
+            }
+        }
     }
 
     #[test]
