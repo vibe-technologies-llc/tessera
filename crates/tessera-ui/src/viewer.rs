@@ -3,6 +3,7 @@ use std::{
     mem,
     path::PathBuf,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -11,11 +12,11 @@ use gpui::{
 };
 use tessera_media::{VideoDecoder, VideoFrame};
 use tessera_render::{Compositor, Frame, Layer};
-use tessera_timeline::{Project, Time, Timecode};
+use tessera_timeline::{FrameRate, Project, Time, Timecode};
 
 use crate::{
     frame_image::render_image,
-    playhead::{Playhead, Speed},
+    playhead::{Playhead, Speed, last_frame},
     theme,
 };
 
@@ -26,6 +27,8 @@ struct DecoderKey {
 }
 
 type Decoders = HashMap<DecoderKey, VideoDecoder>;
+
+const LATENCY_SMOOTHING: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LayerRequest {
@@ -43,6 +46,25 @@ impl FrameRequest {
     fn decoders(&self) -> impl Iterator<Item = &DecoderKey> {
         self.layers.iter().map(|layer| &layer.decoder)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Target {
+    time: Time,
+    speed: Speed,
+    request: Option<FrameRequest>,
+}
+
+struct Rendered {
+    target: Target,
+    picture: Picture,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    Show,
+    Hold,
+    Drop,
 }
 
 enum CompositorSlot {
@@ -107,7 +129,9 @@ pub struct Viewer {
     project: Entity<Project>,
     playhead: Entity<Playhead>,
     idle_renderer: Option<Renderer>,
-    wanted: Option<FrameRequest>,
+    latency: Duration,
+    wanted: Target,
+    pending: Option<Rendered>,
     shown: Option<FrameRequest>,
     picture: Picture,
     retired: Vec<Arc<RenderImage>>,
@@ -133,7 +157,9 @@ impl Viewer {
             project,
             playhead,
             idle_renderer: Some(Renderer::new()),
-            wanted: None,
+            latency: Duration::ZERO,
+            wanted: Target::default(),
+            pending: None,
             shown: None,
             picture: Picture::Empty,
             retired: Vec::new(),
@@ -150,11 +176,31 @@ impl Viewer {
         if stale {
             self.show(None, Picture::Empty, cx);
         }
-        let wanted = frame_request(self.project.read(cx), self.playhead.read(cx).time());
-        if stale || wanted != self.wanted {
-            self.wanted = wanted;
-            self.render_wanted(cx);
+        if let Some(pending) = self.pending.take()
+            && pending
+                .target
+                .request
+                .as_ref()
+                .is_none_or(|request| self.is_live_request(request, cx))
+        {
+            self.settle(pending, cx);
         }
+        let project = self.project.read(cx);
+        let playhead = self.playhead.read(cx);
+        let speed = playhead.speed();
+        let time = presentation_time(
+            playhead.time(),
+            speed,
+            self.latency,
+            project.settings.frame_rate,
+            last_frame(project.timeline.duration(), project.settings.frame_rate),
+        );
+        self.wanted = Target {
+            time,
+            speed,
+            request: frame_request(project, time),
+        };
+        self.render_wanted(cx);
     }
 
     fn is_live(&self, decoder: &DecoderKey, cx: &Context<Self>) -> bool {
@@ -171,36 +217,63 @@ impl Viewer {
     }
 
     fn render_wanted(&mut self, cx: &mut Context<Self>) {
-        if self.wanted == self.shown {
+        let latest = self
+            .pending
+            .as_ref()
+            .map_or(&self.shown, |pending| &pending.target.request);
+        if *latest == self.wanted.request {
             return;
         }
-        let Some(request) = self.wanted.clone() else {
-            self.show(None, Picture::Empty, cx);
-            return;
-        };
         let Some(mut renderer) = self.idle_renderer.take() else {
             return;
         };
+        let target = self.wanted.clone();
+        let Some(request) = target.request.clone() else {
+            self.idle_renderer = Some(renderer);
+            self.settle(
+                Rendered {
+                    target,
+                    picture: Picture::Empty,
+                },
+                cx,
+            );
+            return;
+        };
         renderer.decoders.retain(|key, _| self.is_live(key, cx));
-        let rendered = cx.background_spawn({
-            let request = request.clone();
-            async move {
-                let picture = renderer.render(&request);
-                (renderer, picture)
-            }
+        let started = Instant::now();
+        let rendered = cx.background_spawn(async move {
+            let picture = renderer.render(&request);
+            (renderer, picture)
         });
         cx.spawn(async move |this, cx| {
             let (renderer, picture) = rendered.await;
             this.update(cx, |viewer, cx| {
                 viewer.idle_renderer = Some(renderer);
-                if viewer.is_live_request(&request, cx) {
-                    viewer.show(Some(request), picture, cx);
+                viewer.latency = smoothed_latency(viewer.latency, started.elapsed());
+                let live = target
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| viewer.is_live_request(request, cx));
+                if live {
+                    viewer.settle(Rendered { target, picture }, cx);
                 }
                 viewer.render_wanted(cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn settle(&mut self, rendered: Rendered, cx: &mut Context<Self>) {
+        let playhead = self.playhead.read(cx);
+        match fate(&rendered.target, playhead.time(), playhead.speed()) {
+            Fate::Show => {
+                self.pending = None;
+                self.show(rendered.target.request, rendered.picture, cx);
+            }
+            Fate::Hold => self.pending = Some(rendered),
+            Fate::Drop => {}
+        }
     }
 
     fn show(&mut self, shown: Option<FrameRequest>, picture: Picture, cx: &mut Context<Self>) {
@@ -305,6 +378,39 @@ fn frame_request(project: &Project, time: Time) -> Option<FrameRequest> {
         })
         .collect();
     (!layers.is_empty()).then_some(FrameRequest { layers, sequence })
+}
+
+fn presentation_time(
+    playhead: Time,
+    speed: Speed,
+    latency: Duration,
+    frame_rate: FrameRate,
+    last: Option<Time>,
+) -> Time {
+    let Some(last) = last.filter(|_| !speed.is_paused()) else {
+        return playhead;
+    };
+    let ahead = frame_rate.frame_start(playhead + Time::from_duration(latency) * speed.factor());
+    ahead.clamp(Time::ZERO, last.max(playhead))
+}
+
+fn fate(target: &Target, playhead: Time, speed: Speed) -> Fate {
+    let due = match speed.factor() {
+        0 => target.speed.is_paused() || target.time == playhead,
+        1.. => target.time <= playhead,
+        _ => target.time >= playhead,
+    };
+    if due {
+        Fate::Show
+    } else if target.speed == speed && !speed.is_paused() {
+        Fate::Hold
+    } else {
+        Fate::Drop
+    }
+}
+
+fn smoothed_latency(previous: Duration, sample: Duration) -> Duration {
+    (previous * (LATENCY_SMOOTHING - 1) + sample) / LATENCY_SMOOTHING
 }
 
 fn speed_label(speed: Speed) -> Option<String> {
@@ -465,7 +571,7 @@ mod tests {
     }
 
     fn wanted_paths(viewer: &Entity<Viewer>, cx: &mut VisualTestContext) -> Vec<PathBuf> {
-        cx.read(|cx| layer_paths(viewer.read(cx).wanted.as_ref()))
+        cx.read(|cx| layer_paths(viewer.read(cx).wanted.request.as_ref()))
     }
 
     fn solid(width: u32, height: u32, bgra: [u8; 4]) -> Arc<VideoFrame> {
@@ -525,6 +631,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn playing_asks_for_the_frame_due_once_the_render_lands() {
+        let rate = FrameRate::FPS_30;
+        let last = Some(rate.frame_to_time(299));
+        let at = |frame, speed, millis| {
+            let latency = Duration::from_millis(millis);
+            presentation_time(rate.frame_to_time(frame), speed, latency, rate, last)
+        };
+        assert_eq!(at(30, Speed::FORWARD, 100), rate.frame_to_time(33));
+        assert_eq!(at(30, Speed::BACKWARD, 100), rate.frame_to_time(27));
+        assert_eq!(at(30, Speed::FORWARD, 10), rate.frame_to_time(30));
+        assert_eq!(at(30, Speed::PAUSED, 100), rate.frame_to_time(30));
+        assert_eq!(at(298, Speed::FORWARD, 500), rate.frame_to_time(299));
+        assert_eq!(at(2, Speed::BACKWARD, 500), Time::ZERO);
+        assert_eq!(
+            presentation_time(
+                rate.frame_to_time(30),
+                Speed::FORWARD,
+                Duration::from_secs(1),
+                rate,
+                None
+            ),
+            rate.frame_to_time(30)
+        );
+    }
+
+    #[test]
+    fn a_rendered_frame_waits_for_the_playhead_and_is_dropped_when_playback_changes() {
+        let rate = FrameRate::FPS_30;
+        let target = |frame, speed| Target {
+            time: rate.frame_to_time(frame),
+            speed,
+            request: None,
+        };
+        let now = rate.frame_to_time(30);
+        assert_eq!(
+            fate(&target(33, Speed::FORWARD), now, Speed::FORWARD),
+            Fate::Hold
+        );
+        assert_eq!(
+            fate(&target(30, Speed::FORWARD), now, Speed::FORWARD),
+            Fate::Show
+        );
+        assert_eq!(
+            fate(&target(28, Speed::FORWARD), now, Speed::FORWARD),
+            Fate::Show
+        );
+        assert_eq!(
+            fate(&target(27, Speed::BACKWARD), now, Speed::BACKWARD),
+            Fate::Hold
+        );
+        assert_eq!(
+            fate(&target(31, Speed::BACKWARD), now, Speed::BACKWARD),
+            Fate::Show
+        );
+        assert_eq!(
+            fate(&target(33, Speed::FORWARD), now, Speed::PAUSED),
+            Fate::Drop
+        );
+        assert_eq!(
+            fate(&target(30, Speed::FORWARD), now, Speed::PAUSED),
+            Fate::Show
+        );
+        assert_eq!(
+            fate(&target(12, Speed::PAUSED), now, Speed::PAUSED),
+            Fate::Show
+        );
+        assert_eq!(
+            fate(&target(27, Speed::FORWARD), now, Speed::BACKWARD),
+            Fate::Drop
+        );
+        assert_eq!(
+            fate(&target(33, Speed::PAUSED), now, Speed::FORWARD),
+            Fate::Drop
+        );
+    }
+
+    #[test]
+    fn the_latency_estimate_follows_render_times_smoothly() {
+        let latency = smoothed_latency(Duration::ZERO, Duration::from_millis(40));
+        assert_eq!(latency, Duration::from_millis(10));
+        let settled = (0..40).fold(latency, |latency, _| {
+            smoothed_latency(latency, Duration::from_millis(40))
+        });
+        assert!(settled > Duration::from_millis(39) && settled <= Duration::from_millis(40));
+    }
+
     #[gpui::test]
     fn the_viewer_asks_for_every_video_layer_under_the_playhead(cx: &mut TestAppContext) {
         let project = cx.new(|_| stacked_project());
@@ -557,7 +750,7 @@ mod tests {
             playhead.update(cx, |playhead, cx| playhead.seek(Time::from_seconds(9), cx))
         });
         cx.run_until_parked();
-        assert!(cx.read(|cx| viewer.read(cx).wanted.is_none()));
+        assert!(cx.read(|cx| viewer.read(cx).wanted.request.is_none()));
         assert!(cx.read(|cx| viewer.read(cx).shown.is_none()));
         assert!(cx.read(|cx| matches!(viewer.read(cx).picture, Picture::Empty)));
     }

@@ -1,7 +1,3 @@
-## Playback
-
-- Drop frames rather than drift when decode or compositing falls behind
-
 ## Compositing
 
 - Convert YUV to RGB with the source's matrix and range

@@ -162,7 +162,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   media the project no longer holds, and a `Compositor` it creates on first use off the UI thread.
   If that creation fails it warns once and shows the top layer's decoded frame alone from then on.
   One job runs at a time, so while scrubbing only the newest request runs next, and the viewer
-  releases each replaced frame from the GPUI atlas with `Window::drop_image`.
+  releases each replaced frame from the GPUI atlas with `Window::drop_image`. While playing, it
+  asks for the frame at the time it will reach the screen instead of the playhead's: the playhead
+  plus the render latency (a smoothed average of recent jobs) times the speed, clamped to the
+  timeline (`presentation_time`). A frame that lands early is held until the playhead reaches it,
+  one overtaken by a newer frame is dropped, and a change of speed drops a held frame
+  (`fate`), so a slow decode or composite shows fewer frames rather than lagging the audio.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.
 

@@ -233,7 +233,7 @@ impl Playhead {
     }
 }
 
-fn last_frame(end: Time, frame_rate: FrameRate) -> Option<Time> {
+pub(crate) fn last_frame(end: Time, frame_rate: FrameRate) -> Option<Time> {
     (end > Time::ZERO).then(|| frame_rate.frame_start(end - Time::from_flicks(1)))
 }
 
