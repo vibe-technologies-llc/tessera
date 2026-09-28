@@ -76,6 +76,10 @@ impl Clip {
             .contains(time)
             .then(|| self.source.start + (time - self.start))
     }
+
+    pub fn is_cut_by(&self, time: Time) -> bool {
+        self.start < time && time < self.timeline_range().end()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -86,13 +90,15 @@ pub struct OverlappingClip {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
-pub enum PlaceClipError {
+pub enum EditError {
     #[error("there is no asset {0:?}")]
     UnknownAsset(AssetId),
     #[error("there is no clip {0:?}")]
     UnknownClip(ClipId),
     #[error("there is no track {0}")]
     UnknownTrack(usize),
+    #[error("{time:?} does not fall inside clip {clip:?}")]
+    OutsideClip { clip: ClipId, time: Time },
     #[error("the asset has no known duration")]
     NoDuration,
     #[error("the asset has no {0:?} stream")]
@@ -205,6 +211,13 @@ impl Timeline {
             .filter(|track| track.kind == TrackKind::Video)
             .find_map(|track| track.clip_at(time))
     }
+
+    pub fn clips_cut_by(&self, time: Time) -> impl Iterator<Item = &Clip> {
+        self.tracks
+            .iter()
+            .filter_map(move |track| track.clip_at(time))
+            .filter(move |clip| clip.is_cut_by(time))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -263,40 +276,33 @@ impl Project {
         )
     }
 
-    fn track_accepting(&self, asset: &Asset, track: usize) -> Result<&Track, PlaceClipError> {
+    fn track_accepting(&self, asset: &Asset, track: usize) -> Result<&Track, EditError> {
         let track_ref = self
             .timeline
             .tracks
             .get(track)
-            .ok_or(PlaceClipError::UnknownTrack(track))?;
+            .ok_or(EditError::UnknownTrack(track))?;
         if asset.has_stream(track_ref.kind) {
             Ok(track_ref)
         } else {
-            Err(PlaceClipError::MissingStream(track_ref.kind))
+            Err(EditError::MissingStream(track_ref.kind))
         }
     }
 
-    fn located_clip(&self, id: ClipId) -> Result<(usize, Clip), PlaceClipError> {
+    fn located_clip(&self, id: ClipId) -> Result<(usize, Clip), EditError> {
         self.find_clip(id)
             .map(|(track, clip)| (track, *clip))
-            .ok_or(PlaceClipError::UnknownClip(id))
+            .ok_or(EditError::UnknownClip(id))
     }
 
-    pub fn clip_for(
-        &self,
-        asset: AssetId,
-        track: usize,
-        start: Time,
-    ) -> Result<Clip, PlaceClipError> {
-        let asset = self
-            .asset(asset)
-            .ok_or(PlaceClipError::UnknownAsset(asset))?;
+    pub fn clip_for(&self, asset: AssetId, track: usize, start: Time) -> Result<Clip, EditError> {
+        let asset = self.asset(asset).ok_or(EditError::UnknownAsset(asset))?;
         let track_ref = self.track_accepting(asset, track)?;
         let duration = asset
             .info
             .duration
             .filter(|duration| *duration > Time::ZERO)
-            .ok_or(PlaceClipError::NoDuration)?;
+            .ok_or(EditError::NoDuration)?;
         let clip = Clip {
             id: self.next_clip_id(),
             asset: asset.id,
@@ -312,22 +318,17 @@ impl Project {
         asset: AssetId,
         track: usize,
         start: Time,
-    ) -> Result<Clip, PlaceClipError> {
+    ) -> Result<Clip, EditError> {
         let clip = self.clip_for(asset, track, start)?;
         self.timeline.tracks[track].insert(clip)?;
         Ok(clip)
     }
 
-    pub fn moved_clip(
-        &self,
-        id: ClipId,
-        track: usize,
-        start: Time,
-    ) -> Result<Clip, PlaceClipError> {
+    pub fn moved_clip(&self, id: ClipId, track: usize, start: Time) -> Result<Clip, EditError> {
         let (_, clip) = self.located_clip(id)?;
         let asset = self
             .asset(clip.asset)
-            .ok_or(PlaceClipError::UnknownAsset(clip.asset))?;
+            .ok_or(EditError::UnknownAsset(clip.asset))?;
         let moved = Clip {
             start: start.max(Time::ZERO),
             ..clip
@@ -337,22 +338,12 @@ impl Project {
         Ok(moved)
     }
 
-    pub fn move_clip(
-        &mut self,
-        id: ClipId,
-        track: usize,
-        start: Time,
-    ) -> Result<Clip, PlaceClipError> {
+    pub fn move_clip(&mut self, id: ClipId, track: usize, start: Time) -> Result<Clip, EditError> {
         let moved = self.moved_clip(id, track, start)?;
         self.replace_clip(moved, track)
     }
 
-    pub fn trimmed_clip(
-        &self,
-        id: ClipId,
-        edge: ClipEdge,
-        to: Time,
-    ) -> Result<Clip, PlaceClipError> {
+    pub fn trimmed_clip(&self, id: ClipId, edge: ClipEdge, to: Time) -> Result<Clip, EditError> {
         let (track, clip) = self.located_clip(id)?;
         let track = &self.timeline.tracks[track];
         let range = clip.timeline_range();
@@ -394,18 +385,57 @@ impl Project {
         }
     }
 
-    pub fn trim_clip(
-        &mut self,
-        id: ClipId,
-        edge: ClipEdge,
-        to: Time,
-    ) -> Result<Clip, PlaceClipError> {
+    pub fn trim_clip(&mut self, id: ClipId, edge: ClipEdge, to: Time) -> Result<Clip, EditError> {
         let trimmed = self.trimmed_clip(id, edge, to)?;
         let (track, _) = self.located_clip(id)?;
         self.replace_clip(trimmed, track)
     }
 
-    fn replace_clip(&mut self, clip: Clip, track: usize) -> Result<Clip, PlaceClipError> {
+    pub fn split_clip(&mut self, id: ClipId, at: Time) -> Result<(Clip, Clip), EditError> {
+        let (track, clip) = self.located_clip(id)?;
+        if !clip.is_cut_by(at) {
+            return Err(EditError::OutsideClip { clip: id, time: at });
+        }
+        let head_duration = at - clip.start;
+        let head = Clip {
+            source: TimeRange::new(clip.source.start, head_duration),
+            ..clip
+        };
+        let tail = Clip {
+            id: self.next_clip_id(),
+            start: at,
+            source: TimeRange::new(
+                clip.source.start + head_duration,
+                clip.source.duration - head_duration,
+            ),
+            ..clip
+        };
+        let track = &mut self.timeline.tracks[track];
+        track.remove(id);
+        track.insert(head)?;
+        track.insert(tail)?;
+        Ok((head, tail))
+    }
+
+    pub fn delete_clip(&mut self, id: ClipId) -> Result<Clip, EditError> {
+        let (track, _) = self.located_clip(id)?;
+        self.timeline.tracks[track]
+            .remove(id)
+            .ok_or(EditError::UnknownClip(id))
+    }
+
+    pub fn ripple_delete_clip(&mut self, id: ClipId) -> Result<Clip, EditError> {
+        let (track, _) = self.located_clip(id)?;
+        let track = &mut self.timeline.tracks[track];
+        let deleted = track.remove(id).ok_or(EditError::UnknownClip(id))?;
+        let end = deleted.timeline_range().end();
+        for later in track.clips.iter_mut().filter(|clip| clip.start >= end) {
+            later.start = later.start - deleted.source.duration;
+        }
+        Ok(deleted)
+    }
+
+    fn replace_clip(&mut self, clip: Clip, track: usize) -> Result<Clip, EditError> {
         let (from, _) = self.located_clip(clip.id)?;
         let removed = self.timeline.tracks[from].remove(clip.id);
         if let Err(overlap) = self.timeline.tracks[track].insert(clip) {
@@ -537,11 +567,11 @@ mod tests {
         let audio = project.add_asset("b.opus".into(), audio_info(3));
         assert_eq!(
             project.place_clip(video, 1, Time::ZERO),
-            Err(PlaceClipError::MissingStream(TrackKind::Audio))
+            Err(EditError::MissingStream(TrackKind::Audio))
         );
         assert_eq!(
             project.place_clip(audio, 0, Time::ZERO),
-            Err(PlaceClipError::MissingStream(TrackKind::Video))
+            Err(EditError::MissingStream(TrackKind::Video))
         );
         assert!(project.place_clip(audio, 1, Time::ZERO).is_ok());
     }
@@ -559,15 +589,15 @@ mod tests {
         );
         assert_eq!(
             project.place_clip(AssetId(9), 0, Time::ZERO),
-            Err(PlaceClipError::UnknownAsset(AssetId(9)))
+            Err(EditError::UnknownAsset(AssetId(9)))
         );
         assert_eq!(
             project.place_clip(asset, 7, Time::ZERO),
-            Err(PlaceClipError::UnknownTrack(7))
+            Err(EditError::UnknownTrack(7))
         );
         assert_eq!(
             project.place_clip(untimed, 0, Time::ZERO),
-            Err(PlaceClipError::NoDuration)
+            Err(EditError::NoDuration)
         );
     }
 
@@ -579,11 +609,11 @@ mod tests {
         let before = project.timeline.clone();
         assert!(matches!(
             project.clip_for(asset, 0, Time::from_seconds(2)),
-            Err(PlaceClipError::Overlapping(_))
+            Err(EditError::Overlapping(_))
         ));
         assert!(matches!(
             project.place_clip(asset, 0, Time::from_seconds(2)),
-            Err(PlaceClipError::Overlapping(_))
+            Err(EditError::Overlapping(_))
         ));
         assert_eq!(project.timeline, before);
         assert!(project.place_clip(asset, 0, Time::from_seconds(3)).is_ok());
@@ -668,7 +698,7 @@ mod tests {
         let before = project.timeline.clone();
         assert!(matches!(
             project.move_clip(first, 0, Time::from_seconds(15)),
-            Err(PlaceClipError::Overlapping(_))
+            Err(EditError::Overlapping(_))
         ));
         assert_eq!(project.timeline, before);
         project.move_clip(second, 0, Time::ZERO).unwrap_err();
@@ -688,7 +718,7 @@ mod tests {
         project.timeline.tracks.push(Track::new(TrackKind::Video));
         assert_eq!(
             project.move_clip(first, 1, Time::ZERO),
-            Err(PlaceClipError::MissingStream(TrackKind::Audio))
+            Err(EditError::MissingStream(TrackKind::Audio))
         );
         let moved = project.move_clip(first, 2, Time::from_seconds(-3)).unwrap();
         assert_eq!(moved.start, Time::ZERO);
@@ -696,7 +726,7 @@ mod tests {
         assert_eq!(project.timeline.tracks[0].clips().len(), 1);
         assert_eq!(
             project.move_clip(ClipId(99), 0, Time::ZERO),
-            Err(PlaceClipError::UnknownClip(ClipId(99)))
+            Err(EditError::UnknownClip(ClipId(99)))
         );
     }
 
@@ -765,5 +795,110 @@ mod tests {
             .unwrap();
         assert_eq!(latest.start, Time::from_seconds(10) - frame);
         assert_eq!(latest.source.duration, frame);
+    }
+
+    #[test]
+    fn splitting_leaves_two_clips_that_play_the_same_frames() {
+        let (mut project, _, first, _) = two_clip_project();
+        let (head, tail) = project.split_clip(first, Time::from_seconds(4)).unwrap();
+        assert_eq!(head.id, first);
+        assert_ne!(tail.id, first);
+        assert_eq!(
+            head.source,
+            TimeRange::new(Time::ZERO, Time::from_seconds(4))
+        );
+        assert_eq!(tail.start, Time::from_seconds(4));
+        assert_eq!(
+            tail.source,
+            TimeRange::new(Time::from_seconds(4), Time::from_seconds(6))
+        );
+        let track = &project.timeline.tracks[0];
+        assert_eq!(track.clips().len(), 3);
+        for seconds in [1, 3, 4, 9] {
+            let time = Time::from_seconds(seconds);
+            let source = track
+                .clip_at(time)
+                .and_then(|clip| clip.source_time_at(time));
+            assert_eq!(source, Some(time));
+        }
+    }
+
+    #[test]
+    fn splitting_needs_a_time_strictly_inside_the_clip() {
+        let (mut project, _, first, _) = two_clip_project();
+        let before = project.timeline.clone();
+        for seconds in [0, 10, 15] {
+            let time = Time::from_seconds(seconds);
+            assert_eq!(
+                project.split_clip(first, time),
+                Err(EditError::OutsideClip { clip: first, time })
+            );
+        }
+        assert_eq!(project.timeline, before);
+    }
+
+    #[test]
+    fn clips_cut_by_a_time_skip_clips_starting_or_ending_there() {
+        let (mut project, asset, first, _) = two_clip_project();
+        let video = project.timeline.tracks.len();
+        project.timeline.tracks.push(Track::new(TrackKind::Video));
+        let upper = project
+            .place_clip(asset, video, Time::from_seconds(5))
+            .unwrap()
+            .id;
+        let cut = |project: &Project, seconds| -> Vec<ClipId> {
+            project
+                .timeline
+                .clips_cut_by(Time::from_seconds(seconds))
+                .map(|clip| clip.id)
+                .collect()
+        };
+        assert_eq!(cut(&project, 7), [first, upper]);
+        assert_eq!(cut(&project, 10), [upper]);
+        assert_eq!(cut(&project, 5), [first]);
+        assert!(cut(&project, 20).is_empty());
+    }
+
+    #[test]
+    fn deleting_leaves_a_gap() {
+        let (mut project, _, first, second) = two_clip_project();
+        let deleted = project.delete_clip(first).unwrap();
+        assert_eq!(deleted.id, first);
+        assert_eq!(project.find_clip(first), None);
+        assert_eq!(
+            project.find_clip(second).map(|(_, clip)| clip.start),
+            Some(Time::from_seconds(20))
+        );
+        assert_eq!(
+            project.delete_clip(first),
+            Err(EditError::UnknownClip(first))
+        );
+    }
+
+    #[test]
+    fn ripple_delete_pulls_later_clips_back_by_the_clip_length() {
+        let (mut project, asset, first, second) = two_clip_project();
+        let third = project
+            .place_clip(asset, 0, Time::from_seconds(30))
+            .unwrap()
+            .id;
+        project.split_clip(first, Time::from_seconds(4)).unwrap();
+        project.ripple_delete_clip(first).unwrap();
+        let starts: Vec<_> = project.timeline.tracks[0]
+            .clips()
+            .iter()
+            .map(|clip| clip.start)
+            .collect();
+        assert_eq!(starts, [0, 16, 26].map(Time::from_seconds).to_vec());
+        assert_eq!(
+            project.find_clip(second).map(|(_, clip)| clip.source.start),
+            Some(Time::ZERO)
+        );
+        project.ripple_delete_clip(second).unwrap();
+        assert_eq!(
+            project.find_clip(third).map(|(_, clip)| clip.start),
+            Some(Time::from_seconds(16))
+        );
+        assert_eq!(project.timeline.duration(), Time::from_seconds(26));
     }
 }

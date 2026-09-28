@@ -5,8 +5,8 @@ mod timecode;
 
 pub use media::{AudioStream, MediaInfo, Stream, VideoStream};
 pub use project::{
-    Asset, AssetId, Clip, ClipEdge, ClipId, OverlappingClip, PlaceClipError, Project,
-    SequenceSettings, Timeline, Track, TrackKind,
+    Asset, AssetId, Clip, ClipEdge, ClipId, EditError, OverlappingClip, Project, SequenceSettings,
+    Timeline, Track, TrackKind,
 };
 pub use time::{FLICKS_PER_SECOND, FrameRate, Time, TimeRange};
 pub use timecode::Timecode;

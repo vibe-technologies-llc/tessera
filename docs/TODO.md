@@ -6,7 +6,6 @@
 
 ## Timeline editing
 
-- Split at the playhead, delete and ripple delete
 - Add, remove and reorder tracks
 - Snapping to clip edges and the playhead
 - Undo and redo as a command history over `Project`

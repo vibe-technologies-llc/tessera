@@ -30,7 +30,10 @@ actions!(
         StepForward,
         ZoomIn,
         ZoomOut,
-        ZoomToFit
+        ZoomToFit,
+        SplitAtPlayhead,
+        DeleteClip,
+        RippleDeleteClip
     ]
 );
 
@@ -48,6 +51,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("=", ZoomIn, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("-", ZoomOut, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("shift-z", ZoomToFit, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("ctrl-k", SplitAtPlayhead, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("delete", DeleteClip, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("backspace", DeleteClip, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("shift-delete", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("shift-backspace", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
     ]);
 }
 

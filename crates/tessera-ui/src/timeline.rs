@@ -8,7 +8,7 @@ use gpui::{
     px, size,
 };
 use tessera_timeline::{
-    Clip, ClipEdge, ClipId, FrameRate, PlaceClipError, Project, Time, TimeRange, Timecode, Track,
+    Clip, ClipEdge, ClipId, EditError, FrameRate, Project, Time, TimeRange, Timecode, Track,
     TrackKind,
 };
 
@@ -166,6 +166,59 @@ impl TimelinePanel {
     pub fn zoom_to_fit(&mut self, cx: &mut Context<Self>) {
         let duration = self.project.read(cx).timeline.duration();
         self.set_viewport(Viewport::fitting(duration, self.lanes.size.width), cx);
+    }
+
+    pub fn split_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let time = self.playhead.read(cx).time();
+        let selection = self.selection;
+        self.project.update(cx, |project, cx| {
+            let selected = selection
+                .and_then(|id| project.find_clip(id))
+                .map(|(_, clip)| *clip)
+                .filter(|clip| clip.is_cut_by(time));
+            let targets: Vec<ClipId> = match selected {
+                Some(clip) => vec![clip.id],
+                None => project
+                    .timeline
+                    .clips_cut_by(time)
+                    .map(|clip| clip.id)
+                    .collect(),
+            };
+            let mut split = false;
+            for id in targets {
+                match project.split_clip(id, time) {
+                    Ok(_) => split = true,
+                    Err(error) => tracing::warn!(%error, "could not split the clip"),
+                }
+            }
+            if split {
+                cx.notify();
+            }
+        });
+    }
+
+    pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
+        self.remove_selection(Project::delete_clip, cx);
+    }
+
+    pub fn ripple_delete_selection(&mut self, cx: &mut Context<Self>) {
+        self.remove_selection(Project::ripple_delete_clip, cx);
+    }
+
+    fn remove_selection(
+        &mut self,
+        remove: impl FnOnce(&mut Project, ClipId) -> Result<Clip, EditError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selection.take() else {
+            return;
+        };
+        self.project
+            .update(cx, |project, cx| match remove(project, id) {
+                Ok(_) => cx.notify(),
+                Err(error) => tracing::warn!(%error, "could not delete the clip"),
+            });
+        cx.notify();
     }
 
     fn zoom_around_playhead(&mut self, factor: f32, cx: &mut Context<Self>) {
@@ -339,7 +392,7 @@ impl TimelinePanel {
         &mut self,
         accepts: impl FnOnce(&DropPreview) -> bool,
         cx: &mut Context<Self>,
-        edit: impl FnOnce(&mut Project, DropPreview) -> Result<Clip, PlaceClipError>,
+        edit: impl FnOnce(&mut Project, DropPreview) -> Result<Clip, EditError>,
     ) {
         let preview = self
             .drop_preview
@@ -530,10 +583,10 @@ fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
         .rounded_sm()
 }
 
-fn placement(track: usize, placed: Result<Clip, PlaceClipError>) -> Option<DropPreview> {
+fn placement(track: usize, placed: Result<Clip, EditError>) -> Option<DropPreview> {
     let (range, fits) = match placed {
         Ok(clip) => (clip.timeline_range(), true),
-        Err(PlaceClipError::Overlapping(overlap)) => (overlap.inserted, false),
+        Err(EditError::Overlapping(overlap)) => (overlap.inserted, false),
         Err(_) => return None,
     };
     Some(DropPreview { track, range, fits })
@@ -769,10 +822,25 @@ mod tests {
         px(TRACK_HEADER_WIDTH + seconds * ONE_SECOND)
     }
 
+    const V2: usize = 2;
+
     fn timeline_with_a_clip(
         cx: &mut TestAppContext,
     ) -> (Entity<TimelinePanel>, &mut VisualTestContext, ClipId) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1)]);
+        (panel, cx, clips[0])
+    }
+
+    fn timeline_with_clips<'a>(
+        cx: &'a mut TestAppContext,
+        clips: &[(usize, i64)],
+    ) -> (
+        Entity<TimelinePanel>,
+        &'a mut VisualTestContext,
+        Vec<ClipId>,
+    ) {
         let mut project = Project::new("test");
+        project.timeline.tracks.push(Track::new(TrackKind::Video));
         let info = MediaInfo {
             duration: Some(Time::from_seconds(8)),
             streams: vec![Stream::Video(VideoStream {
@@ -784,16 +852,46 @@ mod tests {
             })],
         };
         let asset = project.add_asset("a.mkv".into(), info);
-        let clip = project
-            .place_clip(asset, 0, Time::from_seconds(1))
-            .unwrap()
-            .id;
+        let clips = clips
+            .iter()
+            .map(|&(track, seconds)| {
+                project
+                    .place_clip(asset, track, Time::from_seconds(seconds))
+                    .unwrap()
+                    .id
+            })
+            .collect();
         let project = cx.new(|_| project);
         let (panel, cx) = cx.add_window_view(|_, cx| {
             let playhead = cx.new(|_| Playhead::new(project.clone()));
             TimelinePanel::new(project, playhead, cx)
         });
-        (panel, cx, clip)
+        (panel, cx, clips)
+    }
+
+    fn seek(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext, seconds: i64) {
+        let playhead = cx.read(|cx| panel.read(cx).playhead.clone());
+        playhead.update(cx, |playhead, cx| {
+            playhead.seek(Time::from_seconds(seconds), cx);
+        });
+    }
+
+    fn starts_on(
+        panel: &Entity<TimelinePanel>,
+        cx: &mut VisualTestContext,
+        track: usize,
+    ) -> Vec<Time> {
+        cx.read(|cx| {
+            panel.read(cx).project.read(cx).timeline.tracks[track]
+                .clips()
+                .iter()
+                .map(|clip| clip.start)
+                .collect()
+        })
+    }
+
+    fn seconds(values: &[i64]) -> Vec<Time> {
+        values.iter().copied().map(Time::from_seconds).collect()
     }
 
     fn drag(cx: &mut VisualTestContext, from: Pixels, to: Pixels) {
@@ -883,5 +981,38 @@ mod tests {
         let tracks = [TrackKind::Video, TrackKind::Audio, TrackKind::Video].map(Track::new);
         let labels: Vec<_> = track_labels(&tracks).collect();
         assert_eq!(labels, ["V1", "A1", "V2"]);
+    }
+
+    #[gpui::test]
+    fn splitting_cuts_the_selected_clip_or_every_clip_under_the_playhead(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1), (V2, 2)]);
+        seek(&panel, cx, 4);
+        panel.update(cx, TimelinePanel::split_at_playhead);
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 4]));
+        assert_eq!(starts_on(&panel, cx, V2), seconds(&[2, 4]));
+        cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
+        seek(&panel, cx, 3);
+        panel.update(cx, TimelinePanel::split_at_playhead);
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 3, 4]));
+        assert_eq!(starts_on(&panel, cx, V2), seconds(&[2, 4]));
+    }
+
+    #[gpui::test]
+    fn deleting_removes_the_selected_clip_and_leaves_a_gap(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1), (0, 10)]);
+        panel.update(cx, TimelinePanel::delete_selection);
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 10]));
+        cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
+        panel.update(cx, TimelinePanel::delete_selection);
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[10]));
+        assert_eq!(cx.read(|cx| panel.read(cx).selection), None);
+    }
+
+    #[gpui::test]
+    fn ripple_delete_closes_the_gap(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1), (0, 10)]);
+        cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
+        panel.update(cx, TimelinePanel::ripple_delete_selection);
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[2]));
     }
 }

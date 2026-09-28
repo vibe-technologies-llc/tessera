@@ -28,7 +28,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `trimmed_clip` compute the result without mutating, while `move_clip` and `trim_clip` apply it. A
   move is refused where it would overlap or where the target track's kind has no matching stream.
   A trim is clamped instead, between the neighbouring clips, the ends of the media and a minimum
-  length of one frame. Later video tracks sit on top of earlier ones, so
+  length of one frame. `split_clip` cuts a clip strictly inside it, keeping the id on the head
+  and giving the tail a new one. `ripple_delete_clip` pulls the later clips on the same track back
+  by the deleted clip's length, while `delete_clip` leaves a gap. Later video tracks sit on top of
+  earlier ones, so
   `Timeline::top_video_clip_at` searches them from the last.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and frame decode, and encode goes here.
@@ -65,7 +68,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   places the clip at the previewed, frame-snapped start. Clips on the timeline work the same way.
   Pressing a lane selects the clip under the pointer, or clears the selection, and records where
   the clip was grabbed. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
-  drag that the lanes preview and commit as a move or a trim. Panel interactions are tested
+  drag that the lanes preview and commit as a move or a trim. Ctrl+K splits the selected clip at the
+  playhead, or every clip under it when the selection is elsewhere or empty. Delete or Backspace
+  deletes the selection, and with Shift held they ripple delete it. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` shows the top video clip's
   frame under the playhead, decoded at sequence size on a background task. It keeps one decoder
