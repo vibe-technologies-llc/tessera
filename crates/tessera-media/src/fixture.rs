@@ -7,8 +7,8 @@ use ffmpeg_next::{
 };
 use tessera_timeline::FrameRate;
 
-pub const WIDTH: u32 = 64;
-pub const HEIGHT: u32 = 48;
+pub const WIDTH: u32 = 128;
+pub const HEIGHT: u32 = 96;
 pub const FRAME_COUNT: i64 = 20;
 pub const FRAME_RATE: FrameRate = FrameRate::FPS_25;
 pub const AUDIO_SAMPLE_RATE: u32 = 44_100;
@@ -17,6 +17,8 @@ const AUDIO_FORMAT: format::Sample = format::Sample::I16(sample::Type::Packed);
 const KEYFRAME_INTERVAL: u32 = 5;
 const NEUTRAL_CHROMA: u8 = 128;
 const SCENE_CUT_DETECTION_OFF: &str = "1000000000";
+const H264_ENCODER: &str = "libx264";
+const H264_FIXED_GOP: &str = "keyint=5:min-keyint=5:scenecut=0:open-gop=0:log=-1";
 
 pub fn luma(index: i64) -> u8 {
     u8::try_from(20 + index * 10).expect("fixture luma stays in range")
@@ -47,20 +49,36 @@ enum Streams {
     VideoOnly,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VideoCodec {
+    Mpeg4,
+    H264,
+}
+
 impl Fixture {
     pub fn generate(name: &str) -> Self {
-        Self::generate_with(name, Streams::VideoAndAudio)
+        Self::generate_with(name, Streams::VideoAndAudio, VideoCodec::Mpeg4)
     }
 
     pub fn generate_without_audio(name: &str) -> Self {
-        Self::generate_with(name, Streams::VideoOnly)
+        Self::generate_with(name, Streams::VideoOnly, VideoCodec::Mpeg4)
     }
 
-    fn generate_with(name: &str, streams: Streams) -> Self {
+    pub fn generate_h264(name: &str) -> Option<Self> {
+        crate::init().unwrap();
+        encoder::find_by_name(H264_ENCODER)?;
+        Some(Self::generate_with(
+            name,
+            Streams::VideoOnly,
+            VideoCodec::H264,
+        ))
+    }
+
+    fn generate_with(name: &str, streams: Streams, codec: VideoCodec) -> Self {
         crate::init().unwrap();
         let path =
             std::env::temp_dir().join(format!("tessera-media-{}-{name}.mkv", std::process::id()));
-        encode(&path, streams).unwrap();
+        encode(&path, streams, codec).unwrap();
         Self { path }
     }
 
@@ -81,9 +99,9 @@ struct Muxed<E> {
     time_base: Rational,
 }
 
-fn encode(path: &Path, streams: Streams) -> Result<(), ffmpeg_next::Error> {
+fn encode(path: &Path, streams: Streams, codec: VideoCodec) -> Result<(), ffmpeg_next::Error> {
     let mut output = format::output(path)?;
-    let mut video = add_video(&mut output)?;
+    let mut video = add_video(&mut output, codec)?;
     let mut audio = match streams {
         Streams::VideoAndAudio => Some(add_audio(&mut output)?),
         Streams::VideoOnly => None,
@@ -151,9 +169,20 @@ fn wants_global_header(output: &format::context::Output) -> bool {
 
 fn add_video(
     output: &mut format::context::Output,
+    video_codec: VideoCodec,
 ) -> Result<Muxed<encoder::video::Encoder>, ffmpeg_next::Error> {
     let time_base = Rational::new(FRAME_RATE.denominator as i32, FRAME_RATE.numerator as i32);
-    let codec = encoder::find(codec::Id::MPEG4).ok_or(ffmpeg_next::Error::EncoderNotFound)?;
+    let (codec, options) = match video_codec {
+        VideoCodec::Mpeg4 => (
+            encoder::find(codec::Id::MPEG4),
+            Dictionary::from_iter([("sc_threshold", SCENE_CUT_DETECTION_OFF)]),
+        ),
+        VideoCodec::H264 => (
+            encoder::find_by_name(H264_ENCODER),
+            Dictionary::from_iter([("x264-params", H264_FIXED_GOP)]),
+        ),
+    };
+    let codec = codec.ok_or(ffmpeg_next::Error::EncoderNotFound)?;
     let mut video = codec::Context::new_with_codec(codec).encoder().video()?;
     video.set_width(WIDTH);
     video.set_height(HEIGHT);
@@ -164,7 +193,6 @@ fn add_video(
     if wants_global_header(output) {
         video.set_flags(codec::Flags::GLOBAL_HEADER);
     }
-    let options = Dictionary::from_iter([("sc_threshold", SCENE_CUT_DETECTION_OFF)]);
     let encoder = video.open_as_with(codec, options)?;
     let mut stream = output.add_stream(codec)?;
     stream.set_parameters(&encoder);

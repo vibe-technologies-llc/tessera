@@ -1,8 +1,3 @@
-## Decode
-
-- Hardware decode through the discovered accelerators, VAAPI and Vulkan Video first, falling back to
-  software
-
 ## Playback
 
 - Audio output through PipeWire, with the audio clock driving A/V sync

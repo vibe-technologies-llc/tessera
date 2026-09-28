@@ -335,16 +335,24 @@ fn decode_layer(
     decoders: &mut Decoders,
     layer: &LayerRequest,
 ) -> Result<Arc<VideoFrame>, tessera_media::Error> {
-    let decoder = match decoders.entry(layer.decoder.clone()) {
-        Entry::Occupied(entry) => entry.into_mut(),
+    let (decoder, newly_opened) = match decoders.entry(layer.decoder.clone()) {
+        Entry::Occupied(entry) => (entry.into_mut(), false),
         Entry::Vacant(entry) => {
             let DecoderKey { path, bounds } = entry.key();
             let (width, height) = *bounds;
             let opened = VideoDecoder::open(path)?.fit_within(width, height);
-            entry.insert(opened)
+            (entry.insert(opened), true)
         }
     };
-    decoder.frame_at(layer.time)
+    let frame = decoder.frame_at(layer.time)?;
+    if newly_opened {
+        tracing::debug!(
+            path = %layer.decoder.path.display(),
+            hw_accel = ?decoder.hw_accel(),
+            "viewer decoder opened"
+        );
+    }
+    Ok(frame)
 }
 
 fn assemble_image(

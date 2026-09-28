@@ -9,7 +9,7 @@ mod probe;
 pub use audio::{AudioBuffer, AudioDecoder};
 pub use decode::{VideoDecoder, VideoFrame};
 pub use ffmpeg_next::Error as FfmpegError;
-pub use hw::{HwAccel, available_hw_accels};
+pub use hw::{HwAccel, PREFERRED_HW_ACCELS, available_hw_accels};
 pub use probe::probe;
 use thiserror::Error;
 

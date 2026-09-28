@@ -62,6 +62,17 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   API, apart from the `FfmpegError` re-export. `VideoDecoder` is `Send` so it can move to a
   background task: ffmpeg-next leaves its scaler context `!Send`, but an `SwsContext` has no thread
   affinity and each one is owned by a single decoder, so `Scaler` implements `Send` by hand.
+  `VideoDecoder::open` decodes in hardware through the first of `PREFERRED_HW_ACCELS` (VAAPI, then
+  Vulkan Video) that the codec has a device config for and whose device can be created;
+  `open_with` takes the list, and an empty one decodes in software. Each device is created once
+  per process and shared by every decoder, and a failed creation is remembered too. FFmpeg's
+  default `get_format` picks the hardware format, and falls back to software by itself when the
+  hardware refuses the stream (a codec profile or size the driver lacks), so `hw_accel` reports
+  the accelerator only while decoded frames really come from it. Frames stay on the GPU while
+  decoding forward, with `extra_hw_frames` covering the two the decoder holds, and only the frame
+  being shown is downloaded (`av_hwframe_transfer_data`) before scaling to BGRA. The test fixture
+  is 128×96 so hardware accepts it, and an H.264 variant, generated when `libx264` is present, runs
+  the decode tests through the preferred accelerators against software.
   `AudioDecoder::samples` returns an `AudioBuffer` of exactly the requested number of interleaved
   stereo `f32` frames at the rate the decoder was opened with, silent before the stream starts and
   past its end. It resamples through swresample, whose context ffmpeg-next already makes `Send`:

@@ -12,12 +12,17 @@ use ffmpeg_next::{
 };
 use tessera_timeline::{FLICKS_PER_SECOND, Time};
 
-use crate::{Error, cache::FrameCache};
+use crate::{
+    Error,
+    cache::FrameCache,
+    hw::{self, HwAccel, PREFERRED_HW_ACCELS},
+};
 
 const OUTPUT_FORMAT: Pixel = Pixel::BGRA;
 const BYTES_PER_PIXEL: usize = 4;
 const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const UNINDEXED_FORWARD_WINDOW: Time = Time::from_seconds(1);
+const HELD_FRAMES: i32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFrame {
@@ -34,6 +39,7 @@ pub struct VideoDecoder {
     time_base: Rational,
     start: i64,
     decoder: decoder::Video,
+    hw_accel: Option<HwAccel>,
     converter: Converter,
     current: Option<frame::Video>,
     ahead: Option<frame::Video>,
@@ -55,6 +61,10 @@ unsafe impl Send for Scaler {}
 
 impl VideoDecoder {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_with(path, PREFERRED_HW_ACCELS)
+    }
+
+    pub fn open_with(path: impl AsRef<Path>, hw_accels: &[HwAccel]) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
         let input = format::input(&path).map_err(|source| Error::Open {
             path: path.clone(),
@@ -70,12 +80,21 @@ impl VideoDecoder {
             AV_NOPTS_VALUE => 0,
             start => start,
         };
-        let decoder = codec::Context::from_parameters(stream.parameters())
-            .and_then(|context| context.decoder().video())
-            .map_err(|source| Error::Stream {
-                index: stream_index,
-                source,
-            })?;
+        let stream_error = |source| Error::Stream {
+            index: stream_index,
+            source,
+        };
+        let mut context =
+            codec::Context::from_parameters(stream.parameters()).map_err(stream_error)?;
+        let codec = decoder::find(context.id())
+            .ok_or(ffmpeg_next::Error::DecoderNotFound)
+            .map_err(stream_error)?;
+        let hw_accel = hw::attach_device(&mut context, codec, hw_accels, HELD_FRAMES);
+        let decoder = context
+            .decoder()
+            .open_as(codec)
+            .and_then(|opened| opened.video())
+            .map_err(stream_error)?;
         Ok(Self {
             path,
             input,
@@ -83,6 +102,7 @@ impl VideoDecoder {
             time_base,
             start,
             decoder,
+            hw_accel,
             converter: Converter {
                 bounds: None,
                 scaler: None,
@@ -106,6 +126,10 @@ impl VideoDecoder {
     pub fn cache_capacity(mut self, bytes: usize) -> Self {
         self.cache = FrameCache::new(bytes);
         self
+    }
+
+    pub fn hw_accel(&self) -> Option<HwAccel> {
+        self.hw_accel
     }
 
     pub fn frame_at(&mut self, time: Time) -> Result<Arc<VideoFrame>, Error> {
@@ -214,6 +238,9 @@ impl VideoDecoder {
         let mut frame = frame::Video::empty();
         loop {
             if self.decoder.receive_frame(&mut frame).is_ok() {
+                if !hw::is_hardware_frame(&frame) {
+                    self.hw_accel = None;
+                }
                 return Ok(Some(frame));
             }
             if self.drained {
@@ -243,6 +270,13 @@ impl VideoDecoder {
 
 impl Converter {
     fn convert(&mut self, frame: &frame::Video, time: Time) -> Result<VideoFrame, Error> {
+        let downloaded;
+        let frame = if hw::is_hardware_frame(frame) {
+            downloaded = hw::download(frame).map_err(|source| Error::Decode { source })?;
+            &downloaded
+        } else {
+            frame
+        };
         let source = (frame.format(), frame.width(), frame.height());
         let (width, height) = fitted_size(frame.width(), frame.height(), self.bounds);
         let scaler = match self.scaler.take() {
@@ -423,6 +457,61 @@ mod tests {
         let frame = decoder.frame_at(Time::from_seconds(60)).unwrap();
         assert_eq!(frame.time, fixture::FRAME_RATE.frame_to_time(last));
         assert_shows(&frame, last);
+    }
+
+    #[test]
+    fn no_accelerator_offered_decodes_in_software() {
+        let fixture = Fixture::generate("software_only");
+        let mut decoder = VideoDecoder::open_with(fixture.path(), &[]).unwrap();
+        assert_eq!(decoder.hw_accel(), None);
+        for index in [0, 9, 4] {
+            let frame = decoder
+                .frame_at(middle_of_frame(fixture::FRAME_RATE, index))
+                .unwrap();
+            assert_shows(&frame, index);
+        }
+        assert_eq!(decoder.hw_accel(), None);
+    }
+
+    #[test]
+    fn preferred_accelerators_decode_like_software() {
+        let Some(fixture) = Fixture::generate_h264("h264_accelerated") else {
+            return;
+        };
+        let mut software = VideoDecoder::open_with(fixture.path(), &[]).unwrap();
+        let mut preferred = VideoDecoder::open(fixture.path()).unwrap();
+        for index in [0, 7, 3, 12, 19, 11, 5] {
+            let time = middle_of_frame(fixture::FRAME_RATE, index);
+            let expected = software.frame_at(time).unwrap();
+            let actual = preferred.frame_at(time).unwrap();
+            assert_eq!(
+                (actual.width, actual.height, actual.time),
+                (expected.width, expected.height, expected.time)
+            );
+            assert_shows(&expected, index);
+            assert_shows(&actual, index);
+        }
+        if let Some(accel) = preferred.hw_accel() {
+            assert!(PREFERRED_HW_ACCELS.contains(&accel), "{accel:?}");
+        }
+    }
+
+    #[test]
+    fn stepping_through_every_frame_with_preferred_accelerators() {
+        let Some(fixture) = Fixture::generate_h264("h264_stepping") else {
+            return;
+        };
+        let mut decoder = VideoDecoder::open(fixture.path())
+            .unwrap()
+            .cache_capacity(0);
+        let forward = 0..fixture::FRAME_COUNT;
+        for index in forward.clone().chain(forward.rev()) {
+            let frame = decoder
+                .frame_at(fixture::FRAME_RATE.frame_to_time(index))
+                .unwrap();
+            assert_eq!(frame.time, fixture::FRAME_RATE.frame_to_time(index));
+            assert_shows(&frame, index);
+        }
     }
 
     #[test]
