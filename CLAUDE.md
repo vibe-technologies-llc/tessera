@@ -20,7 +20,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   rate, the NTSC 1000/1001 rates included, has an integral frame duration in flicks, so frame ↔ time
   conversion through `FrameRate` stays exact. Never store time as floating-point seconds;
   `as_seconds_f64` exists only for drawing. `Timecode` labels a time at a frame rate, using
-  drop-frame (`;` before the frames) for the 30000/1001 and 60000/1001 rates. A `Track` keeps its
+  drop-frame (`;` before the frames) for the 30000/1001 and 60000/1001 rates. `Time::from_samples`
+  and `Time::to_samples` convert between time and sample indices at a sample rate the same way,
+  flooring, and every common audio rate from 8 kHz to 192 kHz has an integral sample duration.
+  `SequenceSettings` carries the project-wide `sample_rate`, 48 000 by default. A `Track` keeps its
   clips sorted by start and refuses overlapping inserts. `Project::clip_for` builds the clip that
   would cover a whole asset at a start time on a track, checking the stream kind, the duration and
   overlaps without mutating, and `Project::place_clip` inserts it. Every clip carries a `ClipId`
@@ -40,13 +43,21 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `undo` and `redo` swap those snapshots in, the stack keeps the last `HISTORY_DEPTH` commands,
   and a new command clears the redo stack.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
-  system FFmpeg). It covers probing, hwaccel discovery and frame decode, and encode goes here.
-  `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
+  system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
+  here. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
   byte-bounded LRU cache keyed by the span each frame covers. FFmpeg types do not cross its public
   API, apart from the `FfmpegError` re-export. `VideoDecoder` is `Send` so it can move to a
   background task: ffmpeg-next leaves its scaler context `!Send`, but an `SwsContext` has no thread
   affinity and each one is owned by a single decoder, so `Scaler` implements `Send` by hand.
+  `AudioDecoder::samples` returns an `AudioBuffer` of exactly the requested number of interleaved
+  stereo `f32` frames at the rate the decoder was opened with, silent before the stream starts and
+  past its end. It resamples through swresample, whose context ffmpeg-next already makes `Send`:
+  mono is resampled alone and duplicated to both channels, more channels are downmixed. The first
+  frame after a seek is placed by its pts, and the output then continues sample by sample, so a
+  read starting where the last one ended never seeks. A read behind the last one, or more than a
+  second past what is decoded, seeks 100 ms early (flushing the decoder and the resampler) and
+  discards up to the target.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` (device + queue) for compositing timeline
   frames. It isn't wired into the UI yet.
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>` through its `ProjectEditor`, and each panel

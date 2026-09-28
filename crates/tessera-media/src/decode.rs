@@ -305,13 +305,13 @@ fn fitted_size(width: u32, height: u32, bounds: Option<(u32, u32)>) -> (u32, u32
     (fitted.0.max(1) as u32, fitted.1.max(1) as u32)
 }
 
-fn to_stream_ts(time: Time, time_base: Rational) -> i64 {
+pub(crate) fn to_stream_ts(time: Time, time_base: Rational) -> i64 {
     let numerator = i128::from(time.flicks()) * i128::from(time_base.denominator());
     let denominator = i128::from(time_base.numerator()) * i128::from(FLICKS_PER_SECOND);
     numerator.div_euclid(denominator) as i64
 }
 
-fn from_stream_ts(ts: i64, time_base: Rational) -> Time {
+pub(crate) fn from_stream_ts(ts: i64, time_base: Rational) -> Time {
     Time::from_rational(
         ts * i64::from(time_base.numerator()),
         i64::from(time_base.denominator()),

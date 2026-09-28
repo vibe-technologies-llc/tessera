@@ -66,6 +66,26 @@ fn frame_rate(rate: ffmpeg_next::Rational) -> Option<FrameRate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture::{self, Fixture};
+
+    #[test]
+    fn fixture_has_one_video_and_one_audio_stream() {
+        let fixture = Fixture::generate("probe_streams");
+        let info = probe(fixture.path()).unwrap();
+        let video: Vec<_> = info.video().collect();
+        let audio: Vec<_> = info.audio().collect();
+        assert_eq!(video.len(), 1);
+        assert_eq!(
+            (video[0].width, video[0].height),
+            (fixture::WIDTH, fixture::HEIGHT)
+        );
+        assert_eq!(audio.len(), 1);
+        assert_eq!(audio[0].codec, "pcm_s16le");
+        assert_eq!(
+            (audio[0].sample_rate, audio[0].channels),
+            (fixture::AUDIO_SAMPLE_RATE, fixture::AUDIO_CHANNELS)
+        );
+    }
 
     #[test]
     fn missing_file_is_an_open_error() {

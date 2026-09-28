@@ -1,18 +1,33 @@
 use std::path::{Path, PathBuf};
 
-use ffmpeg_next::{Dictionary, Packet, Rational, codec, encoder, format, frame};
+use ffmpeg_next::{
+    ChannelLayout, Dictionary, Packet, Rational, codec, encoder,
+    format::{self, sample},
+    frame,
+};
 use tessera_timeline::FrameRate;
 
 pub const WIDTH: u32 = 64;
 pub const HEIGHT: u32 = 48;
 pub const FRAME_COUNT: i64 = 20;
 pub const FRAME_RATE: FrameRate = FrameRate::FPS_25;
+pub const AUDIO_SAMPLE_RATE: u32 = 44_100;
+pub const AUDIO_CHANNELS: u16 = 1;
+const AUDIO_FORMAT: format::Sample = format::Sample::I16(sample::Type::Packed);
 const KEYFRAME_INTERVAL: u32 = 5;
 const NEUTRAL_CHROMA: u8 = 128;
 const SCENE_CUT_DETECTION_OFF: &str = "1000000000";
 
 pub fn luma(index: i64) -> u8 {
     u8::try_from(20 + index * 10).expect("fixture luma stays in range")
+}
+
+pub fn audio_level(index: i64) -> f32 {
+    0.04 * (index + 1) as f32
+}
+
+pub fn audio_frame_start(index: i64, sample_rate: u32) -> i64 {
+    FRAME_RATE.frame_to_time(index).to_samples(sample_rate)
 }
 
 pub fn expected_grey(index: i64) -> u8 {
@@ -26,12 +41,26 @@ pub struct Fixture {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Streams {
+    VideoAndAudio,
+    VideoOnly,
+}
+
 impl Fixture {
     pub fn generate(name: &str) -> Self {
+        Self::generate_with(name, Streams::VideoAndAudio)
+    }
+
+    pub fn generate_without_audio(name: &str) -> Self {
+        Self::generate_with(name, Streams::VideoOnly)
+    }
+
+    fn generate_with(name: &str, streams: Streams) -> Self {
         crate::init().unwrap();
         let path =
             std::env::temp_dir().join(format!("tessera-media-{}-{name}.mkv", std::process::id()));
-        encode(&path).unwrap();
+        encode(&path, streams).unwrap();
         Self { path }
     }
 
@@ -46,14 +75,85 @@ impl Drop for Fixture {
     }
 }
 
-fn encode(path: &Path) -> Result<(), ffmpeg_next::Error> {
-    let time_base = Rational::new(FRAME_RATE.denominator as i32, FRAME_RATE.numerator as i32);
+struct Muxed<E> {
+    encoder: E,
+    stream: usize,
+    time_base: Rational,
+}
+
+fn encode(path: &Path, streams: Streams) -> Result<(), ffmpeg_next::Error> {
     let mut output = format::output(path)?;
-    let codec = encoder::find(codec::Id::MPEG4).ok_or(ffmpeg_next::Error::EncoderNotFound)?;
-    let global_header = output
+    let mut video = add_video(&mut output)?;
+    let mut audio = match streams {
+        Streams::VideoAndAudio => Some(add_audio(&mut output)?),
+        Streams::VideoOnly => None,
+    };
+    output.write_header()?;
+    for index in 0..FRAME_COUNT {
+        video.encoder.send_frame(&picture(index))?;
+        drain(
+            &mut video.encoder,
+            video.stream,
+            video.time_base,
+            &mut output,
+        )?;
+        if let Some(audio) = &mut audio {
+            audio.encoder.send_frame(&audio_block(index))?;
+            drain(
+                &mut audio.encoder,
+                audio.stream,
+                audio.time_base,
+                &mut output,
+            )?;
+        }
+    }
+    video.encoder.send_eof()?;
+    drain(
+        &mut video.encoder,
+        video.stream,
+        video.time_base,
+        &mut output,
+    )?;
+    if let Some(audio) = &mut audio {
+        audio.encoder.send_eof()?;
+        drain(
+            &mut audio.encoder,
+            audio.stream,
+            audio.time_base,
+            &mut output,
+        )?;
+    }
+    output.write_trailer()
+}
+
+fn drain(
+    encoder: &mut encoder::Encoder,
+    stream: usize,
+    time_base: Rational,
+    output: &mut format::context::Output,
+) -> Result<(), ffmpeg_next::Error> {
+    let stream_time_base = output.stream(stream).expect("stream was added").time_base();
+    let mut packet = Packet::empty();
+    while encoder.receive_packet(&mut packet).is_ok() {
+        packet.set_stream(stream);
+        packet.rescale_ts(time_base, stream_time_base);
+        packet.write_interleaved(output)?;
+    }
+    Ok(())
+}
+
+fn wants_global_header(output: &format::context::Output) -> bool {
+    output
         .format()
         .flags()
-        .contains(format::Flags::GLOBAL_HEADER);
+        .contains(format::Flags::GLOBAL_HEADER)
+}
+
+fn add_video(
+    output: &mut format::context::Output,
+) -> Result<Muxed<encoder::video::Encoder>, ffmpeg_next::Error> {
+    let time_base = Rational::new(FRAME_RATE.denominator as i32, FRAME_RATE.numerator as i32);
+    let codec = encoder::find(codec::Id::MPEG4).ok_or(ffmpeg_next::Error::EncoderNotFound)?;
     let mut video = codec::Context::new_with_codec(codec).encoder().video()?;
     video.set_width(WIDTH);
     video.set_height(HEIGHT);
@@ -61,33 +161,64 @@ fn encode(path: &Path) -> Result<(), ffmpeg_next::Error> {
     video.set_time_base(time_base);
     video.set_frame_rate(Some(time_base.invert()));
     video.set_gop(KEYFRAME_INTERVAL);
-    if global_header {
+    if wants_global_header(output) {
         video.set_flags(codec::Flags::GLOBAL_HEADER);
     }
     let options = Dictionary::from_iter([("sc_threshold", SCENE_CUT_DETECTION_OFF)]);
-    let mut encoder = video.open_as_with(codec, options)?;
-    output.add_stream(codec)?.set_parameters(&encoder);
-    output.write_header()?;
-    let stream_time_base = output.stream(0).expect("stream was added").time_base();
-    let write_ready = |encoder: &mut encoder::Video, output: &mut format::context::Output| {
-        let mut packet = Packet::empty();
-        while encoder.receive_packet(&mut packet).is_ok() {
-            packet.set_stream(0);
-            packet.rescale_ts(time_base, stream_time_base);
-            packet.write_interleaved(output)?;
-        }
-        Ok::<_, ffmpeg_next::Error>(())
-    };
-    for index in 0..FRAME_COUNT {
-        let mut picture = frame::Video::new(format::Pixel::YUV420P, WIDTH, HEIGHT);
-        picture.data_mut(0).fill(luma(index));
-        picture.data_mut(1).fill(NEUTRAL_CHROMA);
-        picture.data_mut(2).fill(NEUTRAL_CHROMA);
-        picture.set_pts(Some(index));
-        encoder.send_frame(&picture)?;
-        write_ready(&mut encoder, &mut output)?;
+    let encoder = video.open_as_with(codec, options)?;
+    let mut stream = output.add_stream(codec)?;
+    stream.set_parameters(&encoder);
+    Ok(Muxed {
+        encoder,
+        stream: stream.index(),
+        time_base,
+    })
+}
+
+fn add_audio(
+    output: &mut format::context::Output,
+) -> Result<Muxed<encoder::audio::Encoder>, ffmpeg_next::Error> {
+    let time_base = Rational::new(1, AUDIO_SAMPLE_RATE as i32);
+    let codec = encoder::find(codec::Id::PCM_S16LE).ok_or(ffmpeg_next::Error::EncoderNotFound)?;
+    let mut audio = codec::Context::new_with_codec(codec).encoder().audio()?;
+    audio.set_rate(AUDIO_SAMPLE_RATE as i32);
+    audio.set_channel_layout(audio_layout());
+    audio.set_format(AUDIO_FORMAT);
+    audio.set_time_base(time_base);
+    if wants_global_header(output) {
+        audio.set_flags(codec::Flags::GLOBAL_HEADER);
     }
-    encoder.send_eof()?;
-    write_ready(&mut encoder, &mut output)?;
-    output.write_trailer()
+    let encoder = audio.open_as(codec)?;
+    let mut stream = output.add_stream(codec)?;
+    stream.set_parameters(&encoder);
+    Ok(Muxed {
+        encoder,
+        stream: stream.index(),
+        time_base,
+    })
+}
+
+fn audio_layout() -> ChannelLayout {
+    ChannelLayout::default(i32::from(AUDIO_CHANNELS))
+}
+
+fn picture(index: i64) -> frame::Video {
+    let mut picture = frame::Video::new(format::Pixel::YUV420P, WIDTH, HEIGHT);
+    picture.data_mut(0).fill(luma(index));
+    picture.data_mut(1).fill(NEUTRAL_CHROMA);
+    picture.data_mut(2).fill(NEUTRAL_CHROMA);
+    picture.set_pts(Some(index));
+    picture
+}
+
+fn audio_block(index: i64) -> frame::Audio {
+    let start = audio_frame_start(index, AUDIO_SAMPLE_RATE);
+    let end = audio_frame_start(index + 1, AUDIO_SAMPLE_RATE);
+    let samples = usize::try_from(end - start).expect("fixture frames move forward");
+    let mut block = frame::Audio::new(AUDIO_FORMAT, samples, audio_layout());
+    block.set_rate(AUDIO_SAMPLE_RATE);
+    let level = (audio_level(index) * f32::from(i16::MAX)).round() as i16;
+    block.plane_mut::<i16>(0).fill(level);
+    block.set_pts(Some(start));
+    block
 }

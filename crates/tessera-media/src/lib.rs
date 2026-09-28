@@ -1,3 +1,4 @@
+mod audio;
 mod cache;
 mod decode;
 #[cfg(test)]
@@ -5,6 +6,7 @@ mod fixture;
 mod hw;
 mod probe;
 
+pub use audio::{AudioBuffer, AudioDecoder};
 pub use decode::{VideoDecoder, VideoFrame};
 pub use ffmpeg_next::Error as FfmpegError;
 pub use hw::{HwAccel, available_hw_accels};
@@ -29,14 +31,21 @@ pub enum Error {
     },
     #[error("{path} has no video stream")]
     NoVideo { path: std::path::PathBuf },
+    #[error("{path} has no audio stream")]
+    NoAudio { path: std::path::PathBuf },
     #[error("failed to seek in {path}: {source}")]
     Seek {
         path: std::path::PathBuf,
         #[source]
         source: FfmpegError,
     },
-    #[error("failed to decode video: {source}")]
+    #[error("failed to decode: {source}")]
     Decode {
+        #[source]
+        source: FfmpegError,
+    },
+    #[error("failed to resample audio: {source}")]
+    Resample {
         #[source]
         source: FfmpegError,
     },

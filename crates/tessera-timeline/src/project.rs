@@ -31,6 +31,7 @@ pub struct SequenceSettings {
     pub width: u32,
     pub height: u32,
     pub frame_rate: FrameRate,
+    pub sample_rate: u32,
 }
 
 impl Default for SequenceSettings {
@@ -39,6 +40,7 @@ impl Default for SequenceSettings {
             width: 1920,
             height: 1080,
             frame_rate: FrameRate::FPS_30,
+            sample_rate: 48_000,
         }
     }
 }
