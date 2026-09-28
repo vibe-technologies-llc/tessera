@@ -30,8 +30,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   A trim is clamped instead, between the neighbouring clips, the ends of the media and a minimum
   length of one frame. `split_clip` cuts a clip strictly inside it, keeping the id on the head
   and giving the tail a new one. `ripple_delete_clip` pulls the later clips on the same track back
-  by the deleted clip's length, while `delete_clip` leaves a gap. Later video tracks sit on top of
-  earlier ones, so
+  by the deleted clip's length, while `delete_clip` leaves a gap. `Timeline::add_track` inserts a
+  track after the last one of its kind. `remove_track` only takes an empty track that isn't the
+  last of its kind, and `swap_tracks` only swaps tracks of the same kind. Later video tracks sit on
+  top of earlier ones, so
   `Timeline::top_video_clip_at` searches them from the last.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and frame decode, and encode goes here.
@@ -70,7 +72,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   the clip was grabbed. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
   drag that the lanes preview and commit as a move or a trim. Ctrl+K splits the selected clip at the
   playhead, or every clip under it when the selection is elsewhere or empty. Delete or Backspace
-  deletes the selection, and with Shift held they ripple delete it. Panel interactions are tested
+  deletes the selection, and with Shift held they ripple delete it. The timeline draws video tracks
+  from the highest index down, then audio tracks in order (`header::display_order`). Each track
+  header has buttons to swap it with its same-kind neighbour or remove it, and a row below the
+  tracks adds video or audio tracks. Shift+wheel scrolls the track rows vertically, under a fixed
+  ruler. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` shows the top video clip's
   frame under the playhead, decoded at sequence size on a background task. It keeps one decoder

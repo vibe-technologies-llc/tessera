@@ -1,3 +1,4 @@
+mod header;
 mod viewport;
 
 use gpui::{
@@ -8,11 +9,14 @@ use gpui::{
     px, size,
 };
 use tessera_timeline::{
-    Clip, ClipEdge, ClipId, EditError, FrameRate, Project, Time, TimeRange, Timecode, Track,
-    TrackKind,
+    Clip, ClipEdge, ClipId, EditError, FrameRate, Project, Time, TimeRange, Timecode, Timeline,
+    Track, TrackKind,
 };
 
-use self::viewport::Viewport;
+use self::{
+    header::{add_track_row, content_height, track_header, track_rows},
+    viewport::Viewport,
+};
 use crate::{
     media_bin::{DraggedAsset, file_name},
     playhead::Playhead,
@@ -129,6 +133,8 @@ pub struct TimelinePanel {
     lanes: Bounds<Pixels>,
     selection: Option<ClipId>,
     grab: Pixels,
+    track_scroll: Pixels,
+    tracks_view: Bounds<Pixels>,
 }
 
 impl TimelinePanel {
@@ -152,6 +158,8 @@ impl TimelinePanel {
             lanes: Bounds::default(),
             selection: None,
             grab: px(0.),
+            track_scroll: px(0.),
+            tracks_view: Bounds::default(),
         }
     }
 
@@ -221,6 +229,46 @@ impl TimelinePanel {
         cx.notify();
     }
 
+    fn add_track(&mut self, kind: TrackKind, cx: &mut Context<Self>) {
+        self.project.update(cx, |project, cx| {
+            project.timeline.add_track(kind);
+            cx.notify();
+        });
+    }
+
+    fn remove_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.edit_tracks(cx, |timeline| timeline.remove_track(index).map(drop));
+    }
+
+    fn swap_tracks(&mut self, first: usize, second: usize, cx: &mut Context<Self>) {
+        self.edit_tracks(cx, |timeline| timeline.swap_tracks(first, second));
+    }
+
+    fn edit_tracks(
+        &mut self,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut Timeline) -> Result<(), EditError>,
+    ) {
+        self.project
+            .update(cx, |project, cx| match edit(&mut project.timeline) {
+                Ok(()) => cx.notify(),
+                Err(error) => tracing::warn!(%error, "could not change the tracks"),
+            });
+    }
+
+    fn scroll_tracks(&mut self, delta: Pixels, rows: usize, cx: &mut Context<Self>) {
+        let scroll = self.clamped_track_scroll(self.track_scroll - delta, rows);
+        if scroll != self.track_scroll {
+            self.track_scroll = scroll;
+            cx.notify();
+        }
+    }
+
+    fn clamped_track_scroll(&self, scroll: Pixels, rows: usize) -> Pixels {
+        let overflow = px(content_height(rows)) - self.tracks_view.size.height;
+        scroll.min(overflow).max(px(0.))
+    }
+
     fn zoom_around_playhead(&mut self, factor: f32, cx: &mut Context<Self>) {
         let playhead = self.playhead.read(cx).time();
         let anchor = self
@@ -233,6 +281,12 @@ impl TimelinePanel {
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
         let delta = event.delta.pixel_delta(window.line_height());
+        cx.stop_propagation();
+        if event.modifiers.shift {
+            let rows = self.project.read(cx).timeline.tracks.len();
+            self.scroll_tracks(delta.x + delta.y, rows, cx);
+            return;
+        }
         let limit = self.scroll_limit(cx);
         let viewport = if event.modifiers.control {
             let factor = 2_f32.powf(f32::from(delta.y) / WHEEL_PIXELS_PER_DOUBLING);
@@ -242,7 +296,6 @@ impl TimelinePanel {
             self.viewport.scrolled_by(-(delta.x + delta.y), limit)
         };
         self.set_viewport(viewport, cx);
-        cx.stop_propagation();
     }
 
     fn follow_playhead(&mut self, cx: &App) {
@@ -439,10 +492,32 @@ impl Render for TimelinePanel {
         let project = self.project.read(cx);
         let frame_rate = project.settings.frame_rate;
         let tracks = &project.timeline.tracks;
+        let rows = track_rows(&project.timeline);
+        self.track_scroll = self.clamped_track_scroll(self.track_scroll, rows.len());
+        let scroll = self.track_scroll;
+        let lanes = rows.iter().map(|row| {
+            let lane = Lane {
+                index: row.index,
+                track: &tracks[row.index],
+                viewport,
+                drop_preview,
+                selection,
+            };
+            track_lane(lane, project, cx)
+        });
+        let lanes = scrolled_tracks(scroll, lanes).child(tracks_view_probe(panel.clone()));
+        let headers = rows
+            .into_iter()
+            .map(|row| track_header(row, cx))
+            .map(IntoElement::into_any_element)
+            .chain([add_track_row(cx).into_any_element()]);
         div()
             .size_full()
             .flex()
             .bg(theme::panel())
+            .on_scroll_wheel(cx.listener(|panel, event, window, cx| {
+                panel.scroll_wheel(event, window, cx);
+            }))
             .child(
                 div()
                     .w(px(TRACK_HEADER_WIDTH))
@@ -452,7 +527,7 @@ impl Render for TimelinePanel {
                     .border_r_1()
                     .border_color(theme::border())
                     .child(timecode_readout(Timecode::new(playhead, frame_rate)))
-                    .children(track_labels(tracks).map(track_header)),
+                    .child(scrolled_tracks(scroll, headers)),
             )
             .child(
                 div()
@@ -462,23 +537,33 @@ impl Render for TimelinePanel {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .on_scroll_wheel(cx.listener(|panel, event, window, cx| {
-                        panel.scroll_wheel(event, window, cx);
-                    }))
                     .child(ruler(panel, viewport, frame_rate))
-                    .children(tracks.iter().enumerate().map(|(index, track)| {
-                        let lane = Lane {
-                            index,
-                            track,
-                            viewport,
-                            drop_preview,
-                            selection,
-                        };
-                        track_lane(lane, project, cx)
-                    }))
+                    .child(lanes)
                     .child(playhead_marker(viewport.x_at(playhead))),
             )
     }
+}
+
+fn scrolled_tracks(scroll: Pixels, rows: impl IntoIterator<Item = impl IntoElement>) -> gpui::Div {
+    div().relative().flex_1().min_h_0().overflow_hidden().child(
+        div()
+            .absolute()
+            .top(-scroll)
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_col()
+            .children(rows),
+    )
+}
+
+fn tracks_view_probe(panel: Entity<TimelinePanel>) -> impl IntoElement {
+    canvas(
+        move |bounds, _, cx| panel.update(cx, |panel, _| panel.tracks_view = bounds),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
 }
 
 fn timecode_readout(timecode: Timecode) -> impl IntoElement {
@@ -492,19 +577,6 @@ fn timecode_readout(timecode: Timecode) -> impl IntoElement {
         .border_color(theme::border())
         .text_xs()
         .child(timecode.to_string())
-}
-
-fn track_header(label: String) -> impl IntoElement {
-    div()
-        .h(px(TRACK_HEIGHT))
-        .flex_none()
-        .px_3()
-        .flex()
-        .items_center()
-        .border_b_1()
-        .border_color(theme::border())
-        .text_color(theme::text_muted())
-        .child(label)
 }
 
 struct Lane<'a> {
@@ -599,21 +671,6 @@ fn drop_ghost(preview: DropPreview, viewport: Viewport) -> impl IntoElement {
         theme::drop_ghost_blocked()
     };
     clip_frame(preview.range, viewport).bg(color)
-}
-
-fn track_labels(tracks: &[Track]) -> impl Iterator<Item = String> {
-    let mut video = 0;
-    let mut audio = 0;
-    tracks.iter().map(move |track| match track.kind {
-        TrackKind::Video => {
-            video += 1;
-            format!("V{video}")
-        }
-        TrackKind::Audio => {
-            audio += 1;
-            format!("A{audio}")
-        }
-    })
 }
 
 struct ClipLook {
@@ -810,19 +867,60 @@ fn ruler_step(pixels_per_second: f32, frame_rate: FrameRate) -> RulerStep {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext};
     use tessera_timeline::{MediaInfo, Stream, VideoStream};
 
-    use super::*;
+    use super::{header::*, *};
 
     const ONE_SECOND: f32 = 48.;
-    const V1: f32 = RULER_HEIGHT + TRACK_HEIGHT / 2.;
+    const V1_ROW: usize = 1;
+    const V1: f32 = RULER_HEIGHT + TRACK_HEIGHT * (V1_ROW as f32 + 0.5);
+    const HEADER_RIGHT: f32 = TRACK_HEADER_WIDTH - 1.;
+
+    fn row_y(row: usize) -> Pixels {
+        px(RULER_HEIGHT + TRACK_HEIGHT * (row as f32 + 0.5))
+    }
+
+    fn header_button_x(from_right: usize) -> Pixels {
+        let step = HEADER_BUTTON_SIZE + HEADER_BUTTON_GAP;
+        px(HEADER_RIGHT - HEADER_PADDING - HEADER_BUTTON_SIZE / 2. - step * from_right as f32)
+    }
+
+    const REMOVE: usize = 0;
+    const DOWN: usize = 1;
+
+    fn click_add(cx: &mut VisualTestContext, rows: usize, kind: TrackKind) {
+        let nth = match kind {
+            TrackKind::Video => 0.,
+            TrackKind::Audio => 1.,
+        };
+        let x = HEADER_PADDING + ADD_BUTTON_WIDTH / 2. + nth * (ADD_BUTTON_WIDTH + ADD_BUTTON_GAP);
+        let y = RULER_HEIGHT + TRACK_HEIGHT * rows as f32 + ADD_ROW_HEIGHT / 2.;
+        cx.simulate_click(point(px(x), px(y)), Modifiers::none());
+    }
+
+    fn kinds_and_clip_track(
+        panel: &Entity<TimelinePanel>,
+        cx: &mut VisualTestContext,
+        clip: ClipId,
+    ) -> (Vec<TrackKind>, Option<usize>) {
+        cx.read(|cx| {
+            let project = panel.read(cx).project.read(cx);
+            let kinds = project
+                .timeline
+                .tracks
+                .iter()
+                .map(|track| track.kind)
+                .collect();
+            (kinds, project.find_clip(clip).map(|(track, _)| track))
+        })
+    }
 
     fn at(seconds: f32) -> Pixels {
         px(TRACK_HEADER_WIDTH + seconds * ONE_SECOND)
     }
 
-    const V2: usize = 2;
+    const V2: usize = 1;
 
     fn timeline_with_a_clip(
         cx: &mut TestAppContext,
@@ -840,7 +938,7 @@ mod tests {
         Vec<ClipId>,
     ) {
         let mut project = Project::new("test");
-        project.timeline.tracks.push(Track::new(TrackKind::Video));
+        project.timeline.add_track(TrackKind::Video);
         let info = MediaInfo {
             duration: Some(Time::from_seconds(8)),
             streams: vec![Stream::Video(VideoStream {
@@ -976,13 +1074,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tracks_are_numbered_per_kind() {
-        let tracks = [TrackKind::Video, TrackKind::Audio, TrackKind::Video].map(Track::new);
-        let labels: Vec<_> = track_labels(&tracks).collect();
-        assert_eq!(labels, ["V1", "A1", "V2"]);
-    }
-
     #[gpui::test]
     fn splitting_cuts_the_selected_clip_or_every_clip_under_the_playhead(cx: &mut TestAppContext) {
         let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1), (V2, 2)]);
@@ -1014,5 +1105,69 @@ mod tests {
         cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
         panel.update(cx, TimelinePanel::ripple_delete_selection);
         assert_eq!(starts_on(&panel, cx, 0), seconds(&[2]));
+    }
+
+    #[gpui::test]
+    fn header_buttons_add_swap_and_remove_tracks(cx: &mut TestAppContext) {
+        use TrackKind::{Audio, Video};
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        click_add(cx, 3, Audio);
+        assert_eq!(
+            kinds_and_clip_track(&panel, cx, clip),
+            (vec![Video, Video, Audio, Audio], Some(0))
+        );
+        cx.simulate_click(point(header_button_x(DOWN), row_y(0)), Modifiers::none());
+        assert_eq!(
+            kinds_and_clip_track(&panel, cx, clip),
+            (vec![Video, Video, Audio, Audio], Some(1))
+        );
+        cx.simulate_click(point(header_button_x(REMOVE), row_y(0)), Modifiers::none());
+        assert_eq!(
+            kinds_and_clip_track(&panel, cx, clip),
+            (vec![Video, Video, Audio, Audio], Some(1))
+        );
+        cx.simulate_click(point(header_button_x(REMOVE), row_y(1)), Modifiers::none());
+        assert_eq!(
+            kinds_and_clip_track(&panel, cx, clip),
+            (vec![Video, Audio, Audio], Some(0))
+        );
+        click_add(cx, 3, Video);
+        assert_eq!(
+            kinds_and_clip_track(&panel, cx, clip),
+            (vec![Video, Video, Audio, Audio], Some(0))
+        );
+    }
+
+    #[gpui::test]
+    fn shift_wheel_scrolls_the_tracks_within_their_height(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        for _ in 0..30 {
+            panel.update(cx, |panel, cx| panel.add_track(TrackKind::Audio, cx));
+        }
+        let wheel = |cx: &mut VisualTestContext, pixels: f32| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(at(4.), px(V1)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(pixels))),
+                modifiers: Modifiers::shift(),
+                touch_phase: TouchPhase::Moved,
+            });
+        };
+        let scroll = |cx: &mut VisualTestContext| cx.read(|cx| panel.read(cx).track_scroll);
+        wheel(cx, -TRACK_HEIGHT);
+        assert_eq!(scroll(cx), px(TRACK_HEIGHT));
+        cx.simulate_click(point(at(4.), row_y(V1_ROW - 1)), Modifiers::none());
+        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+        wheel(cx, -100_000.);
+        let (rows, view) = cx.read(|cx| {
+            let panel = panel.read(cx);
+            (
+                panel.project.read(cx).timeline.tracks.len(),
+                panel.tracks_view,
+            )
+        });
+        assert_eq!(scroll(cx), px(content_height(rows)) - view.size.height);
+        wheel(cx, 100_000.);
+        assert_eq!(scroll(cx), px(0.));
+        assert_eq!(cx.read(|cx| panel.read(cx).viewport), Viewport::default());
     }
 }

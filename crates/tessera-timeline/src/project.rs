@@ -99,6 +99,12 @@ pub enum EditError {
     UnknownTrack(usize),
     #[error("{time:?} does not fall inside clip {clip:?}")]
     OutsideClip { clip: ClipId, time: Time },
+    #[error("track {0} still holds clips")]
+    TrackNotEmpty(usize),
+    #[error("the timeline needs at least one {0:?} track")]
+    LastTrack(TrackKind),
+    #[error("cannot swap a {first:?} track with a {second:?} track")]
+    MixedTrackKinds { first: TrackKind, second: TrackKind },
     #[error("the asset has no known duration")]
     NoDuration,
     #[error("the asset has no {0:?} stream")]
@@ -196,6 +202,64 @@ pub struct Timeline {
 }
 
 impl Timeline {
+    pub fn add_track(&mut self, kind: TrackKind) -> usize {
+        let index = self
+            .tracks
+            .iter()
+            .rposition(|track| track.kind == kind)
+            .map_or(
+                match kind {
+                    TrackKind::Video => 0,
+                    TrackKind::Audio => self.tracks.len(),
+                },
+                |last| last + 1,
+            );
+        self.tracks.insert(index, Track::new(kind));
+        index
+    }
+
+    pub fn check_removable(&self, index: usize) -> Result<&Track, EditError> {
+        let track = self
+            .tracks
+            .get(index)
+            .ok_or(EditError::UnknownTrack(index))?;
+        let same_kind = self
+            .tracks
+            .iter()
+            .filter(|other| other.kind == track.kind)
+            .count();
+        if !track.clips.is_empty() {
+            Err(EditError::TrackNotEmpty(index))
+        } else if same_kind == 1 {
+            Err(EditError::LastTrack(track.kind))
+        } else {
+            Ok(track)
+        }
+    }
+
+    pub fn remove_track(&mut self, index: usize) -> Result<Track, EditError> {
+        self.check_removable(index)?;
+        Ok(self.tracks.remove(index))
+    }
+
+    pub fn swap_tracks(&mut self, first: usize, second: usize) -> Result<(), EditError> {
+        let kind_of = |index: usize| {
+            self.tracks
+                .get(index)
+                .map(|track| track.kind)
+                .ok_or(EditError::UnknownTrack(index))
+        };
+        let (first_kind, second_kind) = (kind_of(first)?, kind_of(second)?);
+        if first_kind != second_kind {
+            return Err(EditError::MixedTrackKinds {
+                first: first_kind,
+                second: second_kind,
+            });
+        }
+        self.tracks.swap(first, second);
+        Ok(())
+    }
+
     pub fn duration(&self) -> Time {
         self.tracks
             .iter()
@@ -900,5 +964,57 @@ mod tests {
             Some(Time::from_seconds(16))
         );
         assert_eq!(project.timeline.duration(), Time::from_seconds(26));
+    }
+
+    fn kinds(timeline: &Timeline) -> Vec<TrackKind> {
+        timeline.tracks.iter().map(|track| track.kind).collect()
+    }
+
+    #[test]
+    fn added_tracks_join_the_others_of_their_kind() {
+        use TrackKind::{Audio, Video};
+        let mut timeline = Project::new("test").timeline;
+        assert_eq!(timeline.add_track(Video), 1);
+        assert_eq!(timeline.add_track(Audio), 3);
+        assert_eq!(timeline.add_track(Video), 2);
+        assert_eq!(kinds(&timeline), [Video, Video, Video, Audio, Audio]);
+        let mut empty = Timeline::default();
+        assert_eq!(empty.add_track(Audio), 0);
+        assert_eq!(empty.add_track(Video), 0);
+        assert_eq!(kinds(&empty), [Video, Audio]);
+    }
+
+    #[test]
+    fn only_empty_tracks_with_a_sibling_can_be_removed() {
+        let (mut project, _, first, _) = two_clip_project();
+        let timeline = &mut project.timeline;
+        assert_eq!(
+            timeline.remove_track(1),
+            Err(EditError::LastTrack(TrackKind::Audio))
+        );
+        assert_eq!(timeline.remove_track(5), Err(EditError::UnknownTrack(5)));
+        let spare = timeline.add_track(TrackKind::Video);
+        assert_eq!(timeline.remove_track(0), Err(EditError::TrackNotEmpty(0)));
+        assert!(timeline.remove_track(spare).unwrap().clips().is_empty());
+        assert_eq!(project.find_clip(first).map(|(track, _)| track), Some(0));
+    }
+
+    #[test]
+    fn swapping_tracks_keeps_their_clips_and_kinds_apart() {
+        let (mut project, _, first, _) = two_clip_project();
+        let upper = project.timeline.add_track(TrackKind::Video);
+        assert_eq!(
+            project.timeline.swap_tracks(0, 2),
+            Err(EditError::MixedTrackKinds {
+                first: TrackKind::Video,
+                second: TrackKind::Audio,
+            })
+        );
+        project.timeline.swap_tracks(0, upper).unwrap();
+        assert_eq!(
+            project.find_clip(first).map(|(track, _)| track),
+            Some(upper)
+        );
+        assert!(project.timeline.tracks[0].clips().is_empty());
     }
 }

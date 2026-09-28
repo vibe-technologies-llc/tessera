@@ -6,7 +6,6 @@
 
 ## Timeline editing
 
-- Add, remove and reorder tracks
 - Snapping to clip edges and the playhead
 - Undo and redo as a command history over `Project`
 
