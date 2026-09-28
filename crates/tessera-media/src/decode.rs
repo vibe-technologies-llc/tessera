@@ -1,11 +1,15 @@
 use std::{
+    ffi::c_int,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use ffmpeg_next::{
-    Rational, Rescale, codec, decoder,
-    ffi::{AV_NOPTS_VALUE, AVSEEK_FLAG_BACKWARD, avformat_index_get_entry_from_timestamp},
+    Rational, Rescale, codec, color, decoder,
+    ffi::{
+        AV_NOPTS_VALUE, AVColorSpace, AVSEEK_FLAG_BACKWARD, SWS_CS_ITU601, SWS_CS_ITU709,
+        avformat_index_get_entry_from_timestamp, sws_getCoefficients, sws_setColorspaceDetails,
+    },
     format::{self, Pixel},
     frame, media, rescale,
     software::scaling,
@@ -23,6 +27,11 @@ const BYTES_PER_PIXEL: usize = 4;
 const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const UNINDEXED_FORWARD_WINDOW: Time = Time::from_seconds(1);
 const HELD_FRAMES: i32 = 2;
+const HIGH_DEFINITION: (u32, u32) = (1280, 720);
+const FULL_RANGE_OUTPUT: c_int = 1;
+const NEUTRAL_BRIGHTNESS: c_int = 0;
+const UNIT_CONTRAST: c_int = 1 << 16;
+const UNIT_SATURATION: c_int = 1 << 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFrame {
@@ -54,7 +63,16 @@ struct Converter {
 
 struct Scaler {
     context: scaling::Context,
-    source: (Pixel, u32, u32),
+    source: Source,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Source {
+    format: Pixel,
+    width: u32,
+    height: u32,
+    matrix: c_int,
+    full_range: bool,
 }
 
 unsafe impl Send for Scaler {}
@@ -270,6 +288,7 @@ impl VideoDecoder {
 
 impl Converter {
     fn convert(&mut self, frame: &frame::Video, time: Time) -> Result<VideoFrame, Error> {
+        let (matrix, range) = (frame.color_space(), frame.color_range());
         let downloaded;
         let frame = if hw::is_hardware_frame(frame) {
             downloaded = hw::download(frame).map_err(|source| Error::Decode { source })?;
@@ -277,23 +296,11 @@ impl Converter {
         } else {
             frame
         };
-        let source = (frame.format(), frame.width(), frame.height());
-        let (width, height) = fitted_size(frame.width(), frame.height(), self.bounds);
+        let source = Source::new(frame.format(), frame.width(), frame.height(), matrix, range);
+        let (width, height) = fitted_size(source.width, source.height, self.bounds);
         let scaler = match self.scaler.take() {
             Some(scaler) if scaler.source == source => scaler,
-            _ => Scaler {
-                context: scaling::Context::get(
-                    source.0,
-                    source.1,
-                    source.2,
-                    OUTPUT_FORMAT,
-                    width,
-                    height,
-                    scaling::Flags::BILINEAR,
-                )
-                .map_err(|source| Error::Decode { source })?,
-                source,
-            },
+            _ => Scaler::new(source, width, height).map_err(|source| Error::Decode { source })?,
         };
         let scaler = self.scaler.insert(scaler);
         let mut scaled = frame::Video::empty();
@@ -308,6 +315,76 @@ impl Converter {
             bgra: packed_rows(&scaled),
         })
     }
+}
+
+impl Source {
+    fn new(
+        format: Pixel,
+        width: u32,
+        height: u32,
+        space: color::Space,
+        range: color::Range,
+    ) -> Self {
+        Self {
+            format,
+            width,
+            height,
+            matrix: yuv_matrix(space, width, height),
+            full_range: range == color::Range::JPEG || is_full_range_format(format),
+        }
+    }
+}
+
+impl Scaler {
+    fn new(source: Source, width: u32, height: u32) -> Result<Self, ffmpeg_next::Error> {
+        let mut context = scaling::Context::get(
+            source.format,
+            source.width,
+            source.height,
+            OUTPUT_FORMAT,
+            width,
+            height,
+            scaling::Flags::BILINEAR,
+        )?;
+        let applied = unsafe {
+            let coefficients = sws_getCoefficients(source.matrix);
+            sws_setColorspaceDetails(
+                context.as_mut_ptr(),
+                coefficients,
+                c_int::from(source.full_range),
+                coefficients,
+                FULL_RANGE_OUTPUT,
+                NEUTRAL_BRIGHTNESS,
+                UNIT_CONTRAST,
+                UNIT_SATURATION,
+            )
+        };
+        if applied < 0 {
+            return Err(ffmpeg_next::Error::from(applied));
+        }
+        Ok(Self { context, source })
+    }
+}
+
+fn yuv_matrix(space: color::Space, width: u32, height: u32) -> c_int {
+    match space {
+        color::Space::Unspecified | color::Space::Reserved => {
+            let (hd_width, hd_height) = HIGH_DEFINITION;
+            if width >= hd_width || height >= hd_height {
+                SWS_CS_ITU709
+            } else {
+                SWS_CS_ITU601
+            }
+        }
+        space => AVColorSpace::from(space) as c_int,
+    }
+}
+
+fn is_full_range_format(format: Pixel) -> bool {
+    matches!(
+        format,
+        Pixel::YUVJ420P | Pixel::YUVJ422P | Pixel::YUVJ444P | Pixel::YUVJ440P | Pixel::YUVJ411P
+    )
 }
 
 fn packed_rows(frame: &frame::Video) -> Vec<u8> {
@@ -523,6 +600,103 @@ mod tests {
         let frame = decoder.frame_at(Time::ZERO).unwrap();
         assert_eq!((frame.width, frame.height), (16, 12));
         assert_eq!(frame.bgra.len(), 16 * 12 * 4);
+    }
+
+    const BT709_RED: [u8; 3] = [63, 102, 240];
+    const LIMITED_BLACK: [u8; 3] = [16, 128, 128];
+
+    fn converted_rgb(
+        ycbcr: [u8; 3],
+        (width, height): (u32, u32),
+        space: color::Space,
+        range: color::Range,
+    ) -> [u8; 3] {
+        let mut frame = frame::Video::new(Pixel::YUV444P, width, height);
+        for (plane, value) in ycbcr.into_iter().enumerate() {
+            frame.data_mut(plane).fill(value);
+        }
+        frame.set_color_space(space);
+        frame.set_color_range(range);
+        let mut converter = Converter {
+            bounds: None,
+            scaler: None,
+        };
+        let converted = converter.convert(&frame, Time::ZERO).unwrap();
+        let [blue, green, red, _] = converted.bgra[..4].try_into().unwrap();
+        [red, green, blue]
+    }
+
+    fn assert_near(actual: [u8; 3], expected: [u8; 3]) {
+        let near = actual
+            .iter()
+            .zip(expected)
+            .all(|(&actual, expected)| actual.abs_diff(expected) <= 3);
+        assert!(near, "expected about {expected:?}, got {actual:?}");
+    }
+
+    #[test]
+    fn yuv_converts_with_the_tagged_matrix() {
+        crate::init().unwrap();
+        let small = (16, 16);
+        let limited = color::Range::MPEG;
+        let red = converted_rgb(BT709_RED, small, color::Space::BT709, limited);
+        assert_near(red, [255, 0, 0]);
+        let misread = converted_rgb(BT709_RED, small, color::Space::BT470BG, limited);
+        assert!(misread[0] < 240, "{misread:?}");
+        let bt2020 = converted_rgb(BT709_RED, small, color::Space::BT2020NCL, limited);
+        assert_ne!(bt2020, red);
+    }
+
+    #[test]
+    fn untagged_yuv_is_read_as_bt709_from_high_definition_up() {
+        crate::init().unwrap();
+        let untagged = color::Space::Unspecified;
+        let limited = color::Range::Unspecified;
+        let hd = converted_rgb(BT709_RED, (1280, 720), untagged, limited);
+        assert_near(hd, [255, 0, 0]);
+        let sd = converted_rgb(BT709_RED, (720, 576), untagged, limited);
+        assert_eq!(
+            sd,
+            converted_rgb(BT709_RED, (16, 16), color::Space::BT470BG, limited)
+        );
+    }
+
+    #[test]
+    fn full_range_yuv_keeps_its_levels() {
+        crate::init().unwrap();
+        let small = (16, 16);
+        let limited = converted_rgb(
+            LIMITED_BLACK,
+            small,
+            color::Space::BT709,
+            color::Range::MPEG,
+        );
+        assert_near(limited, [0, 0, 0]);
+        let full = converted_rgb(
+            LIMITED_BLACK,
+            small,
+            color::Space::BT709,
+            color::Range::JPEG,
+        );
+        assert_near(full, [16, 16, 16]);
+    }
+
+    #[test]
+    fn rgb_sources_convert_without_a_matrix() {
+        crate::init().unwrap();
+        let mut frame = frame::Video::new(Pixel::RGB24, 16, 16);
+        let stride = frame.stride(0);
+        for row in frame.data_mut(0).chunks_mut(stride) {
+            for pixel in row[..16 * 3].chunks_mut(3) {
+                pixel.copy_from_slice(&[200, 100, 50]);
+            }
+        }
+        let mut converter = Converter {
+            bounds: None,
+            scaler: None,
+        };
+        let converted = converter.convert(&frame, Time::ZERO).unwrap();
+        assert_eq!(converted.bgra[..4], [50, 100, 200, 255]);
     }
 
     #[test]

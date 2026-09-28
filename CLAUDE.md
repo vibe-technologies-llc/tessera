@@ -70,7 +70,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   hardware refuses the stream (a codec profile or size the driver lacks), so `hw_accel` reports
   the accelerator only while decoded frames really come from it. Frames stay on the GPU while
   decoding forward, with `extra_hw_frames` covering the two the decoder holds, and only the frame
-  being shown is downloaded (`av_hwframe_transfer_data`) before scaling to BGRA. The test fixture
+  being shown is downloaded (`av_hwframe_transfer_data`) before scaling to BGRA. The scaler
+  converts YUV to full-range RGB with the frame's tagged matrix and range
+  (`sws_setColorspaceDetails`, read before the download), reading an untagged matrix as BT.709
+  from 1280×720 up and BT.601 below, and a `yuvj` format as full range. The test fixture
   is 128×96 so hardware accepts it, and an H.264 variant, generated when `libx264` is present, runs
   the decode tests through the preferred accelerators against software.
   `AudioDecoder::samples` returns an `AudioBuffer` of exactly the requested number of interleaved
