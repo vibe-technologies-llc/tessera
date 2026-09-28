@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{Context, Entity, Task};
+use tessera_audio::TimelinePlayback;
 use tessera_timeline::{FrameRate, Project, Time};
 
 const MAX_SHUTTLE_SPEED: i64 = 8;
@@ -57,8 +58,35 @@ impl Speed {
 struct Playback {
     speed: Speed,
     from: Time,
-    started: Instant,
+    clock: PlaybackClock,
     _ticker: Task<()>,
+}
+
+enum PlaybackClock {
+    Wall(Instant),
+    Audio(TimelinePlayback),
+}
+
+impl PlaybackClock {
+    fn start(speed: Speed, project: &Project, from: Time) -> Self {
+        if speed != Speed::FORWARD {
+            return Self::Wall(Instant::now());
+        }
+        match TimelinePlayback::start(project.clone(), from) {
+            Ok(audio) => Self::Audio(audio),
+            Err(error) => {
+                tracing::warn!(%error, "no audio output, playback follows the wall clock");
+                Self::Wall(Instant::now())
+            }
+        }
+    }
+
+    fn elapsed(&self) -> Time {
+        match self {
+            Self::Wall(started) => Time::from_duration(started.elapsed()),
+            Self::Audio(audio) => audio.elapsed(),
+        }
+    }
 }
 
 enum Advance {
@@ -73,7 +101,17 @@ pub struct Playhead {
 }
 
 impl Playhead {
-    pub fn new(project: Entity<Project>) -> Self {
+    pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&project, |playhead, project, cx| {
+            if let Some(Playback {
+                clock: PlaybackClock::Audio(audio),
+                ..
+            }) = &playhead.playback
+            {
+                audio.update_project(project.read(cx).clone());
+            }
+        })
+        .detach();
         Self {
             project,
             time: Time::ZERO,
@@ -146,10 +184,11 @@ impl Playhead {
         };
         if let Some(start) = start {
             self.move_to(start, cx);
+            let clock = PlaybackClock::start(speed, self.project.read(cx), start);
             self.playback = Some(Playback {
                 speed,
                 from: start,
-                started: Instant::now(),
+                clock,
                 _ticker: self.spawn_ticker(speed.tick(frame_rate), cx),
             });
             cx.notify();
@@ -179,7 +218,7 @@ impl Playhead {
             self.pause(cx);
             return false;
         };
-        let elapsed = playback.started.elapsed();
+        let elapsed = playback.clock.elapsed();
         match advance(playback.from, elapsed, playback.speed, frame_rate, last) {
             Advance::To(time) => {
                 self.move_to(time, cx);
@@ -198,14 +237,8 @@ fn last_frame(end: Time, frame_rate: FrameRate) -> Option<Time> {
     (end > Time::ZERO).then(|| frame_rate.frame_start(end - Time::from_flicks(1)))
 }
 
-fn advance(
-    from: Time,
-    elapsed: Duration,
-    speed: Speed,
-    frame_rate: FrameRate,
-    last: Time,
-) -> Advance {
-    let time = frame_rate.frame_start(from + Time::from_duration(elapsed) * speed.factor());
+fn advance(from: Time, elapsed: Time, speed: Speed, frame_rate: FrameRate, last: Time) -> Advance {
+    let time = frame_rate.frame_start(from + elapsed * speed.factor());
     if time >= last {
         Advance::StopAt(last)
     } else if time <= Time::ZERO && speed.factor() < 0 {
@@ -266,8 +299,10 @@ mod tests {
         let rate = FrameRate::FPS_30;
         let last = rate.frame_to_time(299);
         let from = rate.frame_to_time(30);
-        let advanced =
-            |millis, speed| advance(from, Duration::from_millis(millis), speed, rate, last);
+        let advanced = |millis, speed| {
+            let elapsed = Time::from_duration(Duration::from_millis(millis));
+            advance(from, elapsed, speed, rate, last)
+        };
         assert!(matches!(advanced(0, Speed::FORWARD), Advance::To(time) if time == from));
         assert!(
             matches!(advanced(1_010, Speed::FORWARD), Advance::To(time) if time == rate.frame_to_time(60))
@@ -285,8 +320,10 @@ mod tests {
         let rate = FrameRate::FPS_30;
         let last = rate.frame_to_time(59);
         let from = rate.frame_to_time(30);
-        let stopped =
-            |millis, speed| advance(from, Duration::from_millis(millis), speed, rate, last);
+        let stopped = |millis, speed| {
+            let elapsed = Time::from_duration(Duration::from_millis(millis));
+            advance(from, elapsed, speed, rate, last)
+        };
         assert!(matches!(stopped(1_000, Speed::FORWARD), Advance::StopAt(time) if time == last));
         assert!(
             matches!(stopped(2_000, Speed::BACKWARD), Advance::StopAt(time) if time == Time::ZERO)

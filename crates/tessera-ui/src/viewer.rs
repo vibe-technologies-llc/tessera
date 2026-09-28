@@ -528,7 +528,7 @@ mod tests {
     #[gpui::test]
     fn the_viewer_asks_for_every_video_layer_under_the_playhead(cx: &mut TestAppContext) {
         let project = cx.new(|_| stacked_project());
-        let playhead = cx.new(|_| Playhead::new(project.clone()));
+        let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
         let (viewer, cx) =
             cx.add_window_view(|_, cx| Viewer::new(project.clone(), playhead.clone(), cx));
         cx.run_until_parked();
@@ -566,7 +566,7 @@ mod tests {
     fn a_replaced_project_asks_for_frames_of_its_own_media(cx: &mut TestAppContext) {
         let project = cx.new(|_| project_showing("/missing/first.mkv"));
         let (viewer, cx) = cx.add_window_view(|_, cx| {
-            let playhead = cx.new(|_| Playhead::new(project.clone()));
+            let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
             Viewer::new(project.clone(), playhead, cx)
         });
         cx.run_until_parked();

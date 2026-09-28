@@ -1,0 +1,13 @@
+[package]
+name = "tessera-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pipewire.workspace = true
+tessera-media.workspace = true
+tessera-timeline.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

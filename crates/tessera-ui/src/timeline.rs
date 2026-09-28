@@ -1049,7 +1049,7 @@ mod tests {
             .collect();
         let project = cx.new(|_| project);
         let (panel, cx) = cx.add_window_view(|_, cx| {
-            let playhead = cx.new(|_| Playhead::new(project.clone()));
+            let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
             TimelinePanel::new(ProjectEditor::new(project, cx), playhead, cx)
         });
         (panel, cx, clips)

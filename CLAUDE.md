@@ -11,8 +11,8 @@ parse or keep stable.
 ## Architecture
 
 A Cargo workspace under `crates/`. Dependencies point one way:
-`tessera-timeline` ← `tessera-media`, `tessera-document`, `tessera-render` ← `tessera-ui` ←
-`tessera` (the binary).
+`tessera-timeline` ← `tessera-media`, `tessera-document`, `tessera-render`; `tessera-media` ←
+`tessera-audio`; all of them ← `tessera-ui` ← `tessera` (the binary).
 
 - **`tessera-timeline`** is the pure project model (`Project`, `Timeline`, `Track`, `Clip`,
   `Asset`). Each `Asset` carries its probed `MediaInfo` (duration and streams), so nothing outside
@@ -81,6 +81,22 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   read starting where the last one ended never seeks. A read behind the last one, or more than a
   second past what is decoded, seeks 100 ms early (flushing the decoder and the resampler) and
   discards up to the target.
+- **`tessera-audio`** plays the timeline's sound through PipeWire (`pipewire`, the only crate
+  allowed to touch it). `Mixer::render` fills a block of interleaved stereo `f32` samples starting
+  at a timeline sample index: every clip on every audio track that overlaps the block is read
+  from an `AudioDecoder` (one per media path, at the project's sample rate) and summed into its
+  part of the block. A clip reads from its source start plus its offset into the clip, so blocks
+  that follow each other continue in the source without seeking. Media that fails to open or
+  decode is warned about once and stays silent. `Output` runs a PipeWire playback stream on its
+  own thread, whose process callback copies whole frames out of a shared queue (silence on
+  underrun), and a feeder thread that keeps about 200 ms queued by calling the source closure.
+  Its `position` is the audio clock: the samples the device has played, taken at each callback
+  as the samples consumed minus the stream's delay to the device (`pw_time` delay plus
+  resampler buffering), interpolated between callbacks with a monotonic clock, capped at what was
+  consumed and never running backwards. Silence from an underrun doesn't advance it.
+  `TimelinePlayback` ties a `Mixer` to an `Output` from a start time, reports the time played
+  since then, and picks up a replaced project on the next block. Dropping the `Output` stops the
+  stream thread and joins it, and the feeder exits after its current block.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` for compositing timeline frames. It
   doesn't depend on `tessera-media`: a `Layer` borrows a packed straight-alpha BGRA8 image shaped
   like `VideoFrame`, and `Compositor::composite` returns an owned sequence-sized `Frame`. It clears a
@@ -109,10 +125,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   single-key transport bindings. The `Workspace` also owns an `Entity<Playhead>` shared the same
   way: the playhead is UI state, not part of the project, and scrubbing snaps it to frame starts.
   The playhead also runs the transport: space plays and pauses, J/K/L shuttle (each press doubles
-  the speed up to 8× in that direction) and the arrow keys step one frame. Playing anchors a wall
+  the speed up to 8× in that direction) and the arrow keys step one frame. Playing anchors a
   clock at the start time and a ticker task moves the playhead to the frame start under
   `anchor + elapsed × speed`, so it never drifts, and stops on the timeline's last frame or at
-  zero. Any seek or step pauses playback. The timeline's ruler is a `canvas` that paints its ticks
+  zero. At normal forward speed the clock is a `TimelinePlayback`, so the audio clock drives the
+  picture, and the playhead passes each project change on to it. Other speeds, or a failed
+  audio output (warned about), use the wall clock and play no sound. Any seek or step pauses playback. The timeline's ruler is a `canvas` that paints its ticks
   and timecode labels and scrubs the playhead through window mouse listeners, so a drag keeps
   tracking outside the ruler. The timeline maps time to pixels through a `Viewport` (zoom as
   pixels per second, plus the time at the left edge). The wheel scrolls it, Ctrl+wheel zooms
@@ -164,8 +182,8 @@ frames reach the viewer as a GPUI image read back to the CPU, not through a shar
 A wave counts as verified when `rust-formatter --check`, `cargo clippy --all-targets -- -D warnings`
 and `cargo test` all pass.
 
-Building needs the system FFmpeg development headers (the build runs bindgen, so it needs clang)
-and a Vulkan driver.
+Building needs the system FFmpeg and PipeWire development headers (the build runs bindgen, so it
+needs clang) and a Vulkan driver.
 
 ## Conventions
 

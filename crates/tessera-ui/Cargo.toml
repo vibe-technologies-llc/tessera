@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 gpui.workspace = true
 image.workspace = true
+tessera-audio.workspace = true
 tessera-document.workspace = true
 tessera-timeline.workspace = true
 tessera-media.workspace = true

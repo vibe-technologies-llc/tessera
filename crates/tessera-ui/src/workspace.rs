@@ -34,7 +34,7 @@ impl Workspace {
     pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
-        let playhead = cx.new(|_| Playhead::new(project.clone()));
+        let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
         let editor = ProjectEditor::new(project.clone(), cx);
         Self {
             focus_handle,
