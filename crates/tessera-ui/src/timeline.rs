@@ -1,13 +1,15 @@
 mod viewport;
 
 use gpui::{
-    App, Bounds, Context, DispatchPhase, DragMoveEvent, Entity, Hitbox, HitboxBehavior,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, Rgba, ScrollWheelEvent, SharedString, Styled, Window, canvas,
-    div, fill, point, px, size,
+    App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity, Hitbox,
+    HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Render, Rgba, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, prelude::FluentBuilder,
+    px, size,
 };
 use tessera_timeline::{
-    AssetId, Clip, FrameRate, PlaceClipError, Project, Time, TimeRange, Timecode, Track, TrackKind,
+    Clip, ClipEdge, ClipId, FrameRate, PlaceClipError, Project, Time, TimeRange, Timecode, Track,
+    TrackKind,
 };
 
 use self::viewport::Viewport;
@@ -31,6 +33,7 @@ const PLAYHEAD_WIDTH: f32 = 1.;
 const PLAYHEAD_CAP_WIDTH: f32 = 9.;
 const PLAYHEAD_CAP_HEIGHT: f32 = 8.;
 const CLIP_INSET: f32 = 4.;
+const TRIM_HANDLE_WIDTH: f32 = 6.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RulerSpan {
@@ -99,6 +102,24 @@ struct DropPreview {
     fits: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grip {
+    Body,
+    Edge(ClipEdge),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DraggedClip {
+    id: ClipId,
+    grip: Grip,
+}
+
+impl Render for DraggedClip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 pub struct TimelinePanel {
     project: Entity<Project>,
     playhead: Entity<Playhead>,
@@ -106,6 +127,8 @@ pub struct TimelinePanel {
     drop_preview: Option<DropPreview>,
     viewport: Viewport,
     lanes: Bounds<Pixels>,
+    selection: Option<ClipId>,
+    grab: Pixels,
 }
 
 impl TimelinePanel {
@@ -127,6 +150,8 @@ impl TimelinePanel {
             drop_preview: None,
             viewport: Viewport::default(),
             lanes: Bounds::default(),
+            selection: None,
+            grab: px(0.),
         }
     }
 
@@ -190,16 +215,82 @@ impl TimelinePanel {
         }
     }
 
-    fn drag_over_lane(
+    fn press_lane(&mut self, track: usize, offset: Pixels, cx: &mut Context<Self>) {
+        let time = self.viewport.time_at(offset);
+        let pressed = self
+            .project
+            .read(cx)
+            .timeline
+            .tracks
+            .get(track)
+            .and_then(|track| track.clip_at(time))
+            .copied();
+        if let Some(clip) = pressed {
+            self.grab = offset - self.viewport.x_at(clip.start);
+        }
+        let selection = pressed.map(|clip| clip.id);
+        if selection != self.selection {
+            self.selection = selection;
+            cx.notify();
+        }
+    }
+
+    fn drag_asset_over_lane(
         &mut self,
         track: usize,
         event: &DragMoveEvent<DraggedAsset>,
         cx: &mut Context<Self>,
     ) {
+        let asset = event.drag(cx).id;
+        self.hover_lane(track, event, cx, |panel, offset, cx| {
+            let project = panel.project.read(cx);
+            placement(
+                track,
+                project.clip_for(asset, track, panel.frame_at(offset, cx)),
+            )
+        });
+    }
+
+    fn drag_clip_over_lane(
+        &mut self,
+        track: usize,
+        event: &DragMoveEvent<DraggedClip>,
+        cx: &mut Context<Self>,
+    ) {
+        let DraggedClip { id, grip } = *event.drag(cx);
+        match grip {
+            Grip::Body => {
+                let grab = self.grab;
+                self.hover_lane(track, event, cx, |panel, offset, cx| {
+                    let start = panel.frame_at(offset - grab, cx);
+                    placement(track, panel.project.read(cx).moved_clip(id, track, start))
+                });
+            }
+            Grip::Edge(edge) => {
+                let offset = event.event.position.x - event.bounds.left();
+                let to = self.frame_at(offset, cx);
+                let project = self.project.read(cx);
+                let Some((clip_track, _)) = project.find_clip(id) else {
+                    return;
+                };
+                if clip_track == track {
+                    let preview = placement(track, project.trimmed_clip(id, edge, to));
+                    self.show_preview(preview, cx);
+                }
+            }
+        }
+    }
+
+    fn hover_lane<T: 'static>(
+        &mut self,
+        track: usize,
+        event: &DragMoveEvent<T>,
+        cx: &mut Context<Self>,
+        preview: impl FnOnce(&Self, Pixels, &App) -> Option<DropPreview>,
+    ) {
         let position = event.event.position;
         let preview = if event.bounds.contains(&position) {
-            let asset = event.drag(cx).id;
-            self.preview_drop(asset, track, position.x - event.bounds.left(), cx)
+            preview(self, position.x - event.bounds.left(), cx)
         } else if self
             .drop_preview
             .is_some_and(|preview| preview.track == track)
@@ -208,53 +299,75 @@ impl TimelinePanel {
         } else {
             return;
         };
+        self.show_preview(preview, cx);
+    }
+
+    fn show_preview(&mut self, preview: Option<DropPreview>, cx: &mut Context<Self>) {
         if preview != self.drop_preview {
             self.drop_preview = preview;
             cx.notify();
         }
     }
 
-    fn preview_drop(
-        &self,
-        asset: AssetId,
-        track: usize,
-        offset: Pixels,
-        cx: &App,
-    ) -> Option<DropPreview> {
-        let project = self.project.read(cx);
-        let start = project
-            .settings
-            .frame_rate
-            .frame_start(self.viewport.time_at(offset));
-        let (range, fits) = match project.clip_for(asset, track, start) {
-            Ok(clip) => (clip.timeline_range(), true),
-            Err(PlaceClipError::Overlapping(overlap)) => (overlap.inserted, false),
-            Err(_) => return None,
-        };
-        Some(DropPreview { track, range, fits })
+    fn drop_asset_on_lane(&mut self, track: usize, dragged: &DraggedAsset, cx: &mut Context<Self>) {
+        let asset = dragged.id;
+        self.commit_preview(
+            |preview| preview.track == track,
+            cx,
+            |project, preview| project.place_clip(asset, preview.track, preview.range.start),
+        );
     }
 
-    fn drop_on_lane(&mut self, track: usize, dragged: &DraggedAsset, cx: &mut Context<Self>) {
-        let Some(preview) = self
+    fn drop_clip_on_lane(&mut self, track: usize, dragged: &DraggedClip, cx: &mut Context<Self>) {
+        let DraggedClip { id, grip } = *dragged;
+        self.commit_preview(
+            |preview| grip != Grip::Body || preview.track == track,
+            cx,
+            |project, preview| match grip {
+                Grip::Body => project.move_clip(id, preview.track, preview.range.start),
+                Grip::Edge(ClipEdge::Start) => {
+                    project.trim_clip(id, ClipEdge::Start, preview.range.start)
+                }
+                Grip::Edge(ClipEdge::End) => {
+                    project.trim_clip(id, ClipEdge::End, preview.range.end())
+                }
+            },
+        );
+    }
+
+    fn commit_preview(
+        &mut self,
+        accepts: impl FnOnce(&DropPreview) -> bool,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut Project, DropPreview) -> Result<Clip, PlaceClipError>,
+    ) {
+        let preview = self
             .drop_preview
             .take()
-            .filter(|preview| preview.track == track && preview.fits)
-        else {
-            cx.notify();
-            return;
-        };
-        self.project.update(cx, |project, cx| {
-            match project.place_clip(dragged.id, track, preview.range.start) {
-                Ok(_) => cx.notify(),
-                Err(error) => tracing::warn!(%error, "could not place the clip"),
+            .filter(|preview| preview.fits && accepts(preview));
+        if let Some(preview) = preview {
+            let edited = self.project.update(cx, |project, cx| {
+                let edited = edit(project, preview);
+                if edited.is_ok() {
+                    cx.notify();
+                }
+                edited
+            });
+            match edited {
+                Ok(clip) => self.selection = Some(clip.id),
+                Err(error) => tracing::warn!(%error, "could not edit the timeline"),
             }
-        });
+        }
         cx.notify();
     }
 
-    fn scrub_to(&mut self, offset: Pixels, cx: &mut Context<Self>) {
+    fn frame_at(&self, offset: Pixels, cx: &App) -> Time {
         let frame_rate = self.project.read(cx).settings.frame_rate;
-        let time = frame_rate.frame_start(self.viewport.time_at(offset));
+        frame_rate.frame_start(self.viewport.time_at(offset))
+    }
+
+    fn scrub_to(&mut self, offset: Pixels, cx: &mut Context<Self>) {
+        let time = self.frame_at(offset, cx);
         self.playhead
             .update(cx, |playhead, cx| playhead.seek(time, cx));
     }
@@ -268,6 +381,7 @@ impl Render for TimelinePanel {
         let panel = cx.entity();
         let drop_preview = self.drop_preview;
         let viewport = self.viewport;
+        let selection = self.selection;
         let playhead = self.playhead.read(cx).time();
         let project = self.project.read(cx);
         let frame_rate = project.settings.frame_rate;
@@ -300,7 +414,14 @@ impl Render for TimelinePanel {
                     }))
                     .child(ruler(panel, viewport, frame_rate))
                     .children(tracks.iter().enumerate().map(|(index, track)| {
-                        track_lane(index, track, project, viewport, drop_preview, cx)
+                        let lane = Lane {
+                            index,
+                            track,
+                            viewport,
+                            drop_preview,
+                            selection,
+                        };
+                        track_lane(lane, project, cx)
                     }))
                     .child(playhead_marker(viewport.x_at(playhead))),
             )
@@ -333,14 +454,22 @@ fn track_header(label: String) -> impl IntoElement {
         .child(label)
 }
 
-fn track_lane(
+struct Lane<'a> {
     index: usize,
-    track: &Track,
-    project: &Project,
+    track: &'a Track,
     viewport: Viewport,
     drop_preview: Option<DropPreview>,
-    cx: &Context<TimelinePanel>,
-) -> impl IntoElement {
+    selection: Option<ClipId>,
+}
+
+fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> impl IntoElement {
+    let Lane {
+        index,
+        track,
+        viewport,
+        drop_preview,
+        selection,
+    } = lane;
     let color = match track.kind {
         TrackKind::Video => theme::video_clip(),
         TrackKind::Audio => theme::audio_clip(),
@@ -354,18 +483,33 @@ fn track_lane(
         .relative()
         .border_b_1()
         .border_color(theme::border())
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |panel, event: &MouseDownEvent, _, cx| {
+                let offset = event.position.x - panel.lanes.left();
+                panel.press_lane(index, offset, cx);
+            }),
+        )
         .on_drag_move(cx.listener(move |panel, event, _, cx| {
-            panel.drag_over_lane(index, event, cx);
+            panel.drag_asset_over_lane(index, event, cx);
+        }))
+        .on_drag_move(cx.listener(move |panel, event, _, cx| {
+            panel.drag_clip_over_lane(index, event, cx);
         }))
         .on_drop(cx.listener(move |panel, dragged, _, cx| {
-            panel.drop_on_lane(index, dragged, cx);
+            panel.drop_asset_on_lane(index, dragged, cx);
         }))
-        .children(
-            track
-                .clips()
-                .iter()
-                .map(|clip| clip_block(clip, clip_label(project, clip), color, viewport)),
-        )
+        .on_drop(cx.listener(move |panel, dragged, _, cx| {
+            panel.drop_clip_on_lane(index, dragged, cx);
+        }))
+        .children(track.clips().iter().map(|clip| {
+            let look = ClipLook {
+                label: clip_label(project, clip),
+                color,
+                selected: selection == Some(clip.id),
+            };
+            clip_block(clip, look, viewport)
+        }))
         .children(ghost)
 }
 
@@ -384,6 +528,15 @@ fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
         .left(viewport.x_at(range.start))
         .w(viewport.width_of(range.duration))
         .rounded_sm()
+}
+
+fn placement(track: usize, placed: Result<Clip, PlaceClipError>) -> Option<DropPreview> {
+    let (range, fits) = match placed {
+        Ok(clip) => (clip.timeline_range(), true),
+        Err(PlaceClipError::Overlapping(overlap)) => (overlap.inserted, false),
+        Err(_) => return None,
+    };
+    Some(DropPreview { track, range, fits })
 }
 
 fn drop_ghost(preview: DropPreview, viewport: Viewport) -> impl IntoElement {
@@ -410,19 +563,49 @@ fn track_labels(tracks: &[Track]) -> impl Iterator<Item = String> {
     })
 }
 
-fn clip_block(
-    clip: &Clip,
+struct ClipLook {
     label: SharedString,
     color: Rgba,
-    viewport: Viewport,
-) -> impl IntoElement {
+    selected: bool,
+}
+
+fn clip_block(clip: &Clip, look: ClipLook, viewport: Viewport) -> impl IntoElement {
+    let body = DraggedClip {
+        id: clip.id,
+        grip: Grip::Body,
+    };
     clip_frame(clip.timeline_range(), viewport)
+        .id(("clip", clip.id.0))
         .overflow_hidden()
         .px_1()
-        .bg(color)
+        .bg(look.color)
         .text_xs()
         .text_color(theme::text())
-        .child(div().truncate().child(label))
+        .when(look.selected, |frame| {
+            frame.border_2().border_color(theme::selection())
+        })
+        .on_drag(body, |dragged, _, _, cx| cx.new(|_| *dragged))
+        .child(div().truncate().child(look.label))
+        .child(trim_handle(clip.id, ClipEdge::Start))
+        .child(trim_handle(clip.id, ClipEdge::End))
+}
+
+fn trim_handle(id: ClipId, edge: ClipEdge) -> impl IntoElement {
+    let dragged = DraggedClip {
+        id,
+        grip: Grip::Edge(edge),
+    };
+    let handle = match edge {
+        ClipEdge::Start => div().id(("clip-start", id.0)).left_0(),
+        ClipEdge::End => div().id(("clip-end", id.0)).right_0(),
+    };
+    handle
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .w(px(TRIM_HANDLE_WIDTH))
+        .cursor(CursorStyle::ResizeLeftRight)
+        .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| *dragged))
 }
 
 fn ruler(
@@ -574,7 +757,90 @@ fn ruler_step(pixels_per_second: f32, frame_rate: FrameRate) -> RulerStep {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use tessera_timeline::{MediaInfo, Stream, VideoStream};
+
     use super::*;
+
+    const ONE_SECOND: f32 = 48.;
+    const V1: f32 = RULER_HEIGHT + TRACK_HEIGHT / 2.;
+
+    fn at(seconds: f32) -> Pixels {
+        px(TRACK_HEADER_WIDTH + seconds * ONE_SECOND)
+    }
+
+    fn timeline_with_a_clip(
+        cx: &mut TestAppContext,
+    ) -> (Entity<TimelinePanel>, &mut VisualTestContext, ClipId) {
+        let mut project = Project::new("test");
+        let info = MediaInfo {
+            duration: Some(Time::from_seconds(8)),
+            streams: vec![Stream::Video(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                width: 1920,
+                height: 1080,
+                frame_rate: None,
+            })],
+        };
+        let asset = project.add_asset("a.mkv".into(), info);
+        let clip = project
+            .place_clip(asset, 0, Time::from_seconds(1))
+            .unwrap()
+            .id;
+        let project = cx.new(|_| project);
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let playhead = cx.new(|_| Playhead::new(project.clone()));
+            TimelinePanel::new(project, playhead, cx)
+        });
+        (panel, cx, clip)
+    }
+
+    fn drag(cx: &mut VisualTestContext, from: Pixels, to: Pixels) {
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(point(from, px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(from + px(4.), px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(to, px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_up(point(to, px(V1)), MouseButton::Left, none);
+    }
+
+    fn clip_of(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext, id: ClipId) -> Clip {
+        cx.read(|cx| *panel.read(cx).project.read(cx).find_clip(id).unwrap().1)
+    }
+
+    #[gpui::test]
+    fn pressing_a_clip_selects_it_and_empty_lane_clears(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
+        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+        cx.simulate_click(point(at(12.), px(V1)), Modifiers::none());
+        assert_eq!(cx.read(|cx| panel.read(cx).selection), None);
+    }
+
+    #[gpui::test]
+    fn dragging_a_clip_moves_it_by_the_pointer_travel(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        drag(cx, at(4.), at(6.));
+        let moved = clip_of(&panel, cx, clip);
+        assert_eq!(moved.start, Time::from_seconds(3));
+        assert_eq!(moved.source.start, Time::ZERO);
+        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+    }
+
+    #[gpui::test]
+    fn dragging_the_edges_trims_the_clip(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        drag(cx, at(9.) - px(2.), at(6.));
+        let trimmed = clip_of(&panel, cx, clip);
+        assert_eq!(trimmed.timeline_range().end(), Time::from_seconds(6));
+        drag(cx, at(1.) + px(2.), at(3.));
+        let trimmed = clip_of(&panel, cx, clip);
+        assert_eq!(trimmed.start, Time::from_seconds(3));
+        assert_eq!(
+            trimmed.source,
+            TimeRange::new(Time::from_seconds(2), Time::from_seconds(3))
+        );
+    }
 
     #[test]
     fn ruler_step_keeps_major_ticks_apart() {

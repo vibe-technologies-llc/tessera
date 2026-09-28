@@ -6,7 +6,6 @@
 
 ## Timeline editing
 
-- Select, move and trim clips while keeping the no-overlap invariant
 - Split at the playhead, delete and ripple delete
 - Add, remove and reorder tracks
 - Snapping to clip edges and the playhead

@@ -55,3 +55,7 @@ pub fn drop_ghost() -> Rgba {
 pub fn drop_ghost_blocked() -> Rgba {
     rgba(0xe06c7566)
 }
+
+pub fn selection() -> Rgba {
+    rgb(0xf2f3f5)
+}
