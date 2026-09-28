@@ -1,4 +1,5 @@
 mod header;
+mod snap;
 mod viewport;
 
 use gpui::{
@@ -15,6 +16,7 @@ use tessera_timeline::{
 
 use self::{
     header::{add_track_row, content_height, track_header, track_rows},
+    snap::{Snap, SnapTargets},
     viewport::Viewport,
 };
 use crate::{
@@ -38,6 +40,8 @@ const PLAYHEAD_CAP_WIDTH: f32 = 9.;
 const PLAYHEAD_CAP_HEIGHT: f32 = 8.;
 const CLIP_INSET: f32 = 4.;
 const TRIM_HANDLE_WIDTH: f32 = 6.;
+const SNAP_DISTANCE: f32 = 8.;
+const SNAP_LINE_WIDTH: f32 = 1.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RulerSpan {
@@ -104,6 +108,16 @@ struct DropPreview {
     track: usize,
     range: TimeRange,
     fits: bool,
+    snapped_to: Option<Time>,
+}
+
+impl DropPreview {
+    fn snapped(self, snap: Option<Snap>) -> Self {
+        let snapped_to = snap
+            .map(|snap| snap.target)
+            .filter(|&target| target == self.range.start || target == self.range.end());
+        Self { snapped_to, ..self }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +149,7 @@ pub struct TimelinePanel {
     grab: Pixels,
     track_scroll: Pixels,
     tracks_view: Bounds<Pixels>,
+    snapping: bool,
 }
 
 impl TimelinePanel {
@@ -160,6 +175,7 @@ impl TimelinePanel {
             grab: px(0.),
             track_scroll: px(0.),
             tracks_view: Bounds::default(),
+            snapping: true,
         }
     }
 
@@ -174,6 +190,11 @@ impl TimelinePanel {
     pub fn zoom_to_fit(&mut self, cx: &mut Context<Self>) {
         let duration = self.project.read(cx).timeline.duration();
         self.set_viewport(Viewport::fitting(duration, self.lanes.size.width), cx);
+    }
+
+    pub fn toggle_snapping(&mut self, cx: &mut Context<Self>) {
+        self.snapping = !self.snapping;
+        cx.notify();
     }
 
     pub fn split_at_playhead(&mut self, cx: &mut Context<Self>) {
@@ -350,10 +371,9 @@ impl TimelinePanel {
         let asset = event.drag(cx).id;
         self.hover_lane(track, event, cx, |panel, offset, cx| {
             let project = panel.project.read(cx);
-            placement(
-                track,
-                project.clip_for(asset, track, panel.frame_at(offset, cx)),
-            )
+            let duration = project.asset(asset).and_then(|asset| asset.info.duration);
+            let (start, snap) = panel.snapped_start(panel.frame_at(offset, cx), duration, None, cx);
+            placement(track, project.clip_for(asset, track, start), snap)
         });
     }
 
@@ -368,19 +388,24 @@ impl TimelinePanel {
             Grip::Body => {
                 let grab = self.grab;
                 self.hover_lane(track, event, cx, |panel, offset, cx| {
+                    let project = panel.project.read(cx);
+                    let duration = project.find_clip(id).map(|(_, clip)| clip.source.duration);
                     let start = panel.frame_at(offset - grab, cx);
-                    placement(track, panel.project.read(cx).moved_clip(id, track, start))
+                    let (start, snap) = panel.snapped_start(start, duration, Some(id), cx);
+                    placement(track, project.moved_clip(id, track, start), snap)
                 });
             }
             Grip::Edge(edge) => {
                 let offset = event.event.position.x - event.bounds.left();
                 let to = self.frame_at(offset, cx);
+                let snap = self.snap(&[to], Some(id), cx);
+                let to = to + snap.map_or(Time::ZERO, |snap| snap.shift);
                 let project = self.project.read(cx);
                 let Some((clip_track, _)) = project.find_clip(id) else {
                     return;
                 };
                 if clip_track == track {
-                    let preview = placement(track, project.trimmed_clip(id, edge, to));
+                    let preview = placement(track, project.trimmed_clip(id, edge, to), snap);
                     self.show_preview(preview, cx);
                 }
             }
@@ -467,6 +492,30 @@ impl TimelinePanel {
         cx.notify();
     }
 
+    fn snapped_start(
+        &self,
+        start: Time,
+        duration: Option<Time>,
+        moving: Option<ClipId>,
+        cx: &App,
+    ) -> (Time, Option<Snap>) {
+        let edges: Vec<Time> = [Some(start), duration.map(|duration| start + duration)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let snap = self.snap(&edges, moving, cx);
+        (start + snap.map_or(Time::ZERO, |snap| snap.shift), snap)
+    }
+
+    fn snap(&self, edges: &[Time], moving: Option<ClipId>, cx: &App) -> Option<Snap> {
+        if !self.snapping {
+            return None;
+        }
+        let playhead = self.playhead.read(cx).time();
+        let targets = SnapTargets::new(&self.project.read(cx).timeline, playhead, moving);
+        targets.snap(edges, self.viewport.duration_of(px(SNAP_DISTANCE)))
+    }
+
     fn frame_at(&self, offset: Pixels, cx: &App) -> Time {
         let frame_rate = self.project.read(cx).settings.frame_rate;
         frame_rate.frame_start(self.viewport.time_at(offset))
@@ -486,6 +535,9 @@ impl Render for TimelinePanel {
         }
         let panel = cx.entity();
         let drop_preview = self.drop_preview;
+        let snap_line = drop_preview
+            .and_then(|preview| preview.snapped_to)
+            .map(|time| snap_line(self.viewport.x_at(time)));
         let viewport = self.viewport;
         let selection = self.selection;
         let playhead = self.playhead.read(cx).time();
@@ -539,6 +591,7 @@ impl Render for TimelinePanel {
                     .flex_col()
                     .child(ruler(panel, viewport, frame_rate))
                     .child(lanes)
+                    .children(snap_line)
                     .child(playhead_marker(viewport.x_at(playhead))),
             )
     }
@@ -655,13 +708,23 @@ fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
         .rounded_sm()
 }
 
-fn placement(track: usize, placed: Result<Clip, EditError>) -> Option<DropPreview> {
+fn placement(
+    track: usize,
+    placed: Result<Clip, EditError>,
+    snap: Option<Snap>,
+) -> Option<DropPreview> {
     let (range, fits) = match placed {
         Ok(clip) => (clip.timeline_range(), true),
         Err(EditError::Overlapping(overlap)) => (overlap.inserted, false),
         Err(_) => return None,
     };
-    Some(DropPreview { track, range, fits })
+    let preview = DropPreview {
+        track,
+        range,
+        fits,
+        snapped_to: None,
+    };
+    Some(preview.snapped(snap))
 }
 
 fn drop_ghost(preview: DropPreview, viewport: Viewport) -> impl IntoElement {
@@ -832,6 +895,16 @@ fn listen_for_scrub(
             panel.update(cx, |panel, _| panel.scrubbing = false);
         }
     });
+}
+
+fn snap_line(x: Pixels) -> impl IntoElement {
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(x - px(SNAP_LINE_WIDTH / 2.))
+        .w(px(SNAP_LINE_WIDTH))
+        .bg(theme::snap_line())
 }
 
 fn playhead_marker(x: Pixels) -> impl IntoElement {
@@ -1036,6 +1109,29 @@ mod tests {
             trimmed.source,
             TimeRange::new(Time::from_seconds(2), Time::from_seconds(3))
         );
+    }
+
+    #[gpui::test]
+    fn moving_a_clip_snaps_its_edges_to_nearby_clip_edges(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (V2, 12)]);
+        let travel = 2.95;
+        drag(cx, at(4.), at(4. + travel));
+        assert_eq!(clip_of(&panel, cx, clips[0]).start, Time::from_seconds(4));
+        panel.update(cx, TimelinePanel::toggle_snapping);
+        drag(cx, at(5.), at(5. - 0.05));
+        assert_eq!(
+            clip_of(&panel, cx, clips[0]).start,
+            FrameRate::FPS_30.frame_start(Time::from_rational(395, 100))
+        );
+    }
+
+    #[gpui::test]
+    fn trimming_snaps_to_the_playhead(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        seek(&panel, cx, 5);
+        drag(cx, at(9.) - px(2.), at(5.1));
+        let trimmed = clip_of(&panel, cx, clip);
+        assert_eq!(trimmed.timeline_range().end(), Time::from_seconds(5));
     }
 
     #[test]

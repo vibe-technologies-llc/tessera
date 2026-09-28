@@ -53,7 +53,7 @@ impl Viewport {
         self.start + self.duration_of(offset)
     }
 
-    fn duration_of(self, width: Pixels) -> Time {
+    pub fn duration_of(self, width: Pixels) -> Time {
         let seconds = f64::from(f32::from(width)) / f64::from(self.pixels_per_second);
         Time::from_flicks((seconds * FLICKS_PER_SECOND as f64).round() as i64)
     }

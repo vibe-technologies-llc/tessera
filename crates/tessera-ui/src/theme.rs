@@ -59,3 +59,7 @@ pub fn drop_ghost_blocked() -> Rgba {
 pub fn selection() -> Rgba {
     rgb(0xf2f3f5)
 }
+
+pub fn snap_line() -> Rgba {
+    rgb(0x5fd0e0)
+}

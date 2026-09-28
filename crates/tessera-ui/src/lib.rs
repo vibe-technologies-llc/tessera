@@ -33,7 +33,8 @@ actions!(
         ZoomToFit,
         SplitAtPlayhead,
         DeleteClip,
-        RippleDeleteClip
+        RippleDeleteClip,
+        ToggleSnapping
     ]
 );
 
@@ -56,6 +57,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("backspace", DeleteClip, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("shift-delete", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("shift-backspace", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("n", ToggleSnapping, Some(WORKSPACE_CONTEXT)),
     ]);
 }
 

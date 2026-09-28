@@ -70,7 +70,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   places the clip at the previewed, frame-snapped start. Clips on the timeline work the same way.
   Pressing a lane selects the clip under the pointer, or clears the selection, and records where
   the clip was grabbed. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
-  drag that the lanes preview and commit as a move or a trim. Ctrl+K splits the selected clip at the
+  drag that the lanes preview and commit as a move or a trim. While snapping is on (N toggles it),
+  a dropped asset's edges, a moved clip's edges and a trimmed edge pull onto the nearest clip edge,
+  the playhead or zero within a few pixels (`timeline::snap`), and the lanes draw a line where the
+  preview snapped. Ctrl+K splits the selected clip at the
   playhead, or every clip under it when the selection is elsewhere or empty. Delete or Backspace
   deletes the selection, and with Shift held they ripple delete it. The timeline draws video tracks
   from the highest index down, then audio tracks in order (`header::display_order`). Each track

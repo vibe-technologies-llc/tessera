@@ -6,8 +6,9 @@ use tessera_timeline::Project;
 
 use crate::{
     DeleteClip, Import, Pause, PlayPause, RippleDeleteClip, ShuttleBackward, ShuttleForward,
-    SplitAtPlayhead, StepBackward, StepForward, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
-    media_bin::MediaBin, playhead::Playhead, theme, timeline::TimelinePanel, viewer::Viewer,
+    SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
+    ZoomToFit, media_bin::MediaBin, playhead::Playhead, theme, timeline::TimelinePanel,
+    viewer::Viewer,
 };
 
 pub struct Workspace {
@@ -100,6 +101,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &RippleDeleteClip, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::ripple_delete_selection);
+            }))
+            .on_action(cx.listener(|workspace, _: &ToggleSnapping, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::toggle_snapping);
             }))
             .size_full()
             .flex()
