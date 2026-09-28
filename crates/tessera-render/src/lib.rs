@@ -1,3 +1,8 @@
+mod compositor;
+mod fit;
+
+pub use compositor::Compositor;
+use fit::Size;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -6,52 +11,45 @@ pub enum Error {
     Adapter(#[from] wgpu::RequestAdapterError),
     #[error("failed to create GPU device: {0}")]
     Device(#[from] wgpu::RequestDeviceError),
+    #[error("the sequence has no pixels")]
+    EmptySequence,
+    #[error("layer {index} has no pixels")]
+    EmptyLayer { index: usize },
+    #[error("layer {index} holds {actual} bytes where {expected} were expected")]
+    LayerLength {
+        index: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("{width}×{height} exceeds the GPU's largest texture side of {max}")]
+    TooLarge { width: u32, height: u32, max: u32 },
+    #[error("failed to wait for the GPU: {0}")]
+    Poll(#[from] wgpu::PollError),
+    #[error("failed to map the composited frame: {0}")]
+    Readback(#[from] wgpu::BufferAsyncError),
+    #[error("failed to read the composited frame: {0}")]
+    MappedRange(#[from] wgpu::MapRangeError),
 }
 
-pub struct Compositor {
-    adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+#[derive(Clone, Copy, Debug)]
+pub struct Layer<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: &'a [u8],
 }
 
-impl Compositor {
-    pub fn new() -> Result<Self, Error> {
-        pollster::block_on(Self::create())
+impl Layer<'_> {
+    fn size(&self) -> Size {
+        Size {
+            width: self.width,
+            height: self.height,
+        }
     }
+}
 
-    async fn create() -> Result<Self, Error> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                ..Default::default()
-            })
-            .await?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("tessera-compositor"),
-                ..Default::default()
-            })
-            .await?;
-        Ok(Self {
-            adapter,
-            device,
-            queue,
-        })
-    }
-
-    pub fn adapter_info(&self) -> wgpu::AdapterInfo {
-        self.adapter.get_info()
-    }
-
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
 }

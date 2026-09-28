@@ -10,10 +10,7 @@
 
 ## Compositing
 
-- Upload decoded frames to `wgpu` textures and composite the video tracks onto a sequence-sized
-  target
 - Convert YUV to RGB with the source's matrix and range
-- Fit sources whose resolution or aspect ratio differs from the sequence
 - Wire the `Compositor` into the viewer through the CPU readback path
 - Import hardware-decoded frames into the compositor without a copy, through dmabuf and Vulkan
   external memory

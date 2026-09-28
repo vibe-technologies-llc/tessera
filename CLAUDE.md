@@ -70,8 +70,16 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   read starting where the last one ended never seeks. A read behind the last one, or more than a
   second past what is decoded, seeks 100 ms early (flushing the decoder and the resampler) and
   discards up to the target.
-- **`tessera-render`** owns a `wgpu` Vulkan `Compositor` (device + queue) for compositing timeline
-  frames. It isn't wired into the UI yet.
+- **`tessera-render`** owns a `wgpu` Vulkan `Compositor` for compositing timeline frames. It
+  doesn't depend on `tessera-media`: a `Layer` borrows a packed straight-alpha BGRA8 image shaped
+  like `VideoFrame`, and `Compositor::composite` returns an owned sequence-sized `Frame`. It clears a
+  `Bgra8Unorm` target to opaque black, draws the layers bottom first as one textured quad each,
+  blended over with their alpha, and reads the target back with its rows unpadded. Each layer is
+  scaled uniformly to fit inside the sequence and centred (`fit::fit_rect`, letterboxing or
+  pillarboxing), with linear filtering, and a layer of the sequence's size comes back byte for
+  byte. The target and readback buffer are kept while the sequence size holds, and layer
+  textures, each with its own placement uniform and bind group, are pooled by size, keeping only
+  those the last call used. It isn't wired into the UI yet.
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>` through its `ProjectEditor`, and each panel
   (`MediaBin`, `Viewer`, `TimelinePanel`) gets a clone of it and re-renders through
   `cx.observe(&project, …)`. Every edit goes through the `ProjectEditor` (`editor.rs`), which
