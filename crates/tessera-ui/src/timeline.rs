@@ -179,6 +179,14 @@ impl TimelinePanel {
         }
     }
 
+    pub fn project_replaced(&mut self, cx: &mut Context<Self>) {
+        self.selection = None;
+        self.drop_preview = None;
+        self.viewport = Viewport::default();
+        self.track_scroll = px(0.);
+        cx.notify();
+    }
+
     pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
         self.zoom_around_playhead(ZOOM_STEP, cx);
     }
@@ -1272,5 +1280,20 @@ mod tests {
         wheel(cx, 100_000.);
         assert_eq!(scroll(cx), px(0.));
         assert_eq!(cx.read(|cx| panel.read(cx).viewport), Viewport::default());
+    }
+
+    #[gpui::test]
+    fn a_replaced_project_clears_the_selection_and_the_view(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
+        panel.update(cx, TimelinePanel::zoom_in);
+        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+        assert_ne!(cx.read(|cx| panel.read(cx).viewport), Viewport::default());
+        let editor = cx.read(|cx| panel.read(cx).editor.clone());
+        cx.update(|_, cx| editor.replace(Project::new("other"), cx));
+        panel.update(cx, TimelinePanel::project_replaced);
+        assert_eq!(cx.read(|cx| panel.read(cx).selection), None);
+        assert_eq!(cx.read(|cx| panel.read(cx).viewport), Viewport::default());
+        assert!(starts_on(&panel, cx, 0).is_empty());
     }
 }

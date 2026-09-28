@@ -11,7 +11,8 @@ parse or keep stable.
 ## Architecture
 
 A Cargo workspace under `crates/`. Dependencies point one way:
-`tessera-timeline` ← `tessera-media`, `tessera-render` ← `tessera-ui` ← `tessera` (the binary).
+`tessera-timeline` ← `tessera-media`, `tessera-document`, `tessera-render` ← `tessera-ui` ←
+`tessera` (the binary).
 
 - **`tessera-timeline`** is the pure project model (`Project`, `Timeline`, `Track`, `Clip`,
   `Asset`). Each `Asset` carries its probed `MediaInfo` (duration and streams), so nothing outside
@@ -42,6 +43,17 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   when the edit succeeds and changes something, and rolls the project back when the edit fails.
   `undo` and `redo` swap those snapshots in, the stack keeps the last `HISTORY_DEPTH` commands,
   and a new command clears the redo stack.
+- **`tessera-document`** reads and writes project files (`.tessera`, `EXTENSION`): pretty JSON in
+  an envelope `{ "format": "tessera-project", "version": N, "project": … }`, with times as integer
+  flicks. The model stays serde-free: each format version has its own DTO module (`v1.rs`, aliased
+  as `current`) with conversions to and from `Project`. Loading parses to a `serde_json::Value`,
+  checks the marker, runs the `MIGRATIONS` chain (one `fn(Value) -> Result<Value, String>` step per
+  source version, so a new version appends a step, and `CURRENT_VERSION` follows its length) and
+  then deserializes the current DTO. Rebuilding the `Project` validates rather than trusts: clips go
+  through `Track::insert`, and ids, assets, stream kinds, clip ranges, rates and one track of each
+  kind are checked, each failure a distinct `ValidationError`. `to_string`/`from_str` are pure;
+  `save` writes a synced sibling temp file and renames it over the target, and `open` and `save`
+  errors carry the path. A fixture in `fixtures/v1.tessera` pins the v1 format.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
   here. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
@@ -66,7 +78,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   pairs the project entity with its `Entity<History>`: `apply` and `perform` record the edit as a
   command and notify the project, so every panel updates and Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y can
   undo and redo it. The `MediaBin` and `TimelinePanel` get a clone of it, and imports are commands
-  too. Never mutate the project entity directly. Global
+  too. Never mutate the project entity directly. Ctrl+S saves to the file the project was last
+  saved to or opened from, or asks for one (appending `.tessera`), and Ctrl+O opens one; the
+  `Workspace` does the file IO on the background executor through `save_to` and `open_from`,
+  reports failures in a prompt, and titles the window after the file. Opening swaps the project
+  into the existing entity through `ProjectEditor::replace`, which clears the history, and pauses
+  the playhead at zero. Through their `project_replaced`, the timeline drops its selection and
+  view, and the bin its pending imports and thumbnails before decoding the new assets' ones. Global
   actions and keybindings are registered in `tessera_ui::init`; actions that need the project are
   handled on the focused `Workspace`, whose key context (`WORKSPACE_CONTEXT`) scopes the
   single-key transport bindings. The `Workspace` also owns an `Entity<Playhead>` shared the same
@@ -102,7 +120,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` shows the top video clip's
   frame under the playhead, decoded at sequence size on a background task. It keeps one decoder
-  per asset and runs one decode at a time, so while scrubbing only the newest request is decoded
+  per media path and size, dropping decoders and frames of media the project no longer holds, and
+  runs one decode at a time, so while scrubbing only the newest request is decoded
   next, and it releases each replaced frame from the GPUI atlas with `Window::drop_image`.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.

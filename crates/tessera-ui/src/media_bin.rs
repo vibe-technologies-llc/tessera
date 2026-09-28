@@ -57,6 +57,7 @@ pub struct MediaBin {
     probing: Vec<PathBuf>,
     failures: Vec<ImportFailure>,
     thumbnails: HashMap<AssetId, Arc<RenderImage>>,
+    retired: Vec<Arc<RenderImage>>,
 }
 
 impl MediaBin {
@@ -69,6 +70,53 @@ impl MediaBin {
             probing: Vec::new(),
             failures: Vec::new(),
             thumbnails: HashMap::new(),
+            retired: Vec::new(),
+        }
+    }
+
+    pub fn project_replaced(&mut self, cx: &mut Context<Self>) {
+        self.probing.clear();
+        self.failures.clear();
+        self.retired
+            .extend(self.thumbnails.drain().map(|(_, thumbnail)| thumbnail));
+        let videos: Vec<(AssetId, PathBuf, Option<Time>)> = self
+            .project
+            .read(cx)
+            .assets
+            .iter()
+            .filter(|asset| asset.info.video().next().is_some())
+            .map(|asset| (asset.id, asset.path.clone(), asset.info.duration))
+            .collect();
+        for (id, path, duration) in videos {
+            let decoded = cx.background_spawn({
+                let path = path.clone();
+                async move { thumbnail(&path, duration) }
+            });
+            cx.spawn(async move |this, cx| {
+                let decoded = decoded.await;
+                this.update(cx, |bin, cx| bin.finish_thumbnail(id, &path, decoded, cx))
+                    .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn finish_thumbnail(
+        &mut self,
+        id: AssetId,
+        path: &Path,
+        thumbnail: Option<Arc<RenderImage>>,
+        cx: &mut Context<Self>,
+    ) {
+        let still_held = self
+            .project
+            .read(cx)
+            .asset(id)
+            .is_some_and(|asset| asset.path == path);
+        if let Some(thumbnail) = thumbnail.filter(|_| still_held) {
+            self.retired.extend(self.thumbnails.insert(id, thumbnail));
+            cx.notify();
         }
     }
 
@@ -126,6 +174,9 @@ impl MediaBin {
         probed: Result<Imported, tessera_media::Error>,
         cx: &mut Context<Self>,
     ) {
+        if !self.probing.contains(&path) {
+            return;
+        }
         self.probing.retain(|probing| *probing != path);
         match probed {
             Ok(imported) if imported.info.streams.is_empty() => {
@@ -210,7 +261,12 @@ impl MediaBin {
 }
 
 impl Render for MediaBin {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for thumbnail in self.retired.drain(..) {
+            if let Err(error) = window.drop_image(thumbnail) {
+                tracing::warn!(%error, "failed to release a thumbnail");
+            }
+        }
         let body = self.body(cx);
         div()
             .id("media-bin")
@@ -374,7 +430,110 @@ pub fn file_name(path: &Path) -> SharedString {
 
 #[cfg(test)]
 mod tests {
+    use gpui::TestAppContext;
+    use tessera_timeline::{AudioStream, Stream, VideoStream};
+
     use super::*;
+
+    fn video_info() -> MediaInfo {
+        MediaInfo {
+            duration: Some(Time::from_seconds(4)),
+            streams: vec![Stream::Video(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                width: 640,
+                height: 360,
+                frame_rate: None,
+            })],
+        }
+    }
+
+    fn audio_info() -> MediaInfo {
+        MediaInfo {
+            duration: Some(Time::from_seconds(4)),
+            streams: vec![Stream::Audio(AudioStream {
+                index: 0,
+                codec: "opus".into(),
+                sample_rate: 48_000,
+                channels: 2,
+            })],
+        }
+    }
+
+    fn blank_thumbnail() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new([image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]))
+    }
+
+    #[gpui::test]
+    fn a_replaced_project_drops_the_old_thumbnails_and_imports(cx: &mut TestAppContext) {
+        let mut first = Project::new("first");
+        let old = first.add_asset("/missing/old.mkv".into(), video_info());
+        let project = cx.new(|_| first);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+        bin.update(cx, |bin, cx| {
+            bin.thumbnails.insert(old, blank_thumbnail());
+            bin.probing.push("/missing/late.mkv".into());
+            bin.fail("broken.mkv".into(), "no streams".into(), cx);
+        });
+
+        let mut second = Project::new("second");
+        second.add_asset("/missing/new.mkv".into(), video_info());
+        second.add_asset("/missing/new.opus".into(), audio_info());
+        bin.update(cx, |bin, cx| {
+            bin.editor.replace(second.clone(), cx);
+            bin.project_replaced(cx);
+            let late = Imported {
+                info: video_info(),
+                thumbnail: Some(blank_thumbnail()),
+            };
+            bin.finish_probe("/missing/late.mkv".into(), Ok(late), cx);
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let bin = bin.read(cx);
+            assert!(bin.thumbnails.is_empty());
+            assert!(bin.probing.is_empty());
+            assert!(bin.failures.is_empty());
+            assert_eq!(bin.project.read(cx).assets, second.assets);
+        });
+    }
+
+    #[gpui::test]
+    fn thumbnails_land_only_on_the_asset_they_were_decoded_for(cx: &mut TestAppContext) {
+        let mut project = Project::new("test");
+        let asset = project.add_asset("/missing/a.mkv".into(), video_info());
+        let project = cx.new(|_| project);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+        bin.update(cx, |bin, cx| {
+            bin.finish_thumbnail(
+                asset,
+                Path::new("/missing/b.mkv"),
+                Some(blank_thumbnail()),
+                cx,
+            );
+            bin.finish_thumbnail(
+                AssetId(9),
+                Path::new("/missing/a.mkv"),
+                Some(blank_thumbnail()),
+                cx,
+            );
+        });
+        assert!(cx.read(|cx| bin.read(cx).thumbnails.is_empty()));
+        bin.update(cx, |bin, cx| {
+            bin.finish_thumbnail(
+                asset,
+                Path::new("/missing/a.mkv"),
+                Some(blank_thumbnail()),
+                cx,
+            );
+        });
+        assert!(cx.read(|cx| bin.read(cx).thumbnails.contains_key(&asset)));
+    }
 
     #[test]
     fn durations_round_to_the_nearest_second() {

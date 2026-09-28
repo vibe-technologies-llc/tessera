@@ -27,7 +27,6 @@
 
 ## Project files
 
-- Save and open projects in a versioned on-disk format, with migrations between versions
 - Save As, recent projects and a dirty indicator in the title bar
 - Relink media that has moved or gone missing
 - Autosave and recovery after a crash

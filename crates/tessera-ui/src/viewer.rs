@@ -10,7 +10,7 @@ use gpui::{
     RenderImage, SharedString, Styled, StyledImage, Window, div, img,
 };
 use tessera_media::VideoDecoder;
-use tessera_timeline::{AssetId, Project, Time, Timecode};
+use tessera_timeline::{Project, Time, Timecode};
 
 use crate::{
     frame_image::render_image,
@@ -18,14 +18,18 @@ use crate::{
     theme,
 };
 
-type Decoders = HashMap<AssetId, VideoDecoder>;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DecoderKey {
+    path: PathBuf,
+    bounds: (u32, u32),
+}
+
+type Decoders = HashMap<DecoderKey, VideoDecoder>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FrameRequest {
-    asset: AssetId,
-    path: PathBuf,
+    decoder: DecoderKey,
     time: Time,
-    bounds: (u32, u32),
 }
 
 enum Picture {
@@ -74,8 +78,15 @@ impl Viewer {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        let stale = self
+            .shown
+            .as_ref()
+            .is_some_and(|shown| !self.is_live(&shown.decoder, cx));
+        if stale {
+            self.show(None, Picture::Empty, cx);
+        }
         let wanted = self.frame_request(cx);
-        if wanted != self.wanted {
+        if stale || wanted != self.wanted {
             self.wanted = wanted;
             self.decode_wanted(cx);
         }
@@ -87,11 +98,21 @@ impl Viewer {
         let clip = project.timeline.top_video_clip_at(time)?;
         let asset = project.asset(clip.asset)?;
         Some(FrameRequest {
-            asset: asset.id,
-            path: asset.path.clone(),
+            decoder: DecoderKey {
+                path: asset.path.clone(),
+                bounds: sequence_bounds(project),
+            },
             time: clip.source_time_at(time)?,
-            bounds: (project.settings.width, project.settings.height),
         })
+    }
+
+    fn is_live(&self, decoder: &DecoderKey, cx: &Context<Self>) -> bool {
+        let project = self.project.read(cx);
+        decoder.bounds == sequence_bounds(project)
+            && project
+                .assets
+                .iter()
+                .any(|asset| asset.path == decoder.path)
     }
 
     fn decode_wanted(&mut self, cx: &mut Context<Self>) {
@@ -105,6 +126,7 @@ impl Viewer {
         let Some(mut decoders) = self.idle_decoders.take() else {
             return;
         };
+        decoders.retain(|key, _| self.is_live(key, cx));
         let decoded = cx.background_spawn({
             let request = request.clone();
             async move {
@@ -116,7 +138,9 @@ impl Viewer {
             let (decoders, picture) = decoded.await;
             this.update(cx, |viewer, cx| {
                 viewer.idle_decoders = Some(decoders);
-                viewer.show(Some(request), picture, cx);
+                if viewer.is_live(&request.decoder, cx) {
+                    viewer.show(Some(request), picture, cx);
+                }
                 viewer.decode_wanted(cx);
             })
             .ok();
@@ -205,6 +229,10 @@ impl Render for Viewer {
     }
 }
 
+fn sequence_bounds(project: &Project) -> (u32, u32) {
+    (project.settings.width, project.settings.height)
+}
+
 fn speed_label(speed: Speed) -> Option<String> {
     let factor = speed.factor();
     match factor {
@@ -219,7 +247,7 @@ fn decode_picture(decoders: &mut Decoders, request: &FrameRequest) -> Picture {
         Ok(Some(image)) => Picture::Frame(image),
         Ok(None) => Picture::Failed("The decoded frame has an unexpected size".into()),
         Err(error) => {
-            tracing::warn!(path = %request.path.display(), %error, "viewer decode failed");
+            tracing::warn!(path = %request.decoder.path.display(), %error, "viewer decode failed");
             Picture::Failed(error.to_string().into())
         }
     }
@@ -229,12 +257,76 @@ fn decode_frame(
     decoders: &mut Decoders,
     request: &FrameRequest,
 ) -> Result<Option<Arc<RenderImage>>, tessera_media::Error> {
-    let decoder = match decoders.entry(request.asset) {
+    let decoder = match decoders.entry(request.decoder.clone()) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
-            let (width, height) = request.bounds;
-            entry.insert(VideoDecoder::open(&request.path)?.fit_within(width, height))
+            let DecoderKey { path, bounds } = entry.key();
+            let (width, height) = *bounds;
+            let opened = VideoDecoder::open(path)?.fit_within(width, height);
+            entry.insert(opened)
         }
     };
     Ok(render_image(decoder.frame_at(request.time)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
+    use tessera_timeline::{MediaInfo, Stream, VideoStream};
+
+    use super::*;
+    use crate::editor::ProjectEditor;
+
+    fn project_showing(media: &str) -> Project {
+        let mut project = Project::new(media);
+        let info = MediaInfo {
+            duration: Some(Time::from_seconds(4)),
+            streams: vec![Stream::Video(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                width: 640,
+                height: 360,
+                frame_rate: None,
+            })],
+        };
+        let asset = project.add_asset(media.into(), info);
+        project.place_clip(asset, 0, Time::ZERO).unwrap();
+        project
+    }
+
+    fn wanted_path(viewer: &Entity<Viewer>, cx: &mut VisualTestContext) -> Option<PathBuf> {
+        cx.read(|cx| {
+            viewer
+                .read(cx)
+                .wanted
+                .as_ref()
+                .map(|request| request.decoder.path.clone())
+        })
+    }
+
+    #[gpui::test]
+    fn a_replaced_project_asks_for_frames_of_its_own_media(cx: &mut TestAppContext) {
+        let project = cx.new(|_| project_showing("/missing/first.mkv"));
+        let (viewer, cx) = cx.add_window_view(|_, cx| {
+            let playhead = cx.new(|_| Playhead::new(project.clone()));
+            Viewer::new(project.clone(), playhead, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(wanted_path(&viewer, cx), Some("/missing/first.mkv".into()));
+
+        let second = project_showing("/missing/second.mkv");
+        assert_eq!(
+            second.assets[0].id,
+            project.read_with(cx, |project, _| project.assets[0].id)
+        );
+        cx.update(|_, cx| ProjectEditor::new(project.clone(), cx).replace(second, cx));
+        assert!(cx.read(|cx| viewer.read(cx).shown.is_none()));
+        assert_eq!(wanted_path(&viewer, cx), Some("/missing/second.mkv".into()));
+        cx.run_until_parked();
+        let shown = cx.read(|cx| viewer.read(cx).shown.clone());
+        assert_eq!(
+            shown.map(|request| request.decoder.path),
+            Some("/missing/second.mkv".into())
+        );
+    }
 }

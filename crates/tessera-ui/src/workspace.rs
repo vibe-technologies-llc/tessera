@@ -1,14 +1,23 @@
+use std::{ffi::OsStr, path::PathBuf};
+
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Window, div, px,
+    App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+    PathPromptOptions, PromptLevel, Render, Styled, Window, div, px,
 };
-use tessera_timeline::Project;
+use tessera_document::EXTENSION;
+use tessera_timeline::{Project, Time};
 
 use crate::{
-    DeleteClip, Import, Pause, PlayPause, Redo, RippleDeleteClip, ShuttleBackward, ShuttleForward,
-    SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn,
-    ZoomOut, ZoomToFit, editor::ProjectEditor, media_bin::MediaBin, playhead::Playhead, theme,
-    timeline::TimelinePanel, viewer::Viewer,
+    DeleteClip, Import, Open, Pause, PlayPause, Redo, RippleDeleteClip, Save, ShuttleBackward,
+    ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping, Undo,
+    WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    editor::ProjectEditor,
+    media_bin::{MediaBin, file_name},
+    playhead::Playhead,
+    theme,
+    timeline::TimelinePanel,
+    viewer::Viewer,
+    window_title,
 };
 
 pub struct Workspace {
@@ -18,6 +27,7 @@ pub struct Workspace {
     media_bin: Entity<MediaBin>,
     viewer: Entity<Viewer>,
     timeline: Entity<TimelinePanel>,
+    file: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -33,11 +43,135 @@ impl Workspace {
             timeline: cx.new(|cx| TimelinePanel::new(editor.clone(), playhead.clone(), cx)),
             playhead,
             editor,
+            file: None,
         }
     }
 
     pub fn project(&self) -> &Entity<Project> {
         self.editor.project()
+    }
+
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.file.clone() {
+            Some(path) => self.save_to(path, window, cx),
+            None => self.prompt_save(window, cx),
+        }
+    }
+
+    fn prompt_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let suggested_name = format!("{}.{EXTENSION}", self.project().read(cx).name);
+        let chosen = cx.prompt_for_new_path(&default_directory(), Some(&suggested_name));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(chosen) = chosen.await else {
+                return;
+            };
+            this.update_in(cx, |workspace, window, cx| match chosen {
+                Ok(Some(path)) => workspace.save_to(with_project_extension(path), window, cx),
+                Ok(None) => {}
+                Err(error) => report_failure(
+                    "Could not show the save dialog",
+                    &format!("{error:#}"),
+                    window,
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn save_to(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project().read(cx).clone();
+        let saving = cx.background_spawn({
+            let path = path.clone();
+            async move { tessera_document::save(&project, &path) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let saved = saving.await;
+            this.update_in(cx, |workspace, window, cx| match saved {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "saved the project");
+                    workspace.set_file(path, window, cx);
+                }
+                Err(error) => {
+                    report_failure("Could not save the project", &error.to_string(), window, cx)
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn prompt_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(chosen) = chosen.await else {
+                return;
+            };
+            this.update_in(cx, |workspace, window, cx| match chosen {
+                Ok(Some(paths)) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        workspace.open_from(path, window, cx);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => report_failure(
+                    "Could not show the open dialog",
+                    &format!("{error:#}"),
+                    window,
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn open_from(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let opening = cx.background_spawn({
+            let path = path.clone();
+            async move { tessera_document::open(&path) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let opened = opening.await;
+            this.update_in(cx, |workspace, window, cx| match opened {
+                Ok(project) => {
+                    tracing::info!(path = %path.display(), "opened the project");
+                    workspace.replace_project(project, cx);
+                    workspace.set_file(path, window, cx);
+                }
+                Err(error) => {
+                    report_failure("Could not open the project", &error.to_string(), window, cx)
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn replace_project(&mut self, project: Project, cx: &mut Context<Self>) {
+        self.playhead
+            .update(cx, |playhead, cx| playhead.seek(Time::ZERO, cx));
+        self.editor.replace(project, cx);
+        self.timeline.update(cx, TimelinePanel::project_replaced);
+        self.media_bin.update(cx, MediaBin::project_replaced);
+    }
+
+    fn set_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.file = Some(path);
+        window.set_window_title(&self.title(cx));
+    }
+
+    fn title(&self, cx: &App) -> String {
+        match &self.file {
+            Some(path) => window_title(&file_name(path)),
+            None => window_title(&self.project().read(cx).name),
+        }
     }
 
     fn transport(
@@ -62,6 +196,12 @@ impl Render for Workspace {
         div()
             .track_focus(&self.focus_handle)
             .key_context(WORKSPACE_CONTEXT)
+            .on_action(cx.listener(|workspace, _: &Save, window, cx| {
+                workspace.save(window, cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &Open, window, cx| {
+                workspace.prompt_open(window, cx);
+            }))
             .on_action(cx.listener(|workspace, _: &Import, _, cx| {
                 workspace
                     .media_bin
@@ -140,12 +280,33 @@ impl Render for Workspace {
     }
 }
 
+fn report_failure(message: &str, detail: &str, window: &mut Window, cx: &mut App) {
+    tracing::error!(detail, "{message}");
+    drop(window.prompt(PromptLevel::Critical, message, Some(detail), &["OK"], cx));
+}
+
+fn default_directory() -> PathBuf {
+    std::env::home_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
+
+fn with_project_extension(path: PathBuf) -> PathBuf {
+    if path.extension() == Some(OsStr::new(EXTENSION)) {
+        return path;
+    }
+    let mut path = path.into_os_string();
+    path.push(format!(".{EXTENSION}"));
+    path.into()
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
     use tessera_timeline::{MediaInfo, Stream, Time, VideoStream};
 
     use super::*;
+    use crate::playhead::Speed;
 
     const TIMELINE_HEIGHT: f32 = 260.;
     const V1_BELOW_TIMELINE_TOP: f32 = 1. + 24. + 24.;
@@ -169,10 +330,8 @@ mod tests {
         cx.simulate_click(point(x, y), Modifiers::none());
     }
 
-    #[gpui::test]
-    fn editing_keys_reach_the_timeline(cx: &mut TestAppContext) {
-        cx.update(crate::init);
-        let mut project = Project::new("test");
+    fn sample_project(name: &str, media: &str) -> Project {
+        let mut project = Project::new(name);
         let info = MediaInfo {
             duration: Some(Time::from_seconds(8)),
             streams: vec![Stream::Video(VideoStream {
@@ -183,13 +342,19 @@ mod tests {
                 frame_rate: None,
             })],
         };
-        let asset = project.add_asset("a.mkv".into(), info);
+        let asset = project.add_asset(media.into(), info);
         for seconds in [1, 10] {
             project
                 .place_clip(asset, 0, Time::from_seconds(seconds))
                 .unwrap();
         }
-        let project = cx.new(|_| project);
+        project
+    }
+
+    #[gpui::test]
+    fn editing_keys_reach_the_timeline(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
         let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
         let playhead = cx.read(|cx| workspace.read(cx).playhead.clone());
         playhead.update(cx, |playhead, cx| {
@@ -218,5 +383,114 @@ mod tests {
         assert_eq!(starts(&workspace, cx), seconds(&[1, 10]));
         cx.simulate_keystrokes("ctrl-y");
         assert_eq!(starts(&workspace, cx), seconds(&[7]));
+    }
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("tessera-ui-{}-{name}", std::process::id()));
+            std::fs::remove_dir_all(&path).ok();
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn current(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Project {
+        cx.read(|cx| workspace.read(cx).project().read(cx).clone())
+    }
+
+    #[gpui::test]
+    fn saving_then_opening_replaces_the_project_in_place(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("save-open");
+        let path = dir.0.join("cut.tessera");
+        let saved = sample_project("Cut", "/media/cut.mkv");
+        let project = cx.new(|_| saved.clone());
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(project.clone(), window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_to(path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.window_title().as_deref(), Some("cut.tessera — Tessera"));
+        assert_eq!(tessera_document::open(&path).unwrap(), saved);
+
+        let other = sample_project("Other", "/media/other.mkv");
+        workspace.update(cx, |workspace, cx| {
+            workspace.replace_project(other.clone(), cx);
+        });
+        let playhead = cx.read(|cx| workspace.read(cx).playhead.clone());
+        playhead.update(cx, |playhead, cx| playhead.seek(Time::from_seconds(4), cx));
+        cx.simulate_keystrokes("ctrl-k");
+        click_v1(cx, 2.);
+        cx.simulate_keystrokes("l");
+        assert_eq!(starts(&workspace, cx), [1, 4, 10].map(Time::from_seconds));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_from(path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(current(&workspace, cx), saved);
+        assert_eq!(cx.read(|cx| workspace.read(cx).project().clone()), project);
+        let time_and_speed = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let playhead = playhead.read(cx);
+                (playhead.time(), playhead.speed())
+            })
+        };
+        assert_eq!(time_and_speed(cx), (Time::ZERO, Speed::PAUSED));
+        cx.simulate_keystrokes("ctrl-z");
+        assert_eq!(current(&workspace, cx), saved);
+        cx.simulate_keystrokes("delete");
+        assert_eq!(current(&workspace, cx), saved);
+
+        std::fs::remove_file(&path).unwrap();
+        cx.simulate_keystrokes("ctrl-s");
+        cx.run_until_parked();
+        assert_eq!(tessera_document::open(&path).unwrap(), saved);
+    }
+
+    #[gpui::test]
+    fn a_file_that_fails_to_open_is_reported_and_changes_nothing(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("open-failure");
+        let missing = dir.0.join("missing.tessera");
+        let kept = sample_project("Kept", "/media/kept.mkv");
+        let project = cx.new(|_| kept.clone());
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_from(missing.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().unwrap();
+        assert_eq!(message, "Could not open the project");
+        assert!(detail.contains("missing.tessera"), "{detail}");
+        assert_eq!(current(&workspace, cx), kept);
+        assert_eq!(cx.read(|cx| workspace.read(cx).file.clone()), None);
+    }
+
+    #[test]
+    fn saved_paths_gain_the_project_extension() {
+        assert_eq!(
+            with_project_extension("/work/cut".into()),
+            PathBuf::from("/work/cut.tessera")
+        );
+        assert_eq!(
+            with_project_extension("/work/cut.v2".into()),
+            PathBuf::from("/work/cut.v2.tessera")
+        );
+        assert_eq!(
+            with_project_extension("/work/cut.tessera".into()),
+            PathBuf::from("/work/cut.tessera")
+        );
     }
 }

@@ -1,0 +1,69 @@
+{
+  "format": "tessera-project",
+  "version": 1,
+  "project": {
+    "name": "Golden",
+    "settings": {
+      "width": 1920,
+      "height": 1080,
+      "frame_rate": {
+        "numerator": 30000,
+        "denominator": 1001
+      },
+      "sample_rate": 44100
+    },
+    "assets": [
+      {
+        "id": 0,
+        "path": "/media/interview.mkv",
+        "duration_flicks": 7056000000,
+        "streams": [
+          {
+            "kind": "video",
+            "index": 0,
+            "codec": "h264",
+            "width": 1920,
+            "height": 1080,
+            "frame_rate": {
+              "numerator": 30000,
+              "denominator": 1001
+            }
+          },
+          {
+            "kind": "audio",
+            "index": 1,
+            "codec": "aac",
+            "sample_rate": 48000,
+            "channels": 2
+          }
+        ]
+      }
+    ],
+    "tracks": [
+      {
+        "kind": "video",
+        "clips": [
+          {
+            "id": 0,
+            "asset": 0,
+            "start_flicks": 705600000,
+            "source_start_flicks": 0,
+            "source_duration_flicks": 7056000000
+          }
+        ]
+      },
+      {
+        "kind": "audio",
+        "clips": [
+          {
+            "id": 1,
+            "asset": 0,
+            "start_flicks": 705600000,
+            "source_start_flicks": 0,
+            "source_duration_flicks": 7056000000
+          }
+        ]
+      }
+    ]
+  }
+}

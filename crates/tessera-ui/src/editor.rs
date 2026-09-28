@@ -48,6 +48,15 @@ impl ProjectEditor {
         performed
     }
 
+    pub fn replace(&self, project: Project, cx: &mut App) {
+        self.history
+            .update(cx, |history, _| *history = History::default());
+        self.project.update(cx, |current, cx| {
+            *current = project;
+            cx.notify();
+        });
+    }
+
     pub fn undo(&self, cx: &mut App) {
         self.step(cx, "undid", History::undo);
     }
@@ -69,5 +78,36 @@ impl ProjectEditor {
                 cx.notify();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+    use tessera_timeline::TrackKind;
+
+    use super::*;
+
+    #[gpui::test]
+    fn replacing_swaps_the_project_and_forgets_its_history(cx: &mut TestAppContext) {
+        let project = cx.new(|_| Project::new("first"));
+        let editor = cx.update(|cx| ProjectEditor::new(project.clone(), cx));
+        let add_track = |cx: &mut App| {
+            editor.perform(Command::AddTrack, cx, |project| {
+                project.timeline.add_track(TrackKind::Video);
+            });
+        };
+        cx.update(add_track);
+        cx.update(add_track);
+        cx.update(|cx| editor.undo(cx));
+        let mut replacement = Project::new("second");
+        replacement.timeline.add_track(TrackKind::Audio);
+        cx.update(|cx| editor.replace(replacement.clone(), cx));
+        let current = |cx: &mut TestAppContext| cx.read(|cx| project.read(cx).clone());
+        assert_eq!(current(cx), replacement);
+        cx.update(|cx| editor.undo(cx));
+        assert_eq!(current(cx), replacement);
+        cx.update(|cx| editor.redo(cx));
+        assert_eq!(current(cx), replacement);
     }
 }

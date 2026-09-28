@@ -22,6 +22,8 @@ actions!(
     tessera,
     [
         Quit,
+        Save,
+        Open,
         Import,
         PlayPause,
         ShuttleBackward,
@@ -45,6 +47,8 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.bind_keys([
         KeyBinding::new("ctrl-q", Quit, None),
+        KeyBinding::new("ctrl-s", Save, None),
+        KeyBinding::new("ctrl-o", Open, None),
         KeyBinding::new("ctrl-i", Import, None),
         KeyBinding::new("space", PlayPause, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("j", ShuttleBackward, Some(WORKSPACE_CONTEXT)),
@@ -72,7 +76,7 @@ pub fn open_main_window(project: Project, cx: &mut App) -> gpui::Result<WindowHa
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some(format!("{} — Tessera", project.name).into()),
+            title: Some(window_title(&project.name).into()),
             ..Default::default()
         }),
         app_id: Some(APP_ID.to_owned()),
@@ -83,4 +87,8 @@ pub fn open_main_window(project: Project, cx: &mut App) -> gpui::Result<WindowHa
         let project = cx.new(|_| project);
         cx.new(|cx| Workspace::new(project, window, cx))
     })
+}
+
+fn window_title(name: &str) -> String {
+    format!("{name} — Tessera")
 }

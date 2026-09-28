@@ -5685,6 +5685,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-document"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tessera-timeline",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tessera-media"
 version = "0.1.0"
 dependencies = [
@@ -5715,6 +5725,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "image",
+ "tessera-document",
  "tessera-media",
  "tessera-timeline",
  "tracing",
