@@ -37,9 +37,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   by the deleted clip's length, while `delete_clip` leaves a gap. `Timeline::add_track` inserts a
   track after the last one of its kind. `remove_track` only takes an empty track that isn't the
   last of its kind, and `swap_tracks` only swaps tracks of the same kind. Later video tracks sit on
-  top of earlier ones, so
-  `Timeline::top_video_clip_at` searches them from the last. `History` is the undo stack:
-  `History::apply` runs one edit as a `Command`, keeps a snapshot of the project from before it
+  top of earlier ones, so `Timeline::video_clips_at` lists the video clips under a time from the
+  bottom track up, the order they composite in, and `top_video_clip_at` is its last. `History` is
+  the undo stack: `History::apply` runs one edit as a `Command`, keeps a snapshot of the project from before it
   when the edit succeeds and changes something, and rolls the project back when the edit fails.
   `undo` and `redo` swap those snapshots in, the stack keeps the last `HISTORY_DEPTH` commands,
   and a new command clears the redo stack.
@@ -79,7 +79,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   pillarboxing), with linear filtering, and a layer of the sequence's size comes back byte for
   byte. The target and readback buffer are kept while the sequence size holds, and layer
   textures, each with its own placement uniform and bind group, are pooled by size, keeping only
-  those the last call used. It isn't wired into the UI yet.
+  those the last call used. The `Viewer` is its only user.
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>` through its `ProjectEditor`, and each panel
   (`MediaBin`, `Viewer`, `TimelinePanel`) gets a clone of it and re-renders through
   `cx.observe(&project, …)`. Every edit goes through the `ProjectEditor` (`editor.rs`), which
@@ -126,11 +126,14 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   tracks adds video or audio tracks. Shift+wheel scrolls the track rows vertically, under a fixed
   ruler. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
-  simulation). The `Viewer` shows the top video clip's
-  frame under the playhead, decoded at sequence size on a background task. It keeps one decoder
-  per media path and size, dropping decoders and frames of media the project no longer holds, and
-  runs one decode at a time, so while scrubbing only the newest request is decoded
-  next, and it releases each replaced frame from the GPUI atlas with `Window::drop_image`.
+  simulation). The `Viewer` requests every video clip under the
+  playhead as a layer, bottom to top. A background job decodes each at sequence size and
+  composites them into a sequence-sized frame, letterbox bars included, which becomes the GPUI
+  image. The job carries one decoder per media path and size, dropping decoders and frames of
+  media the project no longer holds, and a `Compositor` it creates on first use off the UI thread.
+  If that creation fails it warns once and shows the top layer's decoded frame alone from then on.
+  One job runs at a time, so while scrubbing only the newest request runs next, and the viewer
+  releases each replaced frame from the GPUI atlas with `Window::drop_image`.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.
 

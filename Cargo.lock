@@ -5727,6 +5727,7 @@ dependencies = [
  "image",
  "tessera-document",
  "tessera-media",
+ "tessera-render",
  "tessera-timeline",
  "tracing",
 ]

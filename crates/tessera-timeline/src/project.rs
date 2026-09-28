@@ -270,12 +270,15 @@ impl Timeline {
             .unwrap_or(Time::ZERO)
     }
 
-    pub fn top_video_clip_at(&self, time: Time) -> Option<&Clip> {
+    pub fn video_clips_at(&self, time: Time) -> impl DoubleEndedIterator<Item = &Clip> {
         self.tracks
             .iter()
-            .rev()
             .filter(|track| track.kind == TrackKind::Video)
-            .find_map(|track| track.clip_at(time))
+            .filter_map(move |track| track.clip_at(time))
+    }
+
+    pub fn top_video_clip_at(&self, time: Time) -> Option<&Clip> {
+        self.video_clips_at(time).next_back()
     }
 
     pub fn clips_cut_by(&self, time: Time) -> impl Iterator<Item = &Clip> {
@@ -726,6 +729,45 @@ mod tests {
         assert_eq!(top(2), Some(AssetId(2)));
         assert_eq!(top(3), Some(AssetId(1)));
         assert_eq!(top(5), None);
+    }
+
+    #[test]
+    fn video_clips_stack_from_the_bottom_track_up() {
+        let mut timeline = Timeline {
+            tracks: [
+                TrackKind::Video,
+                TrackKind::Video,
+                TrackKind::Audio,
+                TrackKind::Video,
+            ]
+            .map(Track::new)
+            .to_vec(),
+        };
+        let clips = [(0, 1, 0, 6), (1, 2, 2, 2), (2, 3, 0, 8), (3, 4, 1, 4)];
+        for (track, asset, start, duration) in clips {
+            let clip = Clip {
+                asset: AssetId(asset),
+                ..clip(start, duration)
+            };
+            timeline.tracks[track].insert(clip).unwrap();
+        }
+        let stack = |seconds| {
+            timeline
+                .video_clips_at(Time::from_seconds(seconds))
+                .map(|clip| clip.asset)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(stack(0), [AssetId(1)]);
+        assert_eq!(stack(1), [AssetId(1), AssetId(4)]);
+        assert_eq!(stack(2), [AssetId(1), AssetId(2), AssetId(4)]);
+        assert_eq!(stack(5), [AssetId(1)]);
+        assert_eq!(stack(7), []);
+        for seconds in 0..8 {
+            assert_eq!(
+                timeline.top_video_clip_at(Time::from_seconds(seconds)),
+                timeline.video_clips_at(Time::from_seconds(seconds)).last()
+            );
+        }
     }
 
     fn two_clip_project() -> (Project, AssetId, ClipId, ClipId) {

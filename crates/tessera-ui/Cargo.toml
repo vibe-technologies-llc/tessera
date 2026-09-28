@@ -11,6 +11,7 @@ image.workspace = true
 tessera-document.workspace = true
 tessera-timeline.workspace = true
 tessera-media.workspace = true
+tessera-render.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

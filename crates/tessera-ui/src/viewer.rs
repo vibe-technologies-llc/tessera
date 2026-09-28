@@ -9,7 +9,8 @@ use gpui::{
     AnyElement, AppContext, Context, Entity, IntoElement, ObjectFit, ParentElement, Render,
     RenderImage, SharedString, Styled, StyledImage, Window, div, img,
 };
-use tessera_media::VideoDecoder;
+use tessera_media::{VideoDecoder, VideoFrame};
+use tessera_render::{Compositor, Frame, Layer};
 use tessera_timeline::{Project, Time, Timecode};
 
 use crate::{
@@ -27,9 +28,73 @@ struct DecoderKey {
 type Decoders = HashMap<DecoderKey, VideoDecoder>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FrameRequest {
+struct LayerRequest {
     decoder: DecoderKey,
     time: Time,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameRequest {
+    layers: Vec<LayerRequest>,
+    sequence: (u32, u32),
+}
+
+impl FrameRequest {
+    fn decoders(&self) -> impl Iterator<Item = &DecoderKey> {
+        self.layers.iter().map(|layer| &layer.decoder)
+    }
+}
+
+enum CompositorSlot {
+    Uncreated,
+    Ready(Box<Compositor>),
+    Unavailable,
+}
+
+impl CompositorSlot {
+    fn compositor(&mut self) -> Option<&mut Compositor> {
+        if let Self::Uncreated = self {
+            *self = match Compositor::new() {
+                Ok(compositor) => {
+                    let adapter = compositor.adapter_info().name;
+                    tracing::info!(%adapter, "viewer compositor ready");
+                    Self::Ready(Box::new(compositor))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "no compositor, the viewer shows only the top video layer");
+                    Self::Unavailable
+                }
+            };
+        }
+        match self {
+            Self::Ready(compositor) => Some(compositor),
+            Self::Uncreated | Self::Unavailable => None,
+        }
+    }
+}
+
+struct Renderer {
+    decoders: Decoders,
+    compositor: CompositorSlot,
+}
+
+impl Renderer {
+    fn new() -> Self {
+        Self {
+            decoders: Decoders::new(),
+            compositor: CompositorSlot::Uncreated,
+        }
+    }
+
+    fn render(&mut self, request: &FrameRequest) -> Picture {
+        let image = decode_layers(&mut self.decoders, &request.layers).and_then(|frames| {
+            assemble_image(self.compositor.compositor(), request.sequence, frames)
+        });
+        match image {
+            Ok(image) => Picture::Frame(image),
+            Err(reason) => Picture::Failed(reason),
+        }
+    }
 }
 
 enum Picture {
@@ -41,7 +106,7 @@ enum Picture {
 pub struct Viewer {
     project: Entity<Project>,
     playhead: Entity<Playhead>,
-    idle_decoders: Option<Decoders>,
+    idle_renderer: Option<Renderer>,
     wanted: Option<FrameRequest>,
     shown: Option<FrameRequest>,
     picture: Picture,
@@ -67,7 +132,7 @@ impl Viewer {
         let mut viewer = Self {
             project,
             playhead,
-            idle_decoders: Some(Decoders::new()),
+            idle_renderer: Some(Renderer::new()),
             wanted: None,
             shown: None,
             picture: Picture::Empty,
@@ -81,29 +146,15 @@ impl Viewer {
         let stale = self
             .shown
             .as_ref()
-            .is_some_and(|shown| !self.is_live(&shown.decoder, cx));
+            .is_some_and(|shown| !self.is_live_request(shown, cx));
         if stale {
             self.show(None, Picture::Empty, cx);
         }
-        let wanted = self.frame_request(cx);
+        let wanted = frame_request(self.project.read(cx), self.playhead.read(cx).time());
         if stale || wanted != self.wanted {
             self.wanted = wanted;
-            self.decode_wanted(cx);
+            self.render_wanted(cx);
         }
-    }
-
-    fn frame_request(&self, cx: &Context<Self>) -> Option<FrameRequest> {
-        let project = self.project.read(cx);
-        let time = self.playhead.read(cx).time();
-        let clip = project.timeline.top_video_clip_at(time)?;
-        let asset = project.asset(clip.asset)?;
-        Some(FrameRequest {
-            decoder: DecoderKey {
-                path: asset.path.clone(),
-                bounds: sequence_bounds(project),
-            },
-            time: clip.source_time_at(time)?,
-        })
     }
 
     fn is_live(&self, decoder: &DecoderKey, cx: &Context<Self>) -> bool {
@@ -115,7 +166,11 @@ impl Viewer {
                 .any(|asset| asset.path == decoder.path)
     }
 
-    fn decode_wanted(&mut self, cx: &mut Context<Self>) {
+    fn is_live_request(&self, request: &FrameRequest, cx: &Context<Self>) -> bool {
+        request.decoders().all(|decoder| self.is_live(decoder, cx))
+    }
+
+    fn render_wanted(&mut self, cx: &mut Context<Self>) {
         if self.wanted == self.shown {
             return;
         }
@@ -123,25 +178,25 @@ impl Viewer {
             self.show(None, Picture::Empty, cx);
             return;
         };
-        let Some(mut decoders) = self.idle_decoders.take() else {
+        let Some(mut renderer) = self.idle_renderer.take() else {
             return;
         };
-        decoders.retain(|key, _| self.is_live(key, cx));
-        let decoded = cx.background_spawn({
+        renderer.decoders.retain(|key, _| self.is_live(key, cx));
+        let rendered = cx.background_spawn({
             let request = request.clone();
             async move {
-                let picture = decode_picture(&mut decoders, &request);
-                (decoders, picture)
+                let picture = renderer.render(&request);
+                (renderer, picture)
             }
         });
         cx.spawn(async move |this, cx| {
-            let (decoders, picture) = decoded.await;
+            let (renderer, picture) = rendered.await;
             this.update(cx, |viewer, cx| {
-                viewer.idle_decoders = Some(decoders);
-                if viewer.is_live(&request.decoder, cx) {
+                viewer.idle_renderer = Some(renderer);
+                if viewer.is_live_request(&request, cx) {
                     viewer.show(Some(request), picture, cx);
                 }
-                viewer.decode_wanted(cx);
+                viewer.render_wanted(cx);
             })
             .ok();
         })
@@ -233,6 +288,25 @@ fn sequence_bounds(project: &Project) -> (u32, u32) {
     (project.settings.width, project.settings.height)
 }
 
+fn frame_request(project: &Project, time: Time) -> Option<FrameRequest> {
+    let sequence = sequence_bounds(project);
+    let layers: Vec<LayerRequest> = project
+        .timeline
+        .video_clips_at(time)
+        .filter_map(|clip| {
+            let asset = project.asset(clip.asset)?;
+            Some(LayerRequest {
+                decoder: DecoderKey {
+                    path: asset.path.clone(),
+                    bounds: sequence,
+                },
+                time: clip.source_time_at(time)?,
+            })
+        })
+        .collect();
+    (!layers.is_empty()).then_some(FrameRequest { layers, sequence })
+}
+
 fn speed_label(speed: Speed) -> Option<String> {
     let factor = speed.factor();
     match factor {
@@ -242,22 +316,26 @@ fn speed_label(speed: Speed) -> Option<String> {
     }
 }
 
-fn decode_picture(decoders: &mut Decoders, request: &FrameRequest) -> Picture {
-    match decode_frame(decoders, request) {
-        Ok(Some(image)) => Picture::Frame(image),
-        Ok(None) => Picture::Failed("The decoded frame has an unexpected size".into()),
-        Err(error) => {
-            tracing::warn!(path = %request.decoder.path.display(), %error, "viewer decode failed");
-            Picture::Failed(error.to_string().into())
-        }
-    }
+fn decode_layers(
+    decoders: &mut Decoders,
+    layers: &[LayerRequest],
+) -> Result<Vec<Arc<VideoFrame>>, SharedString> {
+    layers
+        .iter()
+        .map(|layer| {
+            decode_layer(decoders, layer).map_err(|error| {
+                tracing::warn!(path = %layer.decoder.path.display(), %error, "viewer decode failed");
+                SharedString::from(error.to_string())
+            })
+        })
+        .collect()
 }
 
-fn decode_frame(
+fn decode_layer(
     decoders: &mut Decoders,
-    request: &FrameRequest,
-) -> Result<Option<Arc<RenderImage>>, tessera_media::Error> {
-    let decoder = match decoders.entry(request.decoder.clone()) {
+    layer: &LayerRequest,
+) -> Result<Arc<VideoFrame>, tessera_media::Error> {
+    let decoder = match decoders.entry(layer.decoder.clone()) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
             let DecoderKey { path, bounds } = entry.key();
@@ -266,21 +344,61 @@ fn decode_frame(
             entry.insert(opened)
         }
     };
-    Ok(render_image(decoder.frame_at(request.time)?))
+    decoder.frame_at(layer.time)
+}
+
+fn assemble_image(
+    compositor: Option<&mut Compositor>,
+    sequence: (u32, u32),
+    mut frames: Vec<Arc<VideoFrame>>,
+) -> Result<Arc<RenderImage>, SharedString> {
+    let image = match compositor {
+        Some(compositor) => {
+            let composited = composite_frames(compositor, sequence, &frames).map_err(|error| {
+                tracing::warn!(%error, "viewer compositing failed");
+                SharedString::from(error.to_string())
+            })?;
+            render_image(composited)
+        }
+        None => {
+            let top = frames.pop().ok_or("No video clip is under the playhead")?;
+            render_image(top)
+        }
+    };
+    image.ok_or_else(|| "The decoded frame has an unexpected size".into())
+}
+
+fn composite_frames(
+    compositor: &mut Compositor,
+    (width, height): (u32, u32),
+    frames: &[Arc<VideoFrame>],
+) -> Result<Frame, tessera_render::Error> {
+    let layers: Vec<Layer<'_>> = frames
+        .iter()
+        .map(|frame| Layer {
+            width: frame.width,
+            height: frame.height,
+            bgra: &frame.bgra,
+        })
+        .collect();
+    compositor.composite(width, height, &layers)
 }
 
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, VisualTestContext};
-    use tessera_timeline::{MediaInfo, Stream, VideoStream};
+    use tessera_timeline::{AudioStream, MediaInfo, Stream, TrackKind, VideoStream};
 
     use super::*;
     use crate::editor::ProjectEditor;
 
-    fn project_showing(media: &str) -> Project {
-        let mut project = Project::new(media);
-        let info = MediaInfo {
-            duration: Some(Time::from_seconds(4)),
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    fn video_info(seconds: i64) -> MediaInfo {
+        MediaInfo {
+            duration: Some(Time::from_seconds(seconds)),
             streams: vec![Stream::Video(VideoStream {
                 index: 0,
                 codec: "h264".into(),
@@ -288,20 +406,152 @@ mod tests {
                 height: 360,
                 frame_rate: None,
             })],
-        };
-        let asset = project.add_asset(media.into(), info);
+        }
+    }
+
+    fn audio_info(seconds: i64) -> MediaInfo {
+        MediaInfo {
+            duration: Some(Time::from_seconds(seconds)),
+            streams: vec![Stream::Audio(AudioStream {
+                index: 0,
+                codec: "flac".into(),
+                sample_rate: 48_000,
+                channels: 2,
+            })],
+        }
+    }
+
+    fn project_showing(media: &str) -> Project {
+        let mut project = Project::new(media);
+        let asset = project.add_asset(media.into(), video_info(4));
         project.place_clip(asset, 0, Time::ZERO).unwrap();
         project
     }
 
-    fn wanted_path(viewer: &Entity<Viewer>, cx: &mut VisualTestContext) -> Option<PathBuf> {
-        cx.read(|cx| {
-            viewer
-                .read(cx)
-                .wanted
-                .as_ref()
-                .map(|request| request.decoder.path.clone())
+    fn stacked_project() -> Project {
+        let mut project = Project::new("stacked");
+        let middle = project.timeline.add_track(TrackKind::Video);
+        let top = project.timeline.add_track(TrackKind::Video);
+        let music = project.timeline.add_track(TrackKind::Audio);
+        let placements = [
+            ("/missing/bottom.mkv", video_info(8), 0, 0),
+            ("/missing/middle.mkv", video_info(2), middle, 3),
+            ("/missing/top.mkv", video_info(4), top, 1),
+            ("/missing/music.flac", audio_info(8), music, 0),
+        ];
+        for (path, info, track, start) in placements {
+            let asset = project.add_asset(path.into(), info);
+            project
+                .place_clip(asset, track, Time::from_seconds(start))
+                .unwrap();
+        }
+        project
+    }
+
+    fn layer_paths(request: Option<&FrameRequest>) -> Vec<PathBuf> {
+        request
+            .into_iter()
+            .flat_map(FrameRequest::decoders)
+            .map(|decoder| decoder.path.clone())
+            .collect()
+    }
+
+    fn wanted_paths(viewer: &Entity<Viewer>, cx: &mut VisualTestContext) -> Vec<PathBuf> {
+        cx.read(|cx| layer_paths(viewer.read(cx).wanted.as_ref()))
+    }
+
+    fn solid(width: u32, height: u32, bgra: [u8; 4]) -> Arc<VideoFrame> {
+        Arc::new(VideoFrame {
+            width,
+            height,
+            time: Time::ZERO,
+            bgra: bgra.repeat(width as usize * height as usize),
         })
+    }
+
+    fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
+        let start = ((y * frame.width + x) * 4) as usize;
+        frame.bgra[start..start + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn the_renderer_can_move_to_a_background_task() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Compositor>();
+        assert_send::<Renderer>();
+    }
+
+    #[test]
+    fn the_request_stacks_video_clips_from_the_bottom_track_up() {
+        let project = stacked_project();
+        let paths =
+            |seconds| layer_paths(frame_request(&project, Time::from_seconds(seconds)).as_ref());
+        assert_eq!(
+            paths(3),
+            [
+                PathBuf::from("/missing/bottom.mkv"),
+                "/missing/middle.mkv".into(),
+                "/missing/top.mkv".into()
+            ]
+        );
+        assert_eq!(
+            paths(2),
+            [
+                PathBuf::from("/missing/bottom.mkv"),
+                "/missing/top.mkv".into()
+            ]
+        );
+        assert_eq!(paths(0), [PathBuf::from("/missing/bottom.mkv")]);
+        assert!(frame_request(&project, Time::from_seconds(9)).is_none());
+
+        let request = frame_request(&project, Time::from_seconds(4)).unwrap();
+        assert_eq!(request.sequence, sequence_bounds(&project));
+        let times: Vec<Time> = request.layers.iter().map(|layer| layer.time).collect();
+        assert_eq!(
+            times,
+            [
+                Time::from_seconds(4),
+                Time::from_seconds(1),
+                Time::from_seconds(3)
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn the_viewer_asks_for_every_video_layer_under_the_playhead(cx: &mut TestAppContext) {
+        let project = cx.new(|_| stacked_project());
+        let playhead = cx.new(|_| Playhead::new(project.clone()));
+        let (viewer, cx) =
+            cx.add_window_view(|_, cx| Viewer::new(project.clone(), playhead.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            wanted_paths(&viewer, cx),
+            [PathBuf::from("/missing/bottom.mkv")]
+        );
+
+        cx.update(|_, cx| {
+            playhead.update(cx, |playhead, cx| playhead.seek(Time::from_seconds(3), cx))
+        });
+        let wanted = wanted_paths(&viewer, cx);
+        assert_eq!(
+            wanted,
+            [
+                PathBuf::from("/missing/bottom.mkv"),
+                "/missing/middle.mkv".into(),
+                "/missing/top.mkv".into()
+            ]
+        );
+        cx.run_until_parked();
+        let shown = cx.read(|cx| layer_paths(viewer.read(cx).shown.as_ref()));
+        assert_eq!(shown, wanted);
+
+        cx.update(|_, cx| {
+            playhead.update(cx, |playhead, cx| playhead.seek(Time::from_seconds(9), cx))
+        });
+        cx.run_until_parked();
+        assert!(cx.read(|cx| viewer.read(cx).wanted.is_none()));
+        assert!(cx.read(|cx| viewer.read(cx).shown.is_none()));
+        assert!(cx.read(|cx| matches!(viewer.read(cx).picture, Picture::Empty)));
     }
 
     #[gpui::test]
@@ -312,7 +562,10 @@ mod tests {
             Viewer::new(project.clone(), playhead, cx)
         });
         cx.run_until_parked();
-        assert_eq!(wanted_path(&viewer, cx), Some("/missing/first.mkv".into()));
+        assert_eq!(
+            wanted_paths(&viewer, cx),
+            [PathBuf::from("/missing/first.mkv")]
+        );
 
         let second = project_showing("/missing/second.mkv");
         assert_eq!(
@@ -321,12 +574,44 @@ mod tests {
         );
         cx.update(|_, cx| ProjectEditor::new(project.clone(), cx).replace(second, cx));
         assert!(cx.read(|cx| viewer.read(cx).shown.is_none()));
-        assert_eq!(wanted_path(&viewer, cx), Some("/missing/second.mkv".into()));
-        cx.run_until_parked();
-        let shown = cx.read(|cx| viewer.read(cx).shown.clone());
         assert_eq!(
-            shown.map(|request| request.decoder.path),
-            Some("/missing/second.mkv".into())
+            wanted_paths(&viewer, cx),
+            [PathBuf::from("/missing/second.mkv")]
         );
+        cx.run_until_parked();
+        let shown = cx.read(|cx| layer_paths(viewer.read(cx).shown.as_ref()));
+        assert_eq!(shown, [PathBuf::from("/missing/second.mkv")]);
+    }
+
+    #[test]
+    fn frames_composite_bottom_first_into_the_sequence() {
+        let mut compositor = Compositor::new().expect("a Vulkan adapter");
+        let frames = [solid(8, 4, RED), solid(4, 4, BLUE)];
+        let frame = composite_frames(&mut compositor, (8, 4), &frames).unwrap();
+        assert_eq!((frame.width, frame.height), (8, 4));
+        assert_eq!(pixel(&frame, 4, 2), BLUE);
+        assert_eq!(pixel(&frame, 0, 2), RED);
+        assert_eq!(pixel(&frame, 7, 2), RED);
+
+        let frame = composite_frames(&mut compositor, (8, 4), &frames[1..]).unwrap();
+        assert_eq!(pixel(&frame, 4, 2), BLUE);
+        assert_eq!(pixel(&frame, 0, 2), OPAQUE_BLACK);
+    }
+
+    #[test]
+    fn the_assembled_image_comes_at_sequence_size() {
+        let mut compositor = Compositor::new().expect("a Vulkan adapter");
+        let frames = vec![solid(8, 4, RED), solid(4, 4, BLUE)];
+        let image = assemble_image(Some(&mut compositor), (8, 4), frames).unwrap();
+        assert_eq!(image.size(0), gpui::size(8.into(), 4.into()));
+        assert_eq!(image.as_bytes(0).unwrap()[..4], RED);
+    }
+
+    #[test]
+    fn without_a_compositor_the_top_frame_is_shown_as_decoded() {
+        let frames = vec![solid(8, 4, RED), solid(4, 4, BLUE)];
+        let image = assemble_image(None, (8, 4), frames).unwrap();
+        assert_eq!(image.size(0), gpui::size(4.into(), 4.into()));
+        assert_eq!(image.as_bytes(0).unwrap()[..4], BLUE);
     }
 }

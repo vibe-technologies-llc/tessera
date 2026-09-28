@@ -11,7 +11,6 @@
 ## Compositing
 
 - Convert YUV to RGB with the source's matrix and range
-- Wire the `Compositor` into the viewer through the CPU readback path
 - Import hardware-decoded frames into the compositor without a copy, through dmabuf and Vulkan
   external memory
 - Per-clip transform (position, scale, rotation, crop) and opacity
