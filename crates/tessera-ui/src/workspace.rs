@@ -2,7 +2,7 @@ use std::{ffi::OsStr, path::PathBuf};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, PromptLevel, Render, Styled, Window, div, px,
+    PathPromptOptions, PromptLevel, Render, Styled, Task, Window, div, px,
 };
 use tessera_document::EXTENSION;
 use tessera_timeline::{Project, Time};
@@ -22,6 +22,25 @@ use crate::{
 
 const UNSAVED_MARK: &str = "• ";
 
+#[derive(Clone, Copy)]
+enum UnsavedChanges {
+    Save,
+    Discard,
+    Cancel,
+}
+
+impl UnsavedChanges {
+    const CHOICES: [Self; 3] = [Self::Save, Self::Discard, Self::Cancel];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Save => "Save",
+            Self::Discard => "Don't Save",
+            Self::Cancel => "Cancel",
+        }
+    }
+}
+
 pub struct Workspace {
     editor: ProjectEditor,
     focus_handle: FocusHandle,
@@ -30,6 +49,7 @@ pub struct Workspace {
     viewer: Entity<Viewer>,
     timeline: Entity<TimelinePanel>,
     file: Option<PathBuf>,
+    asking_to_discard: bool,
 }
 
 impl Workspace {
@@ -42,6 +62,11 @@ impl Workspace {
             window.set_window_title(&workspace.title(cx));
         })
         .detach();
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            this.update(cx, |workspace, cx| workspace.should_close(window, cx))
+                .unwrap_or(true)
+        });
         Self {
             focus_handle,
             media_bin: cx.new(|cx| MediaBin::new(editor.clone(), cx)),
@@ -50,6 +75,7 @@ impl Workspace {
             playhead,
             editor,
             file: None,
+            asking_to_discard: false,
         }
     }
 
@@ -57,36 +83,97 @@ impl Workspace {
         self.editor.project()
     }
 
-    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn confirm_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
+        if self.editor.history().read(cx).is_saved() {
+            return Task::ready(true);
+        }
+        if self.asking_to_discard {
+            return Task::ready(false);
+        }
+        self.asking_to_discard = true;
+        window.activate_window();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Save the changes to “{}”?", self.name(cx)),
+            Some("Your changes will be lost if you don't save them."),
+            &UnsavedChanges::CHOICES.map(UnsavedChanges::label),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = answer
+                .await
+                .ok()
+                .and_then(|index| UnsavedChanges::CHOICES.get(index).copied())
+                .unwrap_or(UnsavedChanges::Cancel);
+            let proceeding = this.update_in(cx, |workspace, window, cx| {
+                workspace.asking_to_discard = false;
+                match choice {
+                    UnsavedChanges::Save => workspace.save(window, cx),
+                    UnsavedChanges::Discard => Task::ready(true),
+                    UnsavedChanges::Cancel => Task::ready(false),
+                }
+            });
+            match proceeding {
+                Ok(proceeding) => proceeding.await,
+                Err(_) => false,
+            }
+        })
+    }
+
+    fn should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.editor.history().read(cx).is_saved() {
+            return true;
+        }
+        let confirming = self.confirm_discard(window, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            if confirming.await {
+                cx.update(|window, _| window.remove_window()).ok();
+            }
+        })
+        .detach();
+        false
+    }
+
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
         match self.file.clone() {
             Some(path) => self.save_to(path, window, cx),
             None => self.prompt_save(window, cx),
         }
     }
 
-    fn prompt_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn prompt_save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
         let suggested_name = format!("{}.{EXTENSION}", self.project().read(cx).name);
         let chosen = cx.prompt_for_new_path(&default_directory(), Some(&suggested_name));
         cx.spawn_in(window, async move |this, cx| {
             let Ok(chosen) = chosen.await else {
-                return;
+                return false;
             };
-            this.update_in(cx, |workspace, window, cx| match chosen {
+            let saving = this.update_in(cx, |workspace, window, cx| match chosen {
                 Ok(Some(path)) => workspace.save_to(with_project_extension(path), window, cx),
-                Ok(None) => {}
-                Err(error) => report_failure(
-                    "Could not show the save dialog",
-                    &format!("{error:#}"),
-                    window,
-                    cx,
-                ),
-            })
-            .ok();
+                Ok(None) => Task::ready(false),
+                Err(error) => {
+                    report_failure(
+                        "Could not show the save dialog",
+                        &format!("{error:#}"),
+                        window,
+                        cx,
+                    );
+                    Task::ready(false)
+                }
+            });
+            match saving {
+                Ok(saving) => saving.await,
+                Err(_) => false,
+            }
         })
-        .detach();
     }
 
-    pub fn save_to(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn save_to(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
         let project = self.project().read(cx).clone();
         let revision = self.editor.revision(cx);
         let saving = cx.background_spawn({
@@ -100,14 +187,15 @@ impl Workspace {
                     tracing::info!(path = %path.display(), "saved the project");
                     workspace.editor.mark_saved(revision, cx);
                     workspace.set_file(path, window, cx);
+                    true
                 }
                 Err(error) => {
-                    report_failure("Could not save the project", &error.to_string(), window, cx)
+                    report_failure("Could not save the project", &error.to_string(), window, cx);
+                    false
                 }
             })
-            .ok();
+            .unwrap_or(false)
         })
-        .detach();
     }
 
     fn prompt_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -146,16 +234,28 @@ impl Workspace {
             async move { tessera_document::open(&path) }
         });
         cx.spawn_in(window, async move |this, cx| {
-            let opened = opening.await;
-            this.update_in(cx, |workspace, window, cx| match opened {
-                Ok(project) => {
-                    tracing::info!(path = %path.display(), "opened the project");
-                    workspace.replace_project(project, cx);
-                    workspace.set_file(path, window, cx);
-                }
+            let project = match opening.await {
+                Ok(project) => project,
                 Err(error) => {
-                    report_failure("Could not open the project", &error.to_string(), window, cx)
+                    this.update_in(cx, |_, window, cx| {
+                        report_failure("Could not open the project", &error.to_string(), window, cx)
+                    })
+                    .ok();
+                    return;
                 }
+            };
+            let Ok(confirming) = this.update_in(cx, |workspace, window, cx| {
+                workspace.confirm_discard(window, cx)
+            }) else {
+                return;
+            };
+            if !confirming.await {
+                return;
+            }
+            this.update_in(cx, |workspace, window, cx| {
+                tracing::info!(path = %path.display(), "opened the project");
+                workspace.replace_project(project, cx);
+                workspace.set_file(path, window, cx);
             })
             .ok();
         })
@@ -175,11 +275,15 @@ impl Workspace {
         window.set_window_title(&self.title(cx));
     }
 
-    fn title(&self, cx: &App) -> String {
-        let name = match &self.file {
+    fn name(&self, cx: &App) -> String {
+        match &self.file {
             Some(path) => file_name(path).to_string(),
             None => self.project().read(cx).name.clone(),
-        };
+        }
+    }
+
+    fn title(&self, cx: &App) -> String {
+        let name = self.name(cx);
         if self.editor.history().read(cx).is_saved() {
             window_title(&name)
         } else {
@@ -210,7 +314,7 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .key_context(WORKSPACE_CONTEXT)
             .on_action(cx.listener(|workspace, _: &Save, window, cx| {
-                workspace.save(window, cx);
+                workspace.save(window, cx).detach();
             }))
             .on_action(cx.listener(|workspace, _: &Open, window, cx| {
                 workspace.prompt_open(window, cx);
@@ -431,7 +535,7 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::new(project.clone(), window, cx));
 
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.save_to(path.clone(), window, cx);
+            workspace.save_to(path.clone(), window, cx).detach();
         });
         cx.run_until_parked();
         assert_eq!(cx.window_title().as_deref(), Some("cut.tessera — Tessera"));
@@ -451,6 +555,8 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.open_from(path.clone(), window, cx);
         });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Don't Save");
         cx.run_until_parked();
         assert_eq!(current(&workspace, cx), saved);
         assert_eq!(cx.read(|cx| workspace.read(cx).project().clone()), project);
@@ -489,7 +595,7 @@ mod tests {
         assert_eq!(cx.window_title().as_deref(), Some("• Cut — Tessera"));
 
         workspace.update_in(cx, |workspace, window, cx| {
-            workspace.save_to(path.clone(), window, cx);
+            workspace.save_to(path.clone(), window, cx).detach();
         });
         cx.run_until_parked();
 
@@ -524,6 +630,133 @@ mod tests {
         assert!(detail.contains("missing.tessera"), "{detail}");
         assert_eq!(current(&workspace, cx), kept);
         assert_eq!(cx.read(|cx| workspace.read(cx).file.clone()), None);
+    }
+
+    fn split_at(workspace: &Entity<Workspace>, seconds: i64, cx: &mut VisualTestContext) {
+        let playhead = cx.read(|cx| workspace.read(cx).playhead.clone());
+        playhead.update(cx, |playhead, cx| {
+            playhead.seek(Time::from_seconds(seconds), cx)
+        });
+        cx.simulate_keystrokes("ctrl-k");
+    }
+
+    #[gpui::test]
+    fn closing_asks_before_discarding_unsaved_changes(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        split_at(&workspace, 4, cx);
+
+        assert!(!cx.simulate_close());
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message).as_deref(),
+            Some("Save the changes to “Cut”?")
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(starts(&workspace, cx), [1, 4, 10].map(Time::from_seconds));
+
+        assert!(!cx.simulate_close());
+        cx.simulate_prompt_answer("Don't Save");
+        cx.run_until_parked();
+
+        assert!(cx.windows().is_empty());
+    }
+
+    #[gpui::test]
+    fn closing_a_saved_project_asks_nothing(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (_workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        assert!(cx.simulate_close());
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    fn opening_asks_before_replacing_unsaved_changes(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("open-unsaved");
+        let current_path = dir.0.join("cut.tessera");
+        let other_path = dir.0.join("other.tessera");
+        let other = sample_project("Other", "/media/other.mkv");
+        tessera_document::save(&other, &other_path).unwrap();
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_to(current_path.clone(), window, cx).detach();
+        });
+        cx.run_until_parked();
+        split_at(&workspace, 4, cx);
+        let edited = current(&workspace, cx);
+        let open_other = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_from(other_path.clone(), window, cx);
+            });
+            cx.run_until_parked();
+        };
+
+        open_other(cx);
+
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message).as_deref(),
+            Some("Save the changes to “cut.tessera”?")
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(current(&workspace, cx), edited);
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some("• cut.tessera — Tessera")
+        );
+
+        open_other(cx);
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+
+        assert_eq!(tessera_document::open(&current_path).unwrap(), edited);
+        assert_eq!(current(&workspace, cx), other);
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some("other.tessera — Tessera")
+        );
+    }
+
+    #[gpui::test]
+    fn quitting_can_save_an_untitled_project_first(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("quit-save");
+        let path = dir.0.join("cut");
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        split_at(&workspace, 4, cx);
+        let edited = current(&workspace, cx);
+        cx.simulate_keystrokes("ctrl-q");
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message).as_deref(),
+            Some("Save the changes to “Cut”?")
+        );
+
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        cx.run_until_parked();
+
+        assert_eq!(
+            tessera_document::open(&dir.0.join("cut.tessera")).unwrap(),
+            edited
+        );
+        assert_eq!(cx.window_title().as_deref(), Some("cut.tessera — Tessera"));
     }
 
     #[test]

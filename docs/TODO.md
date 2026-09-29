@@ -18,8 +18,6 @@
 
 ## Project files
 
-- Ask before discarding unsaved changes on Ctrl+Q (a bare `cx.quit()`), on closing the window and
-  on Ctrl+O, which replaces the project and clears the history without asking
 - Give each save its own temp file (`create_new`) and serialise saves and opens: two quick Ctrl+S
   share `.{name}.{pid}.tmp`, so one truncates the other or fails its rename, and an older snapshot
   or a slow open can land after newer edits

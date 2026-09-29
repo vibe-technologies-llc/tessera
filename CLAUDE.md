@@ -151,7 +151,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `Workspace` does the file IO on the background executor through `save_to` and `open_from`,
   reports failures in a prompt, and titles the window after the file. A save marks the revision it snapshotted, not the one
   current when it finishes, and the `Workspace` observes the history to mark the title (`• `)
-  while the project differs from that revision. Opening swaps the project
+  while the project differs from that revision. While it does, Ctrl+Q, closing the window and
+  opening another project ask first (`confirm_discard`): Save saves it (through the dialog when it
+  has no file) and goes on only once the save succeeds, Don't Save goes on, Cancel stops. Ctrl+O
+  asks only after the chosen file has loaded, and a second request while one prompt is up is
+  refused. Opening swaps the project
   into the existing entity through `ProjectEditor::replace`, which clears the history, and pauses
   the playhead at zero. Through their `project_replaced`, the timeline drops its selection and
   view, and the bin its pending imports and thumbnails before decoding the new assets' ones. Global

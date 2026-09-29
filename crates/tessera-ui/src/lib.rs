@@ -44,7 +44,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(quit);
     cx.bind_keys([
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("ctrl-s", Save, None),
@@ -87,6 +87,28 @@ pub fn open_main_window(project: Project, cx: &mut App) -> gpui::Result<WindowHa
         let project = cx.new(|_| project);
         cx.new(|cx| Workspace::new(project, window, cx))
     })
+}
+
+fn quit(_: &Quit, cx: &mut App) {
+    let workspaces: Vec<WindowHandle<Workspace>> = cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast())
+        .collect();
+    cx.spawn(async move |cx| {
+        for workspace in workspaces {
+            let Ok(confirming) = workspace.update(cx, |workspace, window, cx| {
+                workspace.confirm_discard(window, cx)
+            }) else {
+                continue;
+            };
+            if !confirming.await {
+                return;
+            }
+        }
+        cx.update(|cx| cx.quit()).ok();
+    })
+    .detach();
 }
 
 fn window_title(name: &str) -> String {
