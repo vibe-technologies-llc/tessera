@@ -4,9 +4,10 @@ mod v1;
 
 use std::{
     ffi::OsString,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub use error::{Error, FormatError, ValidationError};
@@ -76,7 +77,8 @@ pub fn save(project: &Project, path: &Path) -> Result<(), Error> {
         path: path.to_owned(),
         source,
     })?;
-    write_atomically(path, text.as_bytes()).map_err(|source| Error::Write {
+    let target = resolve_symlinks(path)?;
+    write_atomically(&target, text.as_bytes()).map_err(|source| Error::Write {
         path: path.to_owned(),
         source,
     })
@@ -93,31 +95,101 @@ pub fn open(path: &Path) -> Result<Project, Error> {
     })
 }
 
+const MAX_SYMLINK_HOPS: usize = 40;
+
+fn resolve_symlinks(path: &Path) -> Result<PathBuf, Error> {
+    let mut resolved = path.to_owned();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let is_symlink = match fs::symlink_metadata(&resolved) {
+            Ok(metadata) => metadata.is_symlink(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(Error::Write {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        if !is_symlink {
+            return Ok(resolved);
+        }
+        let target = fs::read_link(&resolved).map_err(|source| Error::Write {
+            path: path.to_owned(),
+            source,
+        })?;
+        resolved = resolved
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_owned)
+            .join(target);
+    }
+    Err(Error::SymlinkLoop {
+        path: path.to_owned(),
+    })
+}
+
 fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let temporary = temporary_sibling(path);
-    let written = write_synced(&temporary, contents).and_then(|()| fs::rename(&temporary, path));
+    let (temporary, mut file) = create_temporary_sibling(path)?;
+    let written = write_synced(&mut file, path, contents)
+        .and_then(|()| fs::rename(&temporary, path))
+        .and_then(|()| sync_directory(path));
     if written.is_err() {
         fs::remove_file(&temporary).ok();
     }
     written
 }
 
-fn write_synced(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
+fn write_synced(file: &mut File, target: &Path, contents: &[u8]) -> io::Result<()> {
+    match fs::metadata(target) {
+        Ok(existing) => file.set_permissions(existing.permissions())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     file.write_all(contents)?;
     file.sync_all()
 }
 
-fn temporary_sibling(path: &Path) -> PathBuf {
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    File::open(directory)?.sync_all()
+}
+
+fn create_temporary_sibling(path: &Path) -> io::Result<(PathBuf, File)> {
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+    loop {
+        let temporary = temporary_sibling(path, NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn temporary_sibling(path: &Path, sequence: u64) -> PathBuf {
     let mut name = OsString::from(".");
     name.push(path.file_name().unwrap_or_default());
-    name.push(format!(".{}.tmp", std::process::id()));
+    name.push(format!(".{}.{sequence}.tmp", std::process::id()));
     path.with_file_name(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, num::NonZeroU32, os::unix::ffi::OsStrExt};
+    use std::{
+        ffi::OsStr,
+        num::NonZeroU32,
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{PermissionsExt, symlink},
+        },
+    };
 
     use serde_json::json;
     use tessera_timeline::{
@@ -425,6 +497,97 @@ mod tests {
         let error = save(&golden_project(), &target).unwrap_err();
         assert!(matches!(error, Error::Write { ref path, .. } if *path == target));
         assert_eq!(dir.entries(), ["taken"]);
+    }
+
+    #[test]
+    fn saves_running_at_once_each_write_their_own_temporary_file() {
+        let dir = ScratchDir::new("concurrent-save");
+        let path = dir.0.join("edit.tessera");
+        let projects = [golden_project(), rich_project()];
+
+        std::thread::scope(|scope| {
+            let saves: Vec<_> = (0..8)
+                .map(|index| {
+                    let project = &projects[index % projects.len()];
+                    let path = &path;
+                    scope.spawn(move || save(project, path))
+                })
+                .collect();
+            for saving in saves {
+                saving.join().unwrap().unwrap();
+            }
+        });
+
+        assert_eq!(dir.entries(), ["edit.tessera"]);
+        assert!(projects.contains(&open(&path).unwrap()));
+    }
+
+    #[test]
+    fn saving_keeps_the_permissions_of_the_file_it_replaces() {
+        let dir = ScratchDir::new("permissions");
+        let path = dir.0.join("edit.tessera");
+        fs::write(&path, "an older project").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        save(&golden_project(), &path).unwrap();
+
+        assert_eq!(mode(&path), 0o640);
+        assert_eq!(fs::read_to_string(&path).unwrap(), GOLDEN_V1);
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn saving_through_a_symlink_replaces_its_target_and_keeps_the_link() {
+        let dir = ScratchDir::new("symlink");
+        let projects = dir.0.join("projects");
+        fs::create_dir(&projects).unwrap();
+        let target = projects.join("edit.tessera");
+        let link = dir.0.join("link.tessera");
+        let hop = dir.0.join("hop.tessera");
+        fs::write(&target, "an older project").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink("projects/edit.tessera", &hop).unwrap();
+        symlink(&hop, &link).unwrap();
+
+        save(&golden_project(), &link).unwrap();
+
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(fs::symlink_metadata(&hop).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), GOLDEN_V1);
+        assert_eq!(mode(&target), 0o600);
+        assert_eq!(fs::read_dir(&projects).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn saving_through_a_dangling_symlink_creates_its_target() {
+        let dir = ScratchDir::new("dangling-symlink");
+        let link = dir.0.join("link.tessera");
+        symlink("edit.tessera", &link).unwrap();
+
+        save(&golden_project(), &link).unwrap();
+
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            fs::read_to_string(dir.0.join("edit.tessera")).unwrap(),
+            GOLDEN_V1
+        );
+    }
+
+    #[test]
+    fn saving_through_a_symlink_loop_is_refused() {
+        let dir = ScratchDir::new("symlink-loop");
+        let first = dir.0.join("first.tessera");
+        let second = dir.0.join("second.tessera");
+        symlink(&second, &first).unwrap();
+        symlink(&first, &second).unwrap();
+
+        let error = save(&golden_project(), &first).unwrap_err();
+
+        assert!(matches!(error, Error::SymlinkLoop { ref path } if *path == first));
+        assert_eq!(dir.entries().len(), 2);
     }
 
     #[test]

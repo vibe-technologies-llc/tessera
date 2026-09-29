@@ -80,9 +80,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   Rebuilding the `Project` validates rather than trusts: clips go through `Clip::check` and
   `Track::insert`, and ids (unique, and each below the stored next id), assets, stream kinds, clip
   ranges, rates and one track of each kind are checked, each failure a distinct `ValidationError`.
-  `to_string` and `from_str` are pure; `save` writes a synced sibling temp file and renames it over
-  the target, and `open` and `save` errors carry the path. A fixture in `fixtures/v1.tessera` pins
-  the v1 format.
+  `to_string` and `from_str` are pure. `save` follows symlinks to the file they point at (refusing a
+  loop, `SymlinkLoop`), writes a synced sibling temp file of its own (`create_new`, named by pid and
+  a process-wide counter) carrying the replaced file's permissions, renames it over the target and
+  syncs the directory. `open` and `save` errors carry the path. A fixture in
+  `fixtures/v1.tessera` pins the v1 format.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
   here. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
@@ -148,8 +150,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   undo and redo it. The `MediaBin` and `TimelinePanel` get a clone of it, and imports are commands
   too. Never mutate the project entity directly. Ctrl+S saves to the file the project was last
   saved to or opened from, or asks for one (appending `.tessera`), and Ctrl+O opens one; the
-  `Workspace` does the file IO on the background executor through `save_to` and `open_from`,
-  reports failures in a prompt, and titles the window after the file. A save marks the revision it snapshotted, not the one
+  `Workspace` does the file IO on the background executor through `save_to` and `open_from`, one
+  job at a time in the order they were asked for (`queue_file_io`), reports failures in a prompt,
+  and titles the window after the file. A save marks the revision it snapshotted, not the one
   current when it finishes, and the `Workspace` observes the history to mark the title (`• `)
   while the project differs from that revision. While it does, Ctrl+Q, closing the window and
   opening another project ask first (`confirm_discard`): Save saves it (through the dialog when it

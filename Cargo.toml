@@ -17,6 +17,7 @@ tessera-timeline.path = "crates/tessera-timeline"
 tessera-ui.path = "crates/tessera-ui"
 anyhow = "=1.0.104"
 ffmpeg-next = "=9.0.0"
+futures = { version = "=0.3.34", default-features = false, features = ["std"] }
 gpui = "=0.2.2"
 image = "=0.25.10"
 pipewire = { version = "=0.10.1", features = ["v0_3_50"] }

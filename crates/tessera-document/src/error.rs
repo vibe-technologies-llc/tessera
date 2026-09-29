@@ -18,6 +18,8 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    #[error("could not write {path}: it passes through too many symbolic links")]
+    SymlinkLoop { path: PathBuf },
     #[error("{path}: {source}")]
     Format {
         path: PathBuf,

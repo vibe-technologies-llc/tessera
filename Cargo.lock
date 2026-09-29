@@ -5838,6 +5838,7 @@ dependencies = [
 name = "tessera-ui"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpui",
  "image",
  "tessera-audio",

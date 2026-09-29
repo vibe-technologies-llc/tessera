@@ -18,11 +18,6 @@
 
 ## Project files
 
-- Give each save its own temp file (`create_new`) and serialise saves and opens: two quick Ctrl+S
-  share `.{name}.{pid}.tmp`, so one truncates the other or fails its rename, and an older snapshot
-  or a slow open can land after newer edits
-- Fsync the parent directory after the rename, and save through a symlink to its target while
-  keeping the file's permissions
 - Validate sequence and stream width, height, sample rate and channels, negative asset durations and
   duplicate stream indices on load (a `"width": 0` sequence loads today)
 - Store media paths relative to the project file when the media sits under it, and resolve relative

@@ -1,5 +1,6 @@
 use std::{ffi::OsStr, path::PathBuf};
 
+use futures::{FutureExt, channel::oneshot, future::Shared};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
     PathPromptOptions, PromptLevel, Render, Styled, Task, Window, div, px,
@@ -49,6 +50,7 @@ pub struct Workspace {
     viewer: Entity<Viewer>,
     timeline: Entity<TimelinePanel>,
     file: Option<PathBuf>,
+    file_io: Shared<Task<()>>,
     asking_to_discard: bool,
 }
 
@@ -75,6 +77,7 @@ impl Workspace {
             playhead,
             editor,
             file: None,
+            file_io: Task::ready(()).shared(),
             asking_to_discard: false,
         }
     }
@@ -176,12 +179,14 @@ impl Workspace {
     ) -> Task<bool> {
         let project = self.project().read(cx).clone();
         let revision = self.editor.revision(cx);
-        let saving = cx.background_spawn({
+        let saving = self.queue_file_io(cx, {
             let path = path.clone();
-            async move { tessera_document::save(&project, &path) }
+            move || tessera_document::save(&project, &path)
         });
         cx.spawn_in(window, async move |this, cx| {
-            let saved = saving.await;
+            let Ok(saved) = saving.await else {
+                return false;
+            };
             this.update_in(cx, |workspace, window, cx| match saved {
                 Ok(()) => {
                     tracing::info!(path = %path.display(), "saved the project");
@@ -229,20 +234,21 @@ impl Workspace {
     }
 
     pub fn open_from(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let opening = cx.background_spawn({
+        let opening = self.queue_file_io(cx, {
             let path = path.clone();
-            async move { tessera_document::open(&path) }
+            move || tessera_document::open(&path)
         });
         cx.spawn_in(window, async move |this, cx| {
             let project = match opening.await {
-                Ok(project) => project,
-                Err(error) => {
+                Ok(Ok(project)) => project,
+                Ok(Err(error)) => {
                     this.update_in(cx, |_, window, cx| {
                         report_failure("Could not open the project", &error.to_string(), window, cx)
                     })
                     .ok();
                     return;
                 }
+                Err(oneshot::Canceled) => return,
             };
             let Ok(confirming) = this.update_in(cx, |workspace, window, cx| {
                 workspace.confirm_discard(window, cx)
@@ -260,6 +266,22 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    fn queue_file_io<R: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        job: impl FnOnce() -> R + Send + 'static,
+    ) -> oneshot::Receiver<R> {
+        let (sender, receiver) = oneshot::channel();
+        let previous = self.file_io.clone();
+        self.file_io = cx
+            .background_spawn(async move {
+                previous.await;
+                sender.send(job()).ok();
+            })
+            .shared();
+        receiver
     }
 
     fn replace_project(&mut self, project: Project, cx: &mut Context<Self>) {
@@ -576,6 +598,34 @@ mod tests {
         cx.simulate_keystrokes("ctrl-s");
         cx.run_until_parked();
         assert_eq!(tessera_document::open(&path).unwrap(), saved);
+    }
+
+    #[gpui::test]
+    fn saves_and_opens_run_in_the_order_they_were_asked_for(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("file-io-order");
+        let path = dir.0.join("cut.tessera");
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let save = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.save_to(path.clone(), window, cx).detach();
+            });
+        };
+
+        save(cx);
+        split_at(&workspace, 4, cx);
+        let edited = current(&workspace, cx);
+        save(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_from(path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(tessera_document::open(&path).unwrap(), edited);
+        assert_eq!(current(&workspace, cx), edited);
+        assert_eq!(cx.window_title().as_deref(), Some("cut.tessera — Tessera"));
     }
 
     #[gpui::test]
