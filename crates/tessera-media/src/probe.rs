@@ -1,4 +1,7 @@
-use std::{num::NonZeroI64, path::Path};
+use std::{
+    num::{NonZeroI64, NonZeroU16, NonZeroU32},
+    path::Path,
+};
 
 use ffmpeg_next::{codec, ffi::AV_TIME_BASE, format, media};
 use tessera_timeline::{AudioStream, FrameRate, MediaInfo, Stream, Time, VideoStream};
@@ -36,24 +39,30 @@ fn describe(stream: &format::stream::Stream) -> Result<Option<Stream>, Error> {
             let video = decoder
                 .video()
                 .map_err(|source| Error::Stream { index, source })?;
-            Some(Stream::Video(VideoStream {
-                index,
-                codec,
-                width: video.width(),
-                height: video.height(),
-                frame_rate: frame_rate(stream.avg_frame_rate()),
-            }))
+            let size = NonZeroU32::new(video.width()).zip(NonZeroU32::new(video.height()));
+            size.map(|(width, height)| {
+                Stream::Video(VideoStream {
+                    index,
+                    codec,
+                    width,
+                    height,
+                    frame_rate: frame_rate(stream.avg_frame_rate()),
+                })
+            })
         }
         media::Type::Audio => {
             let audio = decoder
                 .audio()
                 .map_err(|source| Error::Stream { index, source })?;
-            Some(Stream::Audio(AudioStream {
-                index,
-                codec,
-                sample_rate: audio.rate(),
-                channels: audio.channels(),
-            }))
+            let layout = NonZeroU32::new(audio.rate()).zip(NonZeroU16::new(audio.channels()));
+            layout.map(|(sample_rate, channels)| {
+                Stream::Audio(AudioStream {
+                    index,
+                    codec,
+                    sample_rate,
+                    channels,
+                })
+            })
         }
         _ => None,
     };
@@ -80,13 +89,13 @@ mod tests {
         let audio: Vec<_> = info.audio().collect();
         assert_eq!(video.len(), 1);
         assert_eq!(
-            (video[0].width, video[0].height),
+            (video[0].width.get(), video[0].height.get()),
             (fixture::WIDTH, fixture::HEIGHT)
         );
         assert_eq!(audio.len(), 1);
         assert_eq!(audio[0].codec, "pcm_s16le");
         assert_eq!(
-            (audio[0].sample_rate, audio[0].channels),
+            (audio[0].sample_rate.get(), audio[0].channels.get()),
             (fixture::AUDIO_SAMPLE_RATE.get(), fixture::AUDIO_CHANNELS)
         );
     }

@@ -1,3 +1,5 @@
+use std::num::{NonZeroU16, NonZeroU32};
+
 use crate::time::{FrameRate, Time};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -32,8 +34,8 @@ pub enum Stream {
 pub struct VideoStream {
     pub index: usize,
     pub codec: String,
-    pub width: u32,
-    pub height: u32,
+    pub width: NonZeroU32,
+    pub height: NonZeroU32,
     pub frame_rate: Option<FrameRate>,
 }
 
@@ -41,12 +43,14 @@ pub struct VideoStream {
 pub struct AudioStream {
     pub index: usize,
     pub codec: String,
-    pub sample_rate: u32,
-    pub channels: u16,
+    pub sample_rate: NonZeroU32,
+    pub channels: NonZeroU16,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use super::*;
 
     #[test]
@@ -57,14 +61,14 @@ mod tests {
                 Stream::Audio(AudioStream {
                     index: 0,
                     codec: "opus".into(),
-                    sample_rate: 48_000,
-                    channels: 2,
+                    sample_rate: NonZero::new(48_000).unwrap(),
+                    channels: NonZero::new(2).unwrap(),
                 }),
                 Stream::Video(VideoStream {
                     index: 1,
                     codec: "av1".into(),
-                    width: 1920,
-                    height: 1080,
+                    width: NonZero::new(1920).unwrap(),
+                    height: NonZero::new(1080).unwrap(),
                     frame_rate: Some(FrameRate::FPS_24),
                 }),
             ],

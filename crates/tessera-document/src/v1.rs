@@ -1,4 +1,8 @@
-use std::{collections::HashSet, num::NonZeroU32, path::PathBuf};
+use std::{
+    collections::HashSet,
+    num::{NonZeroU16, NonZeroU32},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
@@ -108,8 +112,8 @@ impl TryFrom<&model::Project> for Project {
 impl From<model::SequenceSettings> for SequenceSettings {
     fn from(settings: model::SequenceSettings) -> Self {
         Self {
-            width: settings.width,
-            height: settings.height,
+            width: settings.width.get(),
+            height: settings.height.get(),
             frame_rate: settings.frame_rate.into(),
             sample_rate: settings.sample_rate.get(),
         }
@@ -148,15 +152,15 @@ impl From<&model::Stream> for Stream {
             model::Stream::Video(video) => Self::Video {
                 index: video.index,
                 codec: video.codec.clone(),
-                width: video.width,
-                height: video.height,
+                width: video.width.get(),
+                height: video.height.get(),
                 frame_rate: video.frame_rate.map(Rational::from),
             },
             model::Stream::Audio(audio) => Self::Audio {
                 index: audio.index,
                 codec: audio.codec.clone(),
-                sample_rate: audio.sample_rate,
-                channels: audio.channels,
+                sample_rate: audio.sample_rate.get(),
+                channels: audio.channels.get(),
             },
         }
     }
@@ -278,9 +282,15 @@ impl TryFrom<SequenceSettings> for model::SequenceSettings {
                 })?;
         let sample_rate =
             NonZeroU32::new(settings.sample_rate).ok_or(ValidationError::ZeroSampleRate)?;
+        let (width, height) = NonZeroU32::new(settings.width)
+            .zip(NonZeroU32::new(settings.height))
+            .ok_or(ValidationError::SequenceSize {
+                width: settings.width,
+                height: settings.height,
+            })?;
         Ok(Self {
-            width: settings.width,
-            height: settings.height,
+            width,
+            height,
             frame_rate,
             sample_rate,
         })
@@ -298,6 +308,21 @@ impl TryFrom<Asset> for model::Asset {
 
     fn try_from(asset: Asset) -> Result<Self, ValidationError> {
         let id = AssetId(asset.id);
+        if let Some(flicks) = asset.duration_flicks.filter(|&flicks| flicks <= 0) {
+            return Err(ValidationError::NonPositiveDuration { asset: id, flicks });
+        }
+        let mut indices = HashSet::new();
+        if let Some(repeated) = asset
+            .streams
+            .iter()
+            .map(Stream::index)
+            .find(|&index| !indices.insert(index))
+        {
+            return Err(ValidationError::DuplicateStream {
+                asset: id,
+                stream: repeated,
+            });
+        }
         Ok(Self {
             id,
             path: PathBuf::from(asset.path),
@@ -314,6 +339,12 @@ impl TryFrom<Asset> for model::Asset {
 }
 
 impl Stream {
+    fn index(&self) -> usize {
+        match *self {
+            Self::Video { index, .. } | Self::Audio { index, .. } => index,
+        }
+    }
+
     fn rebuilt(self, asset: AssetId) -> Result<model::Stream, ValidationError> {
         Ok(match self {
             Self::Video {
@@ -322,22 +353,32 @@ impl Stream {
                 width,
                 height,
                 frame_rate,
-            } => model::Stream::Video(model::VideoStream {
-                index,
-                codec,
-                width,
-                height,
-                frame_rate: frame_rate
-                    .map(|rate| {
-                        rate.frame_rate().ok_or(ValidationError::StreamFrameRate {
-                            asset,
-                            stream: index,
-                            numerator: rate.numerator,
-                            denominator: rate.denominator,
+            } => {
+                let (nonzero_width, nonzero_height) = NonZeroU32::new(width)
+                    .zip(NonZeroU32::new(height))
+                    .ok_or(ValidationError::StreamSize {
+                        asset,
+                        stream: index,
+                        width,
+                        height,
+                    })?;
+                model::Stream::Video(model::VideoStream {
+                    index,
+                    codec,
+                    width: nonzero_width,
+                    height: nonzero_height,
+                    frame_rate: frame_rate
+                        .map(|rate| {
+                            rate.frame_rate().ok_or(ValidationError::StreamFrameRate {
+                                asset,
+                                stream: index,
+                                numerator: rate.numerator,
+                                denominator: rate.denominator,
+                            })
                         })
-                    })
-                    .transpose()?,
-            }),
+                        .transpose()?,
+                })
+            }
             Self::Audio {
                 index,
                 codec,
@@ -346,8 +387,16 @@ impl Stream {
             } => model::Stream::Audio(model::AudioStream {
                 index,
                 codec,
-                sample_rate,
-                channels,
+                sample_rate: NonZeroU32::new(sample_rate).ok_or(
+                    ValidationError::ZeroStreamSampleRate {
+                        asset,
+                        stream: index,
+                    },
+                )?,
+                channels: NonZeroU16::new(channels).ok_or(ValidationError::NoChannels {
+                    asset,
+                    stream: index,
+                })?,
             }),
         })
     }
@@ -548,6 +597,101 @@ mod tests {
             refused(|document| document["settings"]["sample_rate"] = json!(0)),
             ValidationError::ZeroSampleRate
         );
+    }
+
+    #[test]
+    fn sizes_sample_rates_and_channel_counts_must_not_be_zero() {
+        assert_eq!(
+            refused(|document| document["settings"]["width"] = json!(0)),
+            ValidationError::SequenceSize {
+                width: 0,
+                height: 1080
+            }
+        );
+        assert_eq!(
+            refused(|document| document["settings"]["height"] = json!(0)),
+            ValidationError::SequenceSize {
+                width: 1920,
+                height: 0
+            }
+        );
+        assert_eq!(
+            refused(|document| document["assets"][0]["streams"][0]["width"] = json!(0)),
+            ValidationError::StreamSize {
+                asset: AssetId(4),
+                stream: 0,
+                width: 0,
+                height: 1080
+            }
+        );
+        assert_eq!(
+            refused(|document| document["assets"][0]["streams"][0]["height"] = json!(0)),
+            ValidationError::StreamSize {
+                asset: AssetId(4),
+                stream: 0,
+                width: 1920,
+                height: 0
+            }
+        );
+        assert_eq!(
+            refused(|document| document["assets"][1]["streams"][0]["sample_rate"] = json!(0)),
+            ValidationError::ZeroStreamSampleRate {
+                asset: AssetId(7),
+                stream: 0
+            }
+        );
+        assert_eq!(
+            refused(|document| document["assets"][1]["streams"][0]["channels"] = json!(0)),
+            ValidationError::NoChannels {
+                asset: AssetId(7),
+                stream: 0
+            }
+        );
+    }
+
+    #[test]
+    fn asset_durations_must_be_positive() {
+        assert_eq!(
+            refused(|document| document["assets"][0]["duration_flicks"] = json!(-SECOND)),
+            ValidationError::NonPositiveDuration {
+                asset: AssetId(4),
+                flicks: -SECOND
+            }
+        );
+        assert_eq!(
+            refused(|document| document["assets"][1]["duration_flicks"] = json!(0)),
+            ValidationError::NonPositiveDuration {
+                asset: AssetId(7),
+                flicks: 0
+            }
+        );
+    }
+
+    #[test]
+    fn an_asset_lists_each_stream_index_once() {
+        assert_eq!(
+            refused(|document| {
+                let audio = document["assets"][1]["streams"][0].clone();
+                document["assets"][0]["streams"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(audio);
+            }),
+            ValidationError::DuplicateStream {
+                asset: AssetId(4),
+                stream: 0
+            }
+        );
+
+        let mut document = valid();
+        let mut audio = document["assets"][1]["streams"][0].clone();
+        audio["index"] = json!(1);
+        document["assets"][0]["streams"]
+            .as_array_mut()
+            .unwrap()
+            .push(audio);
+
+        assert!(rebuilt(document).is_ok());
     }
 
     #[test]

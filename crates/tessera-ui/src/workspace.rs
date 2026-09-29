@@ -441,6 +441,8 @@ fn with_project_extension(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
     use tessera_timeline::{MediaInfo, Stream, Time, VideoStream};
 
@@ -476,8 +478,8 @@ mod tests {
             streams: vec![Stream::Video(VideoStream {
                 index: 0,
                 codec: "h264".into(),
-                width: 1920,
-                height: 1080,
+                width: NonZero::new(1920).unwrap(),
+                height: NonZero::new(1080).unwrap(),
                 frame_rate: None,
             })],
         };

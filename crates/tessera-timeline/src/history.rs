@@ -143,6 +143,8 @@ impl History {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use super::*;
     use crate::{EditError, FrameRate, MediaInfo, Stream, Time, TrackKind, VideoStream};
 
@@ -334,8 +336,8 @@ mod tests {
                 streams: vec![Stream::Video(VideoStream {
                     index: 0,
                     codec: "h264".into(),
-                    width: 1280,
-                    height: 720,
+                    width: NonZero::new(1280).unwrap(),
+                    height: NonZero::new(720).unwrap(),
                     frame_rate: Some(FrameRate::FPS_30),
                 })],
             },

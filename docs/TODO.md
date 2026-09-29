@@ -18,8 +18,6 @@
 
 ## Project files
 
-- Validate sequence and stream width, height, sample rate and channels, negative asset durations and
-  duplicate stream indices on load (a `"width": 0` sequence loads today)
 - Store media paths relative to the project file when the media sits under it, and resolve relative
   paths against the project's directory rather than the working directory
 - Refuse non-UTF-8 media paths at import or store them losslessly; such a project can never be saved

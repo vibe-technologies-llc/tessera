@@ -128,6 +128,8 @@ fn clip_samples(clip: &Clip, sample_rate: NonZeroU32) -> Range<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use tessera_timeline::{AssetId, AudioStream, ClipEdge, MediaInfo, Stream};
 
     use super::*;
@@ -143,8 +145,8 @@ mod tests {
             streams: vec![Stream::Audio(AudioStream {
                 index: 0,
                 codec: "pcm_s16le".into(),
-                sample_rate: RATE.get(),
-                channels: 2,
+                sample_rate: RATE,
+                channels: NonZero::new(2).unwrap(),
             })],
         };
         let asset = project.add_asset(TONE.into(), info);

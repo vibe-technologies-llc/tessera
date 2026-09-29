@@ -28,13 +28,17 @@ impl Asset {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SequenceSettings {
-    pub width: u32,
-    pub height: u32,
+    pub width: NonZeroU32,
+    pub height: NonZeroU32,
     pub frame_rate: FrameRate,
     pub sample_rate: NonZeroU32,
 }
 
 impl SequenceSettings {
+    pub const DEFAULT_WIDTH: NonZeroU32 =
+        NonZeroU32::new(1920).expect("the default width is not zero");
+    pub const DEFAULT_HEIGHT: NonZeroU32 =
+        NonZeroU32::new(1080).expect("the default height is not zero");
     pub const DEFAULT_SAMPLE_RATE: NonZeroU32 =
         NonZeroU32::new(48_000).expect("the default sample rate is not zero");
 }
@@ -42,8 +46,8 @@ impl SequenceSettings {
 impl Default for SequenceSettings {
     fn default() -> Self {
         Self {
-            width: 1920,
-            height: 1080,
+            width: Self::DEFAULT_WIDTH,
+            height: Self::DEFAULT_HEIGHT,
             frame_rate: FrameRate::FPS_30,
             sample_rate: Self::DEFAULT_SAMPLE_RATE,
         }
@@ -596,6 +600,8 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use super::*;
     use crate::media::{AudioStream, Stream, VideoStream};
 
@@ -785,8 +791,8 @@ mod tests {
             streams: vec![Stream::Video(VideoStream {
                 index: 0,
                 codec: "h264".into(),
-                width: 1280,
-                height: 720,
+                width: NonZero::new(1280).unwrap(),
+                height: NonZero::new(720).unwrap(),
                 frame_rate: Some(FrameRate::FPS_30),
             })],
         }
@@ -798,8 +804,8 @@ mod tests {
             streams: vec![Stream::Audio(AudioStream {
                 index: 0,
                 codec: "opus".into(),
-                sample_rate: 48_000,
-                channels: 2,
+                sample_rate: NonZero::new(48_000).unwrap(),
+                channels: NonZero::new(2).unwrap(),
             })],
         }
     }

@@ -430,6 +430,8 @@ pub fn file_name(path: &Path) -> SharedString {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use gpui::TestAppContext;
     use tessera_timeline::{AudioStream, Stream, VideoStream};
 
@@ -441,8 +443,8 @@ mod tests {
             streams: vec![Stream::Video(VideoStream {
                 index: 0,
                 codec: "h264".into(),
-                width: 640,
-                height: 360,
+                width: NonZero::new(640).unwrap(),
+                height: NonZero::new(360).unwrap(),
                 frame_rate: None,
             })],
         }
@@ -454,8 +456,8 @@ mod tests {
             streams: vec![Stream::Audio(AudioStream {
                 index: 0,
                 codec: "opus".into(),
-                sample_rate: 48_000,
-                channels: 2,
+                sample_rate: NonZero::new(48_000).unwrap(),
+                channels: NonZero::new(2).unwrap(),
             })],
         }
     }

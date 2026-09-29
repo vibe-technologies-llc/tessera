@@ -29,7 +29,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `Time::MAX` instead of wrapping or panicking, and so do the frame, sample and rational
   conversions; `checked_add`, `checked_sub` and `TimeRange::checked_end` report an overflow instead.
   Nothing divides by zero: a `FrameRate` exists only through `FrameRate::new`, which refuses a zero
-  numerator or denominator and a rate faster than one frame per flick, and sample rates and `Time::from_rational` denominators are `NonZero`.
+  numerator or denominator and a rate faster than one frame per flick, and sample rates, channel
+  counts, sequence and stream sizes and `Time::from_rational` denominators are `NonZero`.
   `checked_frame_to_time` reports a frame whose start doesn't fit instead of saturating.
   `Timecode` labels a time at a frame rate, using drop-frame (`;` before the frames) for every
   x/1001 rate whose nominal rate is a multiple of 30 (29.97, 59.94, 119.88), which skips two labels
@@ -79,7 +80,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   version 1 and changes break it in place, fixture included, instead of adding a migration step.
   Rebuilding the `Project` validates rather than trusts: clips go through `Clip::check` and
   `Track::insert`, and ids (unique, and each below the stored next id), assets, stream kinds, clip
-  ranges, rates and one track of each kind are checked, each failure a distinct `ValidationError`.
+  ranges, rates, sizes and channel counts (none zero), asset durations (positive), stream indices
+  (unique within an asset) and one track of each kind are checked, each failure a distinct
+  `ValidationError`.
   `to_string` and `from_str` are pure. `save` follows symlinks to the file they point at (refusing a
   loop, `SymlinkLoop`), writes a synced sibling temp file of its own (`create_new`, named by pid and
   a process-wide counter) carrying the replaced file's permissions, renames it over the target and
@@ -87,7 +90,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `fixtures/v1.tessera` pins the v1 format.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
-  here. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
+  here. Probing leaves out a stream whose size, sample rate or channel count FFmpeg reports as zero,
+  which the model can't hold. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
   byte-bounded LRU cache keyed by the span each frame covers. FFmpeg types do not cross its public
   API, apart from the `FfmpegError` re-export. A decoder refuses a stream whose time base has a

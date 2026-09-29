@@ -955,7 +955,7 @@ fn ruler_step(pixels_per_second: f32, frame_rate: FrameRate) -> RulerStep {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroI64;
+    use std::num::{NonZero, NonZeroI64};
 
     use gpui::{Modifiers, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext};
     use tessera_timeline::{MediaInfo, Stream, VideoStream};
@@ -1034,8 +1034,8 @@ mod tests {
             streams: vec![Stream::Video(VideoStream {
                 index: 0,
                 codec: "h264".into(),
-                width: 1920,
-                height: 1080,
+                width: NonZero::new(1920).unwrap(),
+                height: NonZero::new(1080).unwrap(),
                 frame_rate: None,
             })],
         };

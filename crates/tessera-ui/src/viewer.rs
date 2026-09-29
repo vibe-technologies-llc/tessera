@@ -311,7 +311,7 @@ impl Render for Viewer {
         let playhead = self.playhead.read(cx);
         let timecode = Timecode::new(playhead.time(), settings.frame_rate);
         let speed = speed_label(playhead.speed());
-        let aspect_ratio = settings.width as f32 / settings.height as f32;
+        let aspect_ratio = settings.width.get() as f32 / settings.height.get() as f32;
         let placeholder = format!(
             "{}×{} · {:.3} fps",
             settings.width,
@@ -358,7 +358,7 @@ impl Render for Viewer {
 }
 
 fn sequence_bounds(project: &Project) -> (u32, u32) {
-    (project.settings.width, project.settings.height)
+    (project.settings.width.get(), project.settings.height.get())
 }
 
 fn frame_request(project: &Project, time: Time) -> Option<FrameRequest> {
@@ -500,6 +500,8 @@ fn composite_frames(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use gpui::{TestAppContext, VisualTestContext};
     use tessera_timeline::{AudioStream, MediaInfo, Stream, TrackKind, VideoStream};
 
@@ -516,8 +518,8 @@ mod tests {
             streams: vec![Stream::Video(VideoStream {
                 index: 0,
                 codec: "h264".into(),
-                width: 640,
-                height: 360,
+                width: NonZero::new(640).unwrap(),
+                height: NonZero::new(360).unwrap(),
                 frame_rate: None,
             })],
         }
@@ -529,8 +531,8 @@ mod tests {
             streams: vec![Stream::Audio(AudioStream {
                 index: 0,
                 codec: "flac".into(),
-                sample_rate: 48_000,
-                channels: 2,
+                sample_rate: NonZero::new(48_000).unwrap(),
+                channels: NonZero::new(2).unwrap(),
             })],
         }
     }

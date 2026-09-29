@@ -184,7 +184,7 @@ fn temporary_sibling(path: &Path, sequence: u64) -> PathBuf {
 mod tests {
     use std::{
         ffi::OsStr,
-        num::NonZeroU32,
+        num::{NonZero, NonZeroU32},
         os::unix::{
             ffi::OsStrExt,
             fs::{PermissionsExt, symlink},
@@ -204,8 +204,8 @@ mod tests {
         Stream::Video(VideoStream {
             index,
             codec: "h264".into(),
-            width: 1920,
-            height: 1080,
+            width: NonZero::new(1920).unwrap(),
+            height: NonZero::new(1080).unwrap(),
             frame_rate,
         })
     }
@@ -214,8 +214,8 @@ mod tests {
         Stream::Audio(AudioStream {
             index,
             codec: "aac".into(),
-            sample_rate,
-            channels,
+            sample_rate: NonZero::new(sample_rate).unwrap(),
+            channels: NonZero::new(channels).unwrap(),
         })
     }
 
@@ -241,8 +241,8 @@ mod tests {
     fn rich_project() -> Project {
         let mut project = Project::new("Rich");
         project.settings = tessera_timeline::SequenceSettings {
-            width: 3840,
-            height: 2160,
+            width: NonZero::new(3840).unwrap(),
+            height: NonZero::new(2160).unwrap(),
             frame_rate: FrameRate::NTSC_60,
             sample_rate: NonZeroU32::new(96_000).unwrap(),
         };
