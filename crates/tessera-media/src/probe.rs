@@ -61,7 +61,7 @@ fn describe(stream: &format::stream::Stream) -> Result<Option<Stream>, Error> {
 }
 
 fn frame_rate(rate: ffmpeg_next::Rational) -> Option<FrameRate> {
-    FrameRate::new(
+    FrameRate::nearest(
         u32::try_from(rate.numerator()).ok()?,
         u32::try_from(rate.denominator()).ok()?,
     )
@@ -102,9 +102,22 @@ mod tests {
     fn invalid_rates_are_rejected() {
         assert_eq!(frame_rate(ffmpeg_next::Rational::new(0, 1)), None);
         assert_eq!(frame_rate(ffmpeg_next::Rational::new(30, 0)), None);
+        assert_eq!(frame_rate(ffmpeg_next::Rational::new(-30, 1)), None);
         assert_eq!(
             frame_rate(ffmpeg_next::Rational::new(30_000, 1_001)),
             Some(FrameRate::NTSC_30)
+        );
+    }
+
+    #[test]
+    fn average_rates_snap_to_a_standard_rate_close_by() {
+        assert_eq!(
+            frame_rate(ffmpeg_next::Rational::new(2_997, 100)),
+            Some(FrameRate::NTSC_30)
+        );
+        assert_eq!(
+            frame_rate(ffmpeg_next::Rational::new(44, 1)),
+            FrameRate::new(44, 1)
         );
     }
 }

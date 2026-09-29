@@ -271,7 +271,7 @@ impl TryFrom<SequenceSettings> for model::SequenceSettings {
         let frame_rate =
             settings
                 .frame_rate
-                .positive()
+                .frame_rate()
                 .ok_or(ValidationError::SequenceFrameRate {
                     numerator,
                     denominator,
@@ -288,7 +288,7 @@ impl TryFrom<SequenceSettings> for model::SequenceSettings {
 }
 
 impl Rational {
-    fn positive(self) -> Option<FrameRate> {
+    fn frame_rate(self) -> Option<FrameRate> {
         FrameRate::new(self.numerator, self.denominator)
     }
 }
@@ -329,7 +329,7 @@ impl Stream {
                 height,
                 frame_rate: frame_rate
                     .map(|rate| {
-                        rate.positive().ok_or(ValidationError::StreamFrameRate {
+                        rate.frame_rate().ok_or(ValidationError::StreamFrameRate {
                             asset,
                             stream: index,
                             numerator: rate.numerator,
@@ -547,6 +547,36 @@ mod tests {
         assert_eq!(
             refused(|document| document["settings"]["sample_rate"] = json!(0)),
             ValidationError::ZeroSampleRate
+        );
+    }
+
+    #[test]
+    fn frame_rates_may_be_arbitrary_up_to_a_frame_per_flick() {
+        let mut document = valid();
+        document["settings"]["frame_rate"] = json!({ "numerator": 44, "denominator": 1 });
+        document["assets"][0]["streams"][0]["frame_rate"] =
+            json!({ "numerator": 60, "denominator": 2 });
+
+        let project = rebuilt(document).unwrap();
+        let stream = project
+            .asset(AssetId(4))
+            .unwrap()
+            .info
+            .video()
+            .next()
+            .unwrap();
+
+        assert_eq!(project.settings.frame_rate, FrameRate::new(44, 1).unwrap());
+        assert_eq!(stream.frame_rate, Some(FrameRate::FPS_30));
+        assert_eq!(
+            refused(|document| {
+                document["settings"]["frame_rate"] =
+                    json!({ "numerator": 705_600_001, "denominator": 1 });
+            }),
+            ValidationError::SequenceFrameRate {
+                numerator: 705_600_001,
+                denominator: 1
+            }
         );
     }
 

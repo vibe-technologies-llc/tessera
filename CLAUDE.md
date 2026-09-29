@@ -17,14 +17,19 @@ A Cargo workspace under `crates/`. Dependencies point one way:
 - **`tessera-timeline`** is the pure project model (`Project`, `Timeline`, `Track`, `Clip`,
   `Asset`). Each `Asset` carries its probed `MediaInfo` (duration and streams), so nothing outside
   `tessera-media` has to call into FFmpeg to describe a clip. It has no IO and no GPU, and it
-  depends only on `thiserror`. Time is `Time(i64)` in flicks (1/705 600 000 s). Every common frame
-  rate, the NTSC 1000/1001 rates included, has an integral frame duration in flicks, so frame ↔ time
-  conversion through `FrameRate` stays exact. Never store time as floating-point seconds;
+  depends only on `thiserror`. Time is `Time(i64)` in flicks (1/705 600 000 s). A `FrameRate` may be
+  any positive rational up to one frame per flick, kept in lowest terms. Every rate in
+  `FrameRate::STANDARD`, the NTSC 1000/1001 rates included, has an integral frame duration in
+  flicks. At other rates (44/1) frame `n` starts on the first flick at or after its exact start
+  (`frame_to_time` takes the ceiling, `time_to_frame` the floor), so frames differ in length by at
+  most one flick, `frame_duration` is the first frame's, and frame ↔ time still round-trips
+  exactly. Probing reads a video's rate through `FrameRate::nearest`, which snaps an average rate
+  within 0.05 % of a standard one (2997/100) onto it and keeps any other rate as it is. Never store time as floating-point seconds;
   `as_seconds_f64` exists only for drawing. `Time` arithmetic saturates at `Time::MIN` and
   `Time::MAX` instead of wrapping or panicking, and so do the frame, sample and rational
   conversions; `checked_add`, `checked_sub` and `TimeRange::checked_end` report an overflow instead.
   Nothing divides by zero: a `FrameRate` exists only through `FrameRate::new`, which refuses a zero
-  numerator or denominator, and sample rates and `Time::from_rational` denominators are `NonZero`.
+  numerator or denominator and a rate faster than one frame per flick, and sample rates and `Time::from_rational` denominators are `NonZero`.
   `Timecode` labels a time at a frame rate, using drop-frame (`;` before the frames) for the
   30000/1001 and 60000/1001 rates. `Time::from_samples` and `Time::to_samples` convert between
   time and sample indices at a sample rate the same way, flooring, and every common audio rate from

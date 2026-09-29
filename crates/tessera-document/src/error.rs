@@ -60,10 +60,12 @@ pub enum FormatError {
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ValidationError {
-    #[error("the sequence frame rate {numerator}/{denominator} is not a positive rate")]
+    #[error(
+        "the sequence frame rate {numerator}/{denominator} is not a positive rate of at most one frame per flick"
+    )]
     SequenceFrameRate { numerator: u32, denominator: u32 },
     #[error(
-        "stream {stream} of asset {} has the frame rate {numerator}/{denominator}, which is not a positive rate",
+        "stream {stream} of asset {} has the frame rate {numerator}/{denominator}, which is not a positive rate of at most one frame per flick",
         .asset.0
     )]
     StreamFrameRate {

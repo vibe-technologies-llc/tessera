@@ -106,6 +106,8 @@ impl Sub for Time {
     }
 }
 
+const SNAP_TOLERANCE: f64 = 0.000_5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameRate {
     numerator: NonZeroU32,
@@ -116,13 +118,42 @@ impl FrameRate {
     pub const FPS_24: Self = Self::whole(24, 1);
     pub const FPS_25: Self = Self::whole(25, 1);
     pub const FPS_30: Self = Self::whole(30, 1);
+    pub const FPS_48: Self = Self::whole(48, 1);
+    pub const FPS_50: Self = Self::whole(50, 1);
     pub const FPS_60: Self = Self::whole(60, 1);
+    pub const FPS_100: Self = Self::whole(100, 1);
+    pub const FPS_120: Self = Self::whole(120, 1);
     pub const NTSC_24: Self = Self::whole(24_000, 1_001);
     pub const NTSC_30: Self = Self::whole(30_000, 1_001);
+    pub const NTSC_48: Self = Self::whole(48_000, 1_001);
     pub const NTSC_60: Self = Self::whole(60_000, 1_001);
+    pub const NTSC_120: Self = Self::whole(120_000, 1_001);
+
+    pub const STANDARD: [Self; 13] = [
+        Self::NTSC_24,
+        Self::FPS_24,
+        Self::FPS_25,
+        Self::NTSC_30,
+        Self::FPS_30,
+        Self::NTSC_48,
+        Self::FPS_48,
+        Self::FPS_50,
+        Self::NTSC_60,
+        Self::FPS_60,
+        Self::FPS_100,
+        Self::NTSC_120,
+        Self::FPS_120,
+    ];
 
     pub const fn new(numerator: u32, denominator: u32) -> Option<Self> {
-        match (NonZeroU32::new(numerator), NonZeroU32::new(denominator)) {
+        if numerator == 0 || denominator == 0 || !fits_a_flick(numerator, denominator) {
+            return None;
+        }
+        let divisor = gcd(numerator, denominator);
+        match (
+            NonZeroU32::new(numerator / divisor),
+            NonZeroU32::new(denominator / divisor),
+        ) {
             (Some(numerator), Some(denominator)) => Some(Self {
                 numerator,
                 denominator,
@@ -131,8 +162,22 @@ impl FrameRate {
         }
     }
 
+    pub fn nearest(numerator: u32, denominator: u32) -> Option<Self> {
+        let exact = Self::new(numerator, denominator)?;
+        Some(Self::nearest_standard(exact.as_f64()).unwrap_or(exact))
+    }
+
+    fn nearest_standard(requested: f64) -> Option<Self> {
+        let relative_error = |rate: &Self| (requested - rate.as_f64()).abs() / rate.as_f64();
+        Self::STANDARD
+            .iter()
+            .filter(|rate| relative_error(rate) <= SNAP_TOLERANCE)
+            .min_by(|a, b| relative_error(a).total_cmp(&relative_error(b)))
+            .copied()
+    }
+
     const fn whole(numerator: u32, denominator: u32) -> Self {
-        Self::new(numerator, denominator).expect("a constant rate has non-zero parts")
+        Self::new(numerator, denominator).expect("a constant rate is a valid rate")
     }
 
     pub const fn numerator(self) -> u32 {
@@ -150,7 +195,7 @@ impl FrameRate {
     pub fn frame_to_time(self, frame: i64) -> Time {
         let scaled =
             i128::from(frame) * i128::from(self.denominator()) * i128::from(FLICKS_PER_SECOND);
-        Time::saturated(scaled / i128::from(self.numerator()))
+        Time::saturated(ceiling_div(scaled, i128::from(self.numerator())))
     }
 
     pub fn time_to_frame(self, time: Time) -> i64 {
@@ -170,6 +215,21 @@ impl FrameRate {
     pub fn as_f64(self) -> f64 {
         f64::from(self.numerator()) / f64::from(self.denominator())
     }
+}
+
+fn ceiling_div(dividend: i128, positive_divisor: i128) -> i128 {
+    -(-dividend).div_euclid(positive_divisor)
+}
+
+const fn fits_a_flick(numerator: u32, denominator: u32) -> bool {
+    numerator as u64 <= FLICKS_PER_SECOND as u64 * denominator as u64
+}
+
+const fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -223,19 +283,9 @@ mod tests {
         assert_eq!(Time::from_seconds(2) * -1, Time::from_seconds(-2));
     }
 
-    const RATES: [FrameRate; 7] = [
-        FrameRate::FPS_24,
-        FrameRate::FPS_25,
-        FrameRate::FPS_30,
-        FrameRate::FPS_60,
-        FrameRate::NTSC_24,
-        FrameRate::NTSC_30,
-        FrameRate::NTSC_60,
-    ];
-
     #[test]
     fn every_common_rate_has_an_integral_frame_duration() {
-        for rate in RATES {
+        for rate in FrameRate::STANDARD {
             let flicks_per_frame = i128::from(FLICKS_PER_SECOND) * i128::from(rate.denominator());
             assert_eq!(
                 flicks_per_frame % i128::from(rate.numerator()),
@@ -247,7 +297,7 @@ mod tests {
 
     #[test]
     fn frames_round_trip_through_time() {
-        for rate in RATES {
+        for rate in FrameRate::STANDARD {
             for frame in [0, 1, 2, 1_000, 107_892, 10_000_000] {
                 assert_eq!(
                     rate.time_to_frame(rate.frame_to_time(frame)),
@@ -395,15 +445,113 @@ mod tests {
     }
 
     #[test]
+    fn frame_rates_last_at_least_a_flick() {
+        assert!(FrameRate::new(705_600_000, 1).is_some());
+        assert_eq!(FrameRate::new(705_600_001, 1), None);
+        assert_eq!(FrameRate::new(u32::MAX, 1), None);
+        assert!(FrameRate::new(u32::MAX, 7).is_some());
+        assert!(FrameRate::new(1, u32::MAX).is_some());
+    }
+
+    #[test]
+    fn frame_rates_are_kept_in_lowest_terms() {
+        let doubled = FrameRate::new(60_000, 2_002).unwrap();
+
+        assert_eq!(doubled, FrameRate::NTSC_30);
+        assert_eq!(FrameRate::new(60, 2), Some(FrameRate::FPS_30));
+        assert_eq!(
+            (doubled.numerator(), doubled.denominator()),
+            (30_000, 1_001)
+        );
+    }
+
+    const ARBITRARY_RATES: [(u32, u32); 7] = [
+        (44, 1),
+        (13, 1),
+        (1_000, 33),
+        (97, 7),
+        (2_997, 100),
+        (239_999, 1_000),
+        (u32::MAX, 7),
+    ];
+
+    #[test]
+    fn frames_at_arbitrary_rates_round_trip_through_time() {
+        for (numerator, denominator) in ARBITRARY_RATES {
+            let rate = FrameRate::new(numerator, denominator).unwrap();
+            for frame in [-1_000_003, -2, -1, 0, 1, 2, 3, 1_000_003, 987_654_321] {
+                assert_eq!(
+                    rate.time_to_frame(rate.frame_to_time(frame)),
+                    frame,
+                    "{rate:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frames_at_arbitrary_rates_start_on_the_next_flick() {
+        let rate = FrameRate::new(44, 1).unwrap();
+        let exact_start = |frame: i64| frame as f64 * FLICKS_PER_SECOND as f64 / 44.0;
+
+        for frame in [-45, -1, 1, 2, 3, 43, 44, 45] {
+            let start = rate.frame_to_time(frame).flicks();
+
+            assert!(start as f64 >= exact_start(frame), "{frame}");
+            assert!(((start - 1) as f64) < exact_start(frame), "{frame}");
+        }
+        assert_eq!(rate.frame_duration().flicks(), 16_036_364);
+        assert_eq!(rate.frame_to_time(44), Time::from_seconds(1));
+    }
+
+    #[test]
+    fn frames_at_arbitrary_rates_differ_in_length_by_at_most_a_flick() {
+        let rate = FrameRate::new(44, 1).unwrap();
+        let lengths: Vec<i64> = (0..44)
+            .map(|frame| (rate.frame_to_time(frame + 1) - rate.frame_to_time(frame)).flicks())
+            .collect();
+
+        assert!(
+            lengths
+                .iter()
+                .all(|&length| (16_036_363..=16_036_364).contains(&length))
+        );
+        assert_eq!(lengths.iter().sum::<i64>(), FLICKS_PER_SECOND);
+    }
+
+    #[test]
+    fn nearest_rate_snaps_to_a_standard_rate_close_by() {
+        assert_eq!(FrameRate::nearest(2_997, 100), Some(FrameRate::NTSC_30));
+        assert_eq!(FrameRate::nearest(1_199, 40), Some(FrameRate::NTSC_30));
+        assert_eq!(FrameRate::nearest(2_999, 100), Some(FrameRate::FPS_30));
+        assert_eq!(FrameRate::nearest(5_994, 100), Some(FrameRate::NTSC_60));
+        assert_eq!(FrameRate::nearest(24_000, 1_001), Some(FrameRate::NTSC_24));
+    }
+
+    #[test]
+    fn nearest_rate_keeps_other_rates_as_they_are() {
+        for (numerator, denominator) in [(15, 1), (25, 2), (44, 1), (3_003, 100), (1, u32::MAX)] {
+            assert_eq!(
+                FrameRate::nearest(numerator, denominator),
+                FrameRate::new(numerator, denominator)
+            );
+        }
+        assert_eq!(FrameRate::nearest(0, 1), None);
+        assert_eq!(FrameRate::nearest(44, 0), None);
+        assert_eq!(FrameRate::nearest(u32::MAX, 1), None);
+    }
+
+    #[test]
     fn frame_conversions_saturate_at_extreme_rates() {
-        let fastest = FrameRate::new(u32::MAX, 1).unwrap();
+        let fastest = FrameRate::new(705_600_000, 1).unwrap();
         let slowest = FrameRate::new(1, u32::MAX).unwrap();
 
+        assert_eq!(fastest.frame_duration(), Time::from_flicks(1));
         assert_eq!(slowest.frame_to_time(i64::MAX), Time::MAX);
         assert_eq!(slowest.frame_to_time(i64::MIN), Time::MIN);
         assert_eq!(fastest.time_to_frame(Time::MAX), i64::MAX);
         assert_eq!(fastest.time_to_frame(Time::MIN), i64::MIN);
-        assert_eq!(fastest.nominal_frames_per_second(), i64::from(u32::MAX));
+        assert_eq!(fastest.nominal_frames_per_second(), 705_600_000);
         assert_eq!(slowest.nominal_frames_per_second(), 1);
     }
 
