@@ -98,9 +98,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   part that isn't positive (`InvalidTimeBase`), and converts through the checked `TimeBase`.
   `VideoDecoder` is `Send` so it can move to a background task: ffmpeg-next leaves its scaler
   context `!Send`, but an `SwsContext` has no thread affinity and each one is owned by a single
-  decoder, so `Scaler` implements `Send` by hand. `VideoDecoder::open` decodes in hardware through
-  the first of `PREFERRED_HW_ACCELS` (VAAPI, then Vulkan Video) that the codec has a device config
-  for and whose device can be created; `open_with` takes the list, and an empty one decodes in
+  decoder, so `Scaler` implements `Send` by hand. A requested time maps to the nearest stream
+  tick (`TimeBase::to_ts`), so a 29.97 fps frame start in a 1/1000 time base finds its own frame
+  and not the one before. Decoders use frame and slice threads on every core; on a short file that
+  reads the whole stream ahead and drains the decoder, which is why the seek-policy test opens one
+  with a single thread. `VideoDecoder::open` decodes in hardware through the first of
+  `PREFERRED_HW_ACCELS` (VAAPI, then Vulkan Video) that the codec has a device config for and whose
+  device can be created; `open_with` takes the list, and an empty one decodes in
   software. Each device is created once per process and shared by every decoder, and a failed
   creation is remembered too. FFmpeg's default `get_format` picks the hardware format, and falls
   back to software by itself when the hardware refuses the stream (a codec profile or size the
@@ -109,9 +113,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   decoder holds, and only the frame being shown is downloaded (`av_hwframe_transfer_data`) before
   scaling to BGRA. The scaler converts YUV to full-range RGB with the frame's tagged matrix and
   range (`sws_setColorspaceDetails`, read before the download), reading an untagged matrix as BT.709
-  from 1280×720 up and BT.601 below, and a `yuvj` format as full range. The test fixture
-  is 128×96 so hardware accepts it, and an H.264 variant, generated when `libx264` is present, runs
-  the decode tests through the preferred accelerators against software.
+  from 1280×720 up and BT.601 below, and a `yuvj` format as full range. Each scaler keeps its
+  output frame, and rows are copied out of it whole. The test fixture is 128×96 so hardware accepts
+  it and can be generated at any frame rate (`generate_at_rate`), and an H.264 variant, generated
+  when `libx264` is present, runs the decode tests through the preferred accelerators against
+  software.
   `AudioDecoder::samples` returns an `AudioBuffer` of exactly the requested number of interleaved
   stereo `f32` frames at the rate the decoder was opened with, silent before the stream starts and
   past its end. It resamples through swresample, whose context ffmpeg-next already makes `Send`:

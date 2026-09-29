@@ -8,8 +8,9 @@ use std::{
 use ffmpeg_next::{
     Rational, Rescale, codec, color, decoder,
     ffi::{
-        AV_NOPTS_VALUE, AVColorSpace, AVSEEK_FLAG_BACKWARD, SWS_CS_ITU601, SWS_CS_ITU709,
-        avformat_index_get_entry_from_timestamp, sws_getCoefficients, sws_setColorspaceDetails,
+        AV_NOPTS_VALUE, AVColorSpace, AVSEEK_FLAG_BACKWARD, FF_THREAD_FRAME, FF_THREAD_SLICE,
+        SWS_CS_ITU601, SWS_CS_ITU709, avformat_index_get_entry_from_timestamp, sws_getCoefficients,
+        sws_setColorspaceDetails,
     },
     format::{self, Pixel},
     frame, media, rescale,
@@ -33,6 +34,7 @@ const FULL_RANGE_OUTPUT: c_int = 1;
 const NEUTRAL_BRIGHTNESS: c_int = 0;
 const UNIT_CONTRAST: c_int = 1 << 16;
 const UNIT_SATURATION: c_int = 1 << 16;
+const AUTOMATIC_THREAD_COUNT: c_int = 0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoFrame {
@@ -65,6 +67,7 @@ struct Converter {
 struct Scaler {
     context: scaling::Context,
     source: Source,
+    scaled: frame::Video,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +87,14 @@ impl VideoDecoder {
     }
 
     pub fn open_with(path: impl AsRef<Path>, hw_accels: &[HwAccel]) -> Result<Self, Error> {
+        Self::open_threaded(path, hw_accels, AUTOMATIC_THREAD_COUNT)
+    }
+
+    fn open_threaded(
+        path: impl AsRef<Path>,
+        hw_accels: &[HwAccel],
+        thread_count: c_int,
+    ) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
         let input = format::input(&path).map_err(|source| Error::Open {
             path: path.clone(),
@@ -109,6 +120,7 @@ impl VideoDecoder {
             .ok_or(ffmpeg_next::Error::DecoderNotFound)
             .map_err(stream_error)?;
         let hw_accel = hw::attach_device(&mut context, codec, hw_accels, HELD_FRAMES);
+        set_threads(&mut context, thread_count);
         let decoder = context
             .decoder()
             .open_as(codec)
@@ -302,17 +314,17 @@ impl Converter {
             Some(scaler) if scaler.source == source => scaler,
             _ => Scaler::new(source, width, height).map_err(|source| Error::Decode { source })?,
         };
-        let scaler = self.scaler.insert(scaler);
-        let mut scaled = frame::Video::empty();
-        scaler
-            .context
-            .run(frame, &mut scaled)
+        let Scaler {
+            context, scaled, ..
+        } = self.scaler.insert(scaler);
+        context
+            .run(frame, scaled)
             .map_err(|source| Error::Decode { source })?;
         Ok(VideoFrame {
             width: scaled.width(),
             height: scaled.height(),
             time,
-            bgra: packed_rows(&scaled),
+            bgra: packed_rows(scaled),
         })
     }
 }
@@ -362,7 +374,11 @@ impl Scaler {
         if applied < 0 {
             return Err(ffmpeg_next::Error::from(applied));
         }
-        Ok(Self { context, source })
+        Ok(Self {
+            context,
+            source,
+            scaled: frame::Video::empty(),
+        })
     }
 }
 
@@ -387,16 +403,22 @@ fn is_full_range_format(format: Pixel) -> bool {
     )
 }
 
+fn set_threads(context: &mut codec::Context, thread_count: c_int) {
+    unsafe {
+        let context = context.as_mut_ptr();
+        (*context).thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        (*context).thread_count = thread_count;
+    }
+}
+
 fn packed_rows(frame: &frame::Video) -> Vec<u8> {
     let row_len = frame.width() as usize * BYTES_PER_PIXEL;
-    let stride = frame.stride(0);
-    frame
-        .data(0)
-        .chunks(stride)
-        .take(frame.height() as usize)
-        .flat_map(|row| &row[..row_len])
-        .copied()
-        .collect()
+    let height = frame.height() as usize;
+    let mut packed = Vec::with_capacity(row_len * height);
+    for row in frame.data(0).chunks(frame.stride(0)).take(height) {
+        packed.extend_from_slice(&row[..row_len]);
+    }
+    packed
 }
 
 fn fitted_size(width: u32, height: u32, bounds: Option<(u32, u32)>) -> (u32, u32) {
@@ -446,10 +468,10 @@ impl TimeBase {
     }
 
     pub(crate) fn to_ts(self, time: Time) -> i64 {
-        let scaled = i128::from(time.flicks()) * i128::from(self.denominator.get());
+        let doubled = 2 * i128::from(time.flicks()) * i128::from(self.denominator.get());
         let per_tick = i128::from(self.numerator.get()) * i128::from(FLICKS_PER_SECOND);
-        scaled
-            .div_euclid(per_tick)
+        (doubled + per_tick)
+            .div_euclid(2 * per_tick)
             .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 
@@ -525,9 +547,41 @@ mod tests {
     }
 
     #[test]
+    fn stepping_through_ntsc_frames_in_a_millisecond_time_base() {
+        let rate = FrameRate::NTSC_30;
+        let fixture = Fixture::generate_at_rate("ntsc_milliseconds", rate);
+        let mut decoder = VideoDecoder::open(fixture.path())
+            .unwrap()
+            .cache_capacity(0);
+
+        let time_base = decoder.time_base.rational();
+        assert_eq!(time_base, Rational::new(1, 1000));
+
+        let forward = 0..fixture::FRAME_COUNT;
+        for index in forward.clone().chain(forward.rev()) {
+            let frame = decoder.frame_at(rate.frame_to_time(index)).unwrap();
+            assert_shows(&frame, index);
+        }
+    }
+
+    #[test]
+    fn software_decode_runs_on_every_core() {
+        let fixture = Fixture::generate_without_audio("threads");
+        let decoder = VideoDecoder::open_with(fixture.path(), &[]).unwrap();
+
+        let cores = std::thread::available_parallelism().unwrap().get();
+        let threading = decoder.decoder.threading();
+
+        assert!(threading.count >= cores.min(2), "{threading:?}");
+    }
+
+    #[test]
     fn nearby_frames_decode_forward_and_distant_ones_seek() {
+        const ONE_THREAD: c_int = 1;
+
         let fixture = Fixture::generate("seek_policy");
-        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let mut decoder = VideoDecoder::open_threaded(fixture.path(), &[], ONE_THREAD).unwrap();
+
         let ts = |decoder: &VideoDecoder, index| {
             decoder.stream_ts(middle_of_frame(fixture::FRAME_RATE, index))
         };
@@ -748,6 +802,21 @@ mod tests {
         assert_eq!(ts, 1234 * 3003);
         assert_eq!(time_base.to_time(ts), time);
         assert_eq!(time_base.rational(), Rational::new(1, 90_000));
+    }
+
+    #[test]
+    fn stream_timestamps_round_to_the_nearest_tick() {
+        let milliseconds = TimeBase::new(Rational::new(1, 1000)).unwrap();
+
+        let second_frame = FrameRate::NTSC_30.frame_to_time(2);
+        let before_second_frame = Time::from_flicks(-second_frame.flicks());
+        let half_tick = FLICKS_PER_SECOND / 2000;
+
+        assert_eq!(milliseconds.to_ts(FrameRate::NTSC_30.frame_to_time(1)), 33);
+        assert_eq!(milliseconds.to_ts(second_frame), 67);
+        assert_eq!(milliseconds.to_ts(before_second_frame), -67);
+        assert_eq!(milliseconds.to_ts(Time::from_flicks(half_tick)), 1);
+        assert_eq!(milliseconds.to_ts(Time::from_flicks(half_tick - 1)), 0);
     }
 
     #[test]

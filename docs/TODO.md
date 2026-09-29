@@ -30,9 +30,6 @@
 
 - Offset every stream by one container-wide start time instead of each stream's own `start_time`,
   which puts sound and picture out of sync on TS files and MP4s with edit lists
-- Round a requested time to the nearest stream tick instead of flooring it: 29.97 fps in a 1/1000
-  time base (MKV, WebM) returns the previous frame, so stepping repeats frames
-- Set the decoder's thread count and type; software decode runs on a single thread
 - Apply the display-matrix rotation and the sample aspect ratio, so phone footage isn't sideways and
   anamorphic DV and HDV aren't squashed
 - Seek when the stream index ends before the target, instead of decoding forward through the whole
@@ -43,8 +40,6 @@
   a terminal IO error from the packet iterator as a clean end of file
 - Skip attached-picture streams (cover art) and undecodable streams when probing instead of listing
   them as video or failing the import, and decode the probed stream index rather than `best()`
-- Scale into a reused BGRA buffer and copy rows whole, instead of a new frame and a byte-by-byte
-  `flat_map` copy per converted frame
 - Decode thumbnails in software at thumbnail size rather than through a hardware decoder at full size
 - Stop seeking again on every request for a time before the stream's first frame
 - Keep a decoded run of frames for backward stepping and reverse shuttle, and budget frame caches

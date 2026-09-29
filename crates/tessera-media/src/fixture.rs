@@ -52,6 +52,13 @@ enum Streams {
     VideoOnly,
 }
 
+#[derive(Clone, Copy)]
+struct Recipe {
+    streams: Streams,
+    codec: VideoCodec,
+    frame_rate: FrameRate,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VideoCodec {
     Mpeg4,
@@ -60,11 +67,29 @@ enum VideoCodec {
 
 impl Fixture {
     pub fn generate(name: &str) -> Self {
-        Self::generate_with(name, Streams::VideoAndAudio, VideoCodec::Mpeg4)
+        Self::generate_with(
+            name,
+            Recipe {
+                streams: Streams::VideoAndAudio,
+                codec: VideoCodec::Mpeg4,
+                frame_rate: FRAME_RATE,
+            },
+        )
     }
 
     pub fn generate_without_audio(name: &str) -> Self {
-        Self::generate_with(name, Streams::VideoOnly, VideoCodec::Mpeg4)
+        Self::generate_at_rate(name, FRAME_RATE)
+    }
+
+    pub fn generate_at_rate(name: &str, frame_rate: FrameRate) -> Self {
+        Self::generate_with(
+            name,
+            Recipe {
+                streams: Streams::VideoOnly,
+                codec: VideoCodec::Mpeg4,
+                frame_rate,
+            },
+        )
     }
 
     pub fn generate_h264(name: &str) -> Option<Self> {
@@ -72,16 +97,19 @@ impl Fixture {
         encoder::find_by_name(H264_ENCODER)?;
         Some(Self::generate_with(
             name,
-            Streams::VideoOnly,
-            VideoCodec::H264,
+            Recipe {
+                streams: Streams::VideoOnly,
+                codec: VideoCodec::H264,
+                frame_rate: FRAME_RATE,
+            },
         ))
     }
 
-    fn generate_with(name: &str, streams: Streams, codec: VideoCodec) -> Self {
+    fn generate_with(name: &str, recipe: Recipe) -> Self {
         crate::init().unwrap();
         let path =
             std::env::temp_dir().join(format!("tessera-media-{}-{name}.mkv", std::process::id()));
-        encode(&path, streams, codec).unwrap();
+        encode(&path, recipe).unwrap();
         Self { path }
     }
 
@@ -102,10 +130,10 @@ struct Muxed<E> {
     time_base: Rational,
 }
 
-fn encode(path: &Path, streams: Streams, codec: VideoCodec) -> Result<(), ffmpeg_next::Error> {
+fn encode(path: &Path, recipe: Recipe) -> Result<(), ffmpeg_next::Error> {
     let mut output = format::output(path)?;
-    let mut video = add_video(&mut output, codec)?;
-    let mut audio = match streams {
+    let mut video = add_video(&mut output, recipe.codec, recipe.frame_rate)?;
+    let mut audio = match recipe.streams {
         Streams::VideoAndAudio => Some(add_audio(&mut output)?),
         Streams::VideoOnly => None,
     };
@@ -173,10 +201,11 @@ fn wants_global_header(output: &format::context::Output) -> bool {
 fn add_video(
     output: &mut format::context::Output,
     video_codec: VideoCodec,
+    frame_rate: FrameRate,
 ) -> Result<Muxed<encoder::video::Encoder>, ffmpeg_next::Error> {
     let time_base = Rational::new(
-        FRAME_RATE.denominator() as i32,
-        FRAME_RATE.numerator() as i32,
+        frame_rate.denominator() as i32,
+        frame_rate.numerator() as i32,
     );
     let (codec, options) = match video_codec {
         VideoCodec::Mpeg4 => (
