@@ -35,16 +35,29 @@ impl fmt::Display for Command {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Revision(u64);
+
+impl Revision {
+    fn following(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Entry {
     command: Command,
     project: Project,
+    revision: Revision,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct History {
     undo: VecDeque<Entry>,
     redo: Vec<Entry>,
+    current: Revision,
+    newest: Revision,
+    saved: Revision,
 }
 
 impl History {
@@ -65,31 +78,66 @@ impl History {
             self.undo.push_back(Entry {
                 command,
                 project: before,
+                revision: self.current,
             });
             self.redo.clear();
+            self.newest = self.newest.following();
+            self.current = self.newest;
         }
         edited
     }
 
     pub fn undo(&mut self, project: &mut Project) -> Option<Command> {
         let entry = self.undo.pop_back()?;
-        self.redo.push(swap_in(entry, project));
-        self.redo.last().map(|entry| entry.command)
+        let undone = self.swap_in(entry, project);
+        self.redo.push(undone);
+        self.next_redo()
     }
 
     pub fn redo(&mut self, project: &mut Project) -> Option<Command> {
         let entry = self.redo.pop()?;
-        self.undo.push_back(swap_in(entry, project));
+        let redone = self.swap_in(entry, project);
+        self.undo.push_back(redone);
+        self.next_undo()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn next_undo(&self) -> Option<Command> {
         self.undo.back().map(|entry| entry.command)
     }
-}
 
-fn swap_in(entry: Entry, project: &mut Project) -> Entry {
-    let swapped_out = std::mem::replace(project, entry.project);
-    project.next_ids = project.next_ids.covering(swapped_out.next_ids);
-    Entry {
-        command: entry.command,
-        project: swapped_out,
+    pub fn next_redo(&self) -> Option<Command> {
+        self.redo.last().map(|entry| entry.command)
+    }
+
+    pub fn revision(&self) -> Revision {
+        self.current
+    }
+
+    pub fn mark_saved(&mut self, revision: Revision) {
+        self.saved = revision;
+    }
+
+    pub fn is_saved(&self) -> bool {
+        self.saved == self.current
+    }
+
+    fn swap_in(&mut self, entry: Entry, project: &mut Project) -> Entry {
+        let swapped_out = std::mem::replace(project, entry.project);
+        project.next_ids = project.next_ids.covering(swapped_out.next_ids);
+        let revision = std::mem::replace(&mut self.current, entry.revision);
+        Entry {
+            command: entry.command,
+            project: swapped_out,
+            revision,
+        }
     }
 }
 
@@ -128,6 +176,113 @@ mod tests {
         assert_eq!(history.redo(&mut project), Some(Command::AddTrack));
         assert_eq!(history.redo(&mut project), None);
         assert_eq!(track_count(&project), 4);
+    }
+
+    fn remove_track(history: &mut History, project: &mut Project, index: usize) {
+        history
+            .apply(Command::RemoveTrack, project, |project| {
+                project.timeline.remove_track(index)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn the_next_steps_are_named_before_they_are_taken() {
+        let mut history = History::default();
+        let mut project = Project::new("test");
+
+        assert!(!history.can_undo());
+        assert!(!history.can_redo());
+        assert_eq!(history.next_undo(), None);
+        assert_eq!(history.next_redo(), None);
+
+        add_track(&mut history, &mut project);
+        remove_track(&mut history, &mut project, 0);
+
+        assert!(history.can_undo());
+        assert_eq!(history.next_undo(), Some(Command::RemoveTrack));
+
+        history.undo(&mut project);
+
+        assert!(history.can_undo());
+        assert!(history.can_redo());
+        assert_eq!(history.next_undo(), Some(Command::AddTrack));
+        assert_eq!(history.next_redo(), Some(Command::RemoveTrack));
+
+        history.undo(&mut project);
+
+        assert!(!history.can_undo());
+        assert_eq!(history.next_redo(), Some(Command::AddTrack));
+    }
+
+    #[test]
+    fn the_saved_revision_is_found_again_by_undo_and_redo() {
+        let mut history = History::default();
+        let mut project = Project::new("test");
+
+        assert!(history.is_saved());
+
+        add_track(&mut history, &mut project);
+
+        assert!(!history.is_saved());
+
+        history.mark_saved(history.revision());
+        add_track(&mut history, &mut project);
+
+        assert!(!history.is_saved());
+
+        history.undo(&mut project);
+
+        assert!(history.is_saved());
+
+        history.undo(&mut project);
+
+        assert!(!history.is_saved());
+
+        history.redo(&mut project);
+
+        assert!(history.is_saved());
+
+        let _ = history.apply(Command::RemoveTrack, &mut project, |project| {
+            project.timeline.remove_track(99)
+        });
+
+        assert!(history.is_saved());
+    }
+
+    #[test]
+    fn a_new_command_after_undoing_past_the_save_never_returns_to_it() {
+        let mut history = History::default();
+        let mut project = Project::new("test");
+
+        add_track(&mut history, &mut project);
+        history.mark_saved(history.revision());
+        history.undo(&mut project);
+        add_track(&mut history, &mut project);
+
+        assert_eq!(project.timeline.tracks.len(), 3);
+        assert!(!history.is_saved());
+
+        history.undo(&mut project);
+
+        assert!(!history.is_saved());
+    }
+
+    #[test]
+    fn a_save_marks_the_revision_it_wrote_even_after_later_edits() {
+        let mut history = History::default();
+        let mut project = Project::new("test");
+
+        add_track(&mut history, &mut project);
+        let written = history.revision();
+        add_track(&mut history, &mut project);
+        history.mark_saved(written);
+
+        assert!(!history.is_saved());
+
+        history.undo(&mut project);
+
+        assert!(history.is_saved());
     }
 
     #[test]

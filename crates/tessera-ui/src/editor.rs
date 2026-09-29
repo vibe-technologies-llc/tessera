@@ -1,5 +1,5 @@
 use gpui::{App, AppContext, Entity};
-use tessera_timeline::{Command, History, Project};
+use tessera_timeline::{Command, History, Project, Revision};
 
 #[derive(Clone)]
 pub struct ProjectEditor {
@@ -19,6 +19,21 @@ impl ProjectEditor {
         &self.project
     }
 
+    pub fn history(&self) -> &Entity<History> {
+        &self.history
+    }
+
+    pub fn revision(&self, cx: &App) -> Revision {
+        self.history.read(cx).revision()
+    }
+
+    pub fn mark_saved(&self, revision: Revision, cx: &mut App) {
+        self.history.update(cx, |history, cx| {
+            history.mark_saved(revision);
+            cx.notify();
+        });
+    }
+
     pub fn apply<T, E>(
         &self,
         command: Command,
@@ -26,9 +41,11 @@ impl ProjectEditor {
         edit: impl FnOnce(&mut Project) -> Result<T, E>,
     ) -> Result<T, E> {
         self.project.update(cx, |project, cx| {
-            let edited = self
-                .history
-                .update(cx, |history, _| history.apply(command, project, edit));
+            let edited = self.history.update(cx, |history, cx| {
+                let edited = history.apply(command, project, edit);
+                cx.notify();
+                edited
+            });
             if edited.is_ok() {
                 cx.notify();
             }
@@ -49,8 +66,10 @@ impl ProjectEditor {
     }
 
     pub fn replace(&self, project: Project, cx: &mut App) {
-        self.history
-            .update(cx, |history, _| *history = History::default());
+        self.history.update(cx, |history, cx| {
+            *history = History::default();
+            cx.notify();
+        });
         self.project.update(cx, |current, cx| {
             *current = project;
             cx.notify();
@@ -72,7 +91,11 @@ impl ProjectEditor {
         step: impl FnOnce(&mut History, &mut Project) -> Option<Command>,
     ) {
         self.project.update(cx, |project, cx| {
-            let stepped = self.history.update(cx, |history, _| step(history, project));
+            let stepped = self.history.update(cx, |history, cx| {
+                let stepped = step(history, project);
+                cx.notify();
+                stepped
+            });
             if let Some(command) = stepped {
                 tracing::debug!(%command, "{done}");
                 cx.notify();

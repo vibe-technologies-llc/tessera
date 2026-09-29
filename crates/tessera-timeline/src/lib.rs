@@ -4,7 +4,7 @@ mod project;
 mod time;
 mod timecode;
 
-pub use history::{Command, HISTORY_DEPTH, History};
+pub use history::{Command, HISTORY_DEPTH, History, Revision};
 pub use media::{AudioStream, MediaInfo, Stream, VideoStream};
 pub use project::{
     Asset, AssetId, Clip, ClipEdge, ClipId, EditError, InsertError, InvalidClip, NextIds,

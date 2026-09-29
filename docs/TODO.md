@@ -13,8 +13,6 @@
 - Carry rotation, sample aspect ratio, pixel format, stream disposition and per-stream start time in
   `MediaInfo`, and let a clip choose which of several audio streams it plays
 - A `SetSequenceSettings` command for resolution, frame rate and sample rate
-- Expose `can_undo`, `can_redo`, the next command's name and a saved position on `History`, which
-  the dirty indicator and the unsaved-changes prompt both need
 - Share unchanged assets and tracks between undo snapshots instead of deep-cloning the whole project
   up to `HISTORY_DEPTH` times, and skip the clone and compare for edits that fail
 
@@ -33,7 +31,7 @@
   paths against the project's directory rather than the working directory
 - Refuse non-UTF-8 media paths at import or store them losslessly; such a project can never be saved
 - Confirm the overwrite when `.tessera` is appended to a name the save dialog approved without it
-- Save As, recent projects and a dirty indicator in the title bar
+- Save As and recent projects
 - Relink media that has moved or gone missing, and mark missing media in the bin
 - Autosave and recovery after a crash
 

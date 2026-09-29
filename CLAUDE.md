@@ -64,7 +64,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   of the project from before it when the edit succeeds and changes something, and rolls the project
   back when the edit fails. `undo` and `redo` swap those snapshots in, carrying the newer `NextIds`
   over so an undone clip or asset never gives its id out again. The stack keeps the last
-  `HISTORY_DEPTH` commands, and a new command clears the redo stack.
+  `HISTORY_DEPTH` commands, and a new command clears the redo stack. `can_undo`, `can_redo`,
+  `next_undo` and `next_redo` describe the next step before it is taken. Every project state the
+  history reaches gets a `Revision` never given out again, which undo and redo carry with their
+  snapshots; `mark_saved` records the revision a save wrote, so `is_saved` holds exactly when undo
+  and redo return to it.
 - **`tessera-document`** reads and writes project files (`.tessera`, `EXTENSION`): pretty JSON in
   an envelope `{ "format": "tessera-project", "version": N, "project": … }`, with times as integer
   flicks. The model stays serde-free: each format version has its own DTO module (`v1.rs`, aliased
@@ -145,7 +149,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   too. Never mutate the project entity directly. Ctrl+S saves to the file the project was last
   saved to or opened from, or asks for one (appending `.tessera`), and Ctrl+O opens one; the
   `Workspace` does the file IO on the background executor through `save_to` and `open_from`,
-  reports failures in a prompt, and titles the window after the file. Opening swaps the project
+  reports failures in a prompt, and titles the window after the file. A save marks the revision it snapshotted, not the one
+  current when it finishes, and the `Workspace` observes the history to mark the title (`• `)
+  while the project differs from that revision. Opening swaps the project
   into the existing entity through `ProjectEditor::replace`, which clears the history, and pauses
   the playhead at zero. Through their `project_replaced`, the timeline drops its selection and
   view, and the bin its pending imports and thumbnails before decoding the new assets' ones. Global

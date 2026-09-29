@@ -20,6 +20,8 @@ use crate::{
     window_title,
 };
 
+const UNSAVED_MARK: &str = "• ";
+
 pub struct Workspace {
     editor: ProjectEditor,
     focus_handle: FocusHandle,
@@ -36,6 +38,10 @@ impl Workspace {
         window.focus(&focus_handle);
         let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
         let editor = ProjectEditor::new(project.clone(), cx);
+        cx.observe_in(editor.history(), window, |workspace, _, window, cx| {
+            window.set_window_title(&workspace.title(cx));
+        })
+        .detach();
         Self {
             focus_handle,
             media_bin: cx.new(|cx| MediaBin::new(editor.clone(), cx)),
@@ -82,6 +88,7 @@ impl Workspace {
 
     pub fn save_to(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.project().read(cx).clone();
+        let revision = self.editor.revision(cx);
         let saving = cx.background_spawn({
             let path = path.clone();
             async move { tessera_document::save(&project, &path) }
@@ -91,6 +98,7 @@ impl Workspace {
             this.update_in(cx, |workspace, window, cx| match saved {
                 Ok(()) => {
                     tracing::info!(path = %path.display(), "saved the project");
+                    workspace.editor.mark_saved(revision, cx);
                     workspace.set_file(path, window, cx);
                 }
                 Err(error) => {
@@ -168,9 +176,14 @@ impl Workspace {
     }
 
     fn title(&self, cx: &App) -> String {
-        match &self.file {
-            Some(path) => window_title(&file_name(path)),
-            None => window_title(&self.project().read(cx).name),
+        let name = match &self.file {
+            Some(path) => file_name(path).to_string(),
+            None => self.project().read(cx).name.clone(),
+        };
+        if self.editor.history().read(cx).is_saved() {
+            window_title(&name)
+        } else {
+            window_title(&format!("{UNSAVED_MARK}{name}"))
         }
     }
 
@@ -457,6 +470,41 @@ mod tests {
         cx.simulate_keystrokes("ctrl-s");
         cx.run_until_parked();
         assert_eq!(tessera_document::open(&path).unwrap(), saved);
+    }
+
+    #[gpui::test]
+    fn the_title_marks_unsaved_changes_until_undo_or_redo_returns_to_the_save(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("saved-revision");
+        let path = dir.0.join("cut.tessera");
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let playhead = cx.read(|cx| workspace.read(cx).playhead.clone());
+
+        playhead.update(cx, |playhead, cx| playhead.seek(Time::from_seconds(4), cx));
+        cx.simulate_keystrokes("ctrl-k");
+
+        assert_eq!(cx.window_title().as_deref(), Some("• Cut — Tessera"));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_to(path.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cx.window_title().as_deref(), Some("cut.tessera — Tessera"));
+
+        cx.simulate_keystrokes("ctrl-z");
+
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some("• cut.tessera — Tessera")
+        );
+
+        cx.simulate_keystrokes("ctrl-shift-z");
+
+        assert_eq!(cx.window_title().as_deref(), Some("cut.tessera — Tessera"));
     }
 
     #[gpui::test]
