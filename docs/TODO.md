@@ -145,7 +145,6 @@
   the bin's import path and cross-track clip moves
 - Bring the README up to date: it says Tessera can't import or play video, lists five of the seven
   crates and leaves out `rust-formatter`
-- Correct CLAUDE.md, which has `tessera-render` depending on `tessera-timeline`
 
 ## Compositing
 

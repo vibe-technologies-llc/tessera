@@ -11,8 +11,8 @@ parse or keep stable.
 ## Architecture
 
 A Cargo workspace under `crates/`. Dependencies point one way:
-`tessera-timeline` ← `tessera-media`, `tessera-document`, `tessera-render`; `tessera-media` ←
-`tessera-audio`; all of them ← `tessera-ui` ← `tessera` (the binary).
+`tessera-timeline` ← `tessera-media`, `tessera-document`; `tessera-media` ← `tessera-audio`;
+`tessera-render` stands alone; all of them ← `tessera-ui` ← `tessera` (the binary).
 
 - **`tessera-timeline`** is the pure project model (`Project`, `Timeline`, `Track`, `Clip`,
   `Asset`). Each `Asset` carries its probed `MediaInfo` (duration and streams), so nothing outside
