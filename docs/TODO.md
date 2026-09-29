@@ -17,8 +17,6 @@
   the dirty indicator and the unsaved-changes prompt both need
 - Share unchanged assets and tracks between undo snapshots instead of deep-cloning the whole project
   up to `HISTORY_DEPTH` times, and skip the clone and compare for edits that fail
-- `Timecode` edge cases: `as u8` truncation above 255 fps, `abs` of `i64::MIN`, the untested
-  120000/1001 drop-frame rate, and parsing a typed timecode back into a time
 - Binary-search the sorted clips in `check_free_of_others` and the clip lookups
 
 ## Project files

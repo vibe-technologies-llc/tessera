@@ -11,4 +11,4 @@ pub use project::{
     OverlappingClip, Project, SequenceSettings, Timeline, Track, TrackKind,
 };
 pub use time::{FLICKS_PER_SECOND, FrameRate, Time, TimeRange};
-pub use timecode::Timecode;
+pub use timecode::{ParseTimecodeError, Timecode, TimecodeError, TimecodeField};

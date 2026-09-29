@@ -30,9 +30,14 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   conversions; `checked_add`, `checked_sub` and `TimeRange::checked_end` report an overflow instead.
   Nothing divides by zero: a `FrameRate` exists only through `FrameRate::new`, which refuses a zero
   numerator or denominator and a rate faster than one frame per flick, and sample rates and `Time::from_rational` denominators are `NonZero`.
-  `Timecode` labels a time at a frame rate, using drop-frame (`;` before the frames) for the
-  30000/1001 and 60000/1001 rates. `Time::from_samples` and `Time::to_samples` convert between
-  time and sample indices at a sample rate the same way, flooring, and every common audio rate from
+  `checked_frame_to_time` reports a frame whose start doesn't fit instead of saturating.
+  `Timecode` labels a time at a frame rate, using drop-frame (`;` before the frames) for every
+  x/1001 rate whose nominal rate is a multiple of 30 (29.97, 59.94, 119.88), which skips two labels
+  per 30 nominal frames at each minute but every tenth. Its frames field counts past 255 and its
+  hours reach the ends of `Time`. `Timecode` parses from text (`;` in it marks drop-frame), and
+  `to_time` turns one back into the start of its frame, refusing fields out of range, a separator
+  that doesn't match the rate, a dropped label and a time `Time` can't hold. `Time::from_samples`
+  and `Time::to_samples` convert between time and sample indices at a sample rate the same way, flooring, and every common audio rate from
   8 kHz to 192 kHz has an integral sample duration. `SequenceSettings` carries the project-wide
   `sample_rate`, 48 000 by default. A `Track` keeps its clips sorted by start. `Track::insert` (and
   `check_insert`, its non-mutating preview) refuses a clip that `Clip::check` finds invalid

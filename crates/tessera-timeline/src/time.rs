@@ -193,9 +193,19 @@ impl FrameRate {
     }
 
     pub fn frame_to_time(self, frame: i64) -> Time {
+        Time::saturated(self.frame_start_flicks(frame))
+    }
+
+    pub fn checked_frame_to_time(self, frame: i64) -> Option<Time> {
+        i64::try_from(self.frame_start_flicks(frame))
+            .ok()
+            .map(Time::from_flicks)
+    }
+
+    fn frame_start_flicks(self, frame: i64) -> i128 {
         let scaled =
             i128::from(frame) * i128::from(self.denominator()) * i128::from(FLICKS_PER_SECOND);
-        Time::saturated(ceiling_div(scaled, i128::from(self.numerator())))
+        ceiling_div(scaled, i128::from(self.numerator()))
     }
 
     pub fn time_to_frame(self, time: Time) -> i64 {
@@ -208,8 +218,8 @@ impl FrameRate {
         self.frame_to_time(self.time_to_frame(time))
     }
 
-    pub fn nominal_frames_per_second(self) -> i64 {
-        i64::from(self.numerator().div_ceil(self.denominator()))
+    pub const fn nominal_frames_per_second(self) -> u32 {
+        self.numerator().div_ceil(self.denominator())
     }
 
     pub fn as_f64(self) -> f64 {
@@ -549,6 +559,13 @@ mod tests {
         assert_eq!(fastest.frame_duration(), Time::from_flicks(1));
         assert_eq!(slowest.frame_to_time(i64::MAX), Time::MAX);
         assert_eq!(slowest.frame_to_time(i64::MIN), Time::MIN);
+        assert_eq!(slowest.checked_frame_to_time(i64::MAX), None);
+        assert_eq!(slowest.checked_frame_to_time(i64::MIN), None);
+        assert_eq!(fastest.checked_frame_to_time(i64::MIN), Some(Time::MIN));
+        assert_eq!(
+            slowest.checked_frame_to_time(1),
+            Some(slowest.frame_duration())
+        );
         assert_eq!(fastest.time_to_frame(Time::MAX), i64::MAX);
         assert_eq!(fastest.time_to_frame(Time::MIN), i64::MIN);
         assert_eq!(fastest.nominal_frames_per_second(), 705_600_000);
