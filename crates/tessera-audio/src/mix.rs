@@ -6,7 +6,7 @@ use std::{
 };
 
 use tessera_media::AudioDecoder;
-use tessera_timeline::{Clip, Project, Time, TrackKind};
+use tessera_timeline::{Clip, Project, Time, TimeRange, TrackKind};
 
 use crate::CHANNELS;
 
@@ -87,12 +87,13 @@ impl Mixer {
 
 fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) -> Vec<Span<'_>> {
     let end = first + frames as i64;
+    let block = time_touching_samples(first..end, sample_rate);
     project
         .timeline
         .tracks
         .iter()
         .filter(|track| track.kind == TrackKind::Audio)
-        .flat_map(|track| track.clips())
+        .flat_map(|track| track.clips_overlapping(block))
         .filter_map(|clip| {
             let path = &project.asset(clip.asset)?.path;
             let covered = clip_samples(clip, sample_rate);
@@ -109,6 +110,15 @@ fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) 
             })
         })
         .collect()
+}
+
+fn time_touching_samples(samples: Range<i64>, sample_rate: NonZeroU32) -> TimeRange {
+    let start = Time::from_samples(samples.start, sample_rate);
+    let last_flick_flooring_inside = Time::from_samples(samples.end, sample_rate);
+    TimeRange::new(
+        start,
+        last_flick_flooring_inside - start + Time::from_flicks(1),
+    )
 }
 
 fn clip_samples(clip: &Clip, sample_rate: NonZeroU32) -> Range<i64> {
@@ -195,6 +205,20 @@ mod tests {
             spans[0].frames,
             RATE.get() as usize / 2..RATE.get() as usize
         );
+    }
+
+    #[test]
+    fn a_clip_starting_on_the_flick_a_block_ends_at_still_sounds_its_first_sample() {
+        let (mut project, asset, track) = project_with_tone();
+        let rate = NonZeroU32::new(11).unwrap();
+        let block_end = Time::from_samples(1, rate);
+
+        project.place_clip(asset, track, block_end).unwrap();
+        let spans = spans(&project, rate, 0, 1);
+
+        assert_eq!(block_end.to_samples(rate), 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].frames, 0..1);
     }
 
     #[test]

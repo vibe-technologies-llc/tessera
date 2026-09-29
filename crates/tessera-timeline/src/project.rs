@@ -224,11 +224,10 @@ impl Track {
         clip.check()?;
         let inserted = clip.timeline_range();
         match self
-            .clips
+            .clips_overlapping(inserted)
             .iter()
-            .filter(|clip| Some(clip.id) != moving)
+            .find(|clip| Some(clip.id) != moving)
             .map(Clip::timeline_range)
-            .find(|existing| existing.overlaps(inserted))
         {
             Some(existing) => Err(OverlappingClip { inserted, existing }.into()),
             None => Ok(()),
@@ -240,6 +239,14 @@ impl Track {
         let index = self.clips.partition_point(|other| other.start < clip.start);
         self.clips.insert(index, clip);
         Ok(())
+    }
+
+    pub fn clips_overlapping(&self, range: TimeRange) -> &[Clip] {
+        let first = self
+            .clips
+            .partition_point(|clip| clip.timeline_range().end() <= range.start);
+        let past_last = self.clips.partition_point(|clip| clip.start < range.end());
+        &self.clips[first..past_last.max(first)]
     }
 
     pub fn clip(&self, id: ClipId) -> Option<&Clip> {
@@ -565,8 +572,10 @@ impl Project {
         let (track, _) = self.located_clip(id)?;
         let track = &mut self.timeline.tracks[track];
         let deleted = track.remove(id).ok_or(EditError::UnknownClip(id))?;
-        let end = deleted.timeline_range().end();
-        for later in track.clips.iter_mut().filter(|clip| clip.start >= end) {
+        let first_later = track
+            .clips
+            .partition_point(|clip| clip.start < deleted.timeline_range().end());
+        for later in &mut track.clips[first_later..] {
             later.start = later.start - deleted.source.duration;
         }
         Ok(deleted)
@@ -707,6 +716,28 @@ mod tests {
             project.find_clip(first).map(|(_, clip)| clip.start),
             Some(Time::ZERO)
         );
+    }
+
+    #[test]
+    fn overlapping_clips_are_those_sharing_time_with_the_range() {
+        let mut track = Track::new(TrackKind::Video);
+        for (start, duration) in [(0, 2), (2, 1), (5, 3), (10, 1)] {
+            track.insert(clip(start, duration)).unwrap();
+        }
+
+        for start in -1..12 {
+            for duration in -1..5 {
+                let range = TimeRange::new(Time::from_seconds(start), Time::from_seconds(duration));
+                let scanned: Vec<Clip> = track
+                    .clips()
+                    .iter()
+                    .filter(|clip| clip.timeline_range().overlaps(range))
+                    .copied()
+                    .collect();
+
+                assert_eq!(track.clips_overlapping(range), scanned, "{range:?}");
+            }
+        }
     }
 
     #[test]

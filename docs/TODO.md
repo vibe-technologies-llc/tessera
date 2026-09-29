@@ -17,7 +17,6 @@
   the dirty indicator and the unsaved-changes prompt both need
 - Share unchanged assets and tracks between undo snapshots instead of deep-cloning the whole project
   up to `HISTORY_DEPTH` times, and skip the clone and compare for edits that fail
-- Binary-search the sorted clips in `check_free_of_others` and the clip lookups
 
 ## Project files
 

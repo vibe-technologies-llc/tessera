@@ -39,7 +39,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   that doesn't match the rate, a dropped label and a time `Time` can't hold. `Time::from_samples`
   and `Time::to_samples` convert between time and sample indices at a sample rate the same way, flooring, and every common audio rate from
   8 kHz to 192 kHz has an integral sample duration. `SequenceSettings` carries the project-wide
-  `sample_rate`, 48 000 by default. A `Track` keeps its clips sorted by start. `Track::insert` (and
+  `sample_rate`, 48 000 by default. A `Track` keeps its clips sorted by start, and since they never
+  overlap, by end too, so `clip_at`, `clips_overlapping` and the overlap check on insert
+  binary-search them. `Track::insert` (and
   `check_insert`, its non-mutating preview) refuses a clip that `Clip::check` finds invalid
   (`InvalidClip`: no positive length, a timeline or source start before zero, or an end past
   `Time::MAX`) or that overlaps another. `Project::clip_for` builds the clip that would cover a
@@ -110,7 +112,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   discards up to the target.
 - **`tessera-audio`** plays the timeline's sound through PipeWire (`pipewire`, the only crate
   allowed to touch it). `Mixer::render` fills a block of interleaved stereo `f32` samples starting
-  at a timeline sample index: every clip on every audio track that overlaps the block is read
+  at a timeline sample index: every clip on every audio track that overlaps the block (`clips_overlapping`) is read
   from an `AudioDecoder` (one per media path, at the project's sample rate) and summed into its
   part of the block. A clip reads from its source start plus its offset into the clip, so blocks
   that follow each other continue in the source without seeking. Media that fails to open or
