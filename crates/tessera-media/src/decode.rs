@@ -1,5 +1,6 @@
 use std::{
     ffi::c_int,
+    num::{NonZeroI32, NonZeroI64},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -45,7 +46,7 @@ pub struct VideoDecoder {
     path: PathBuf,
     input: format::context::Input,
     stream_index: usize,
-    time_base: Rational,
+    time_base: TimeBase,
     start: i64,
     decoder: decoder::Video,
     hw_accel: Option<HwAccel>,
@@ -93,7 +94,7 @@ impl VideoDecoder {
             .best(media::Type::Video)
             .ok_or_else(|| Error::NoVideo { path: path.clone() })?;
         let stream_index = stream.index();
-        let time_base = stream.time_base();
+        let time_base = TimeBase::of(&stream, &path)?;
         let start = match stream.start_time() {
             AV_NOPTS_VALUE => 0,
             start => start,
@@ -173,10 +174,9 @@ impl VideoDecoder {
                 });
             }
         };
-        let frame_time = from_stream_ts(
-            pts(frame).unwrap_or(self.start) - self.start,
-            self.time_base,
-        );
+        let frame_time = self
+            .time_base
+            .to_time(pts(frame).unwrap_or(self.start) - self.start);
         let converted = Arc::new(self.converter.convert(frame, frame_time)?);
         if let Some((start, end)) = span {
             self.cache.insert(start..end, converted.clone());
@@ -185,7 +185,7 @@ impl VideoDecoder {
     }
 
     fn stream_ts(&self, time: Time) -> i64 {
-        self.start + to_stream_ts(time, self.time_base)
+        self.start + self.time_base.to_ts(time)
     }
 
     fn needs_seek(&self, target: i64) -> bool {
@@ -200,7 +200,7 @@ impl VideoDecoder {
         }
         match self.keyframe_at_or_before(target) {
             Some(keyframe) => keyframe > position,
-            None => target - position > to_stream_ts(UNINDEXED_FORWARD_WINDOW, self.time_base),
+            None => target - position > self.time_base.to_ts(UNINDEXED_FORWARD_WINDOW),
         }
     }
 
@@ -218,7 +218,7 @@ impl VideoDecoder {
     }
 
     fn seek(&mut self, target: i64) -> Result<(), Error> {
-        let seek_ts = target.rescale(self.time_base, rescale::TIME_BASE);
+        let seek_ts = target.rescale(self.time_base.rational(), rescale::TIME_BASE);
         self.input
             .seek(seek_ts, ..seek_ts)
             .map_err(|source| Error::Seek {
@@ -416,17 +416,49 @@ fn fitted_size(width: u32, height: u32, bounds: Option<(u32, u32)>) -> (u32, u32
     (fitted.0.max(1) as u32, fitted.1.max(1) as u32)
 }
 
-pub(crate) fn to_stream_ts(time: Time, time_base: Rational) -> i64 {
-    let numerator = i128::from(time.flicks()) * i128::from(time_base.denominator());
-    let denominator = i128::from(time_base.numerator()) * i128::from(FLICKS_PER_SECOND);
-    numerator.div_euclid(denominator) as i64
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TimeBase {
+    numerator: NonZeroI32,
+    denominator: NonZeroI32,
 }
 
-pub(crate) fn from_stream_ts(ts: i64, time_base: Rational) -> Time {
-    Time::from_rational(
-        ts * i64::from(time_base.numerator()),
-        i64::from(time_base.denominator()),
-    )
+impl TimeBase {
+    pub(crate) fn of(stream: &format::stream::Stream, path: &Path) -> Result<Self, Error> {
+        let time_base = stream.time_base();
+        Self::new(time_base).ok_or_else(|| Error::InvalidTimeBase {
+            path: path.to_owned(),
+            index: stream.index(),
+            numerator: time_base.numerator(),
+            denominator: time_base.denominator(),
+        })
+    }
+
+    fn new(time_base: Rational) -> Option<Self> {
+        let positive = |part| NonZeroI32::new(part).filter(|part| part.is_positive());
+        Some(Self {
+            numerator: positive(time_base.numerator())?,
+            denominator: positive(time_base.denominator())?,
+        })
+    }
+
+    pub(crate) fn rational(self) -> Rational {
+        Rational::new(self.numerator.get(), self.denominator.get())
+    }
+
+    pub(crate) fn to_ts(self, time: Time) -> i64 {
+        let scaled = i128::from(time.flicks()) * i128::from(self.denominator.get());
+        let per_tick = i128::from(self.numerator.get()) * i128::from(FLICKS_PER_SECOND);
+        scaled
+            .div_euclid(per_tick)
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+
+    pub(crate) fn to_time(self, ts: i64) -> Time {
+        Time::from_rational(
+            ts.saturating_mul(i64::from(self.numerator.get())),
+            NonZeroI64::from(self.denominator),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -710,11 +742,29 @@ mod tests {
 
     #[test]
     fn stream_timestamps_round_trip() {
-        let time_base = Rational::new(1, 90_000);
+        let time_base = TimeBase::new(Rational::new(1, 90_000)).unwrap();
         let time = FrameRate::NTSC_30.frame_to_time(1234);
-        let ts = to_stream_ts(time, time_base);
+        let ts = time_base.to_ts(time);
         assert_eq!(ts, 1234 * 3003);
-        assert_eq!(from_stream_ts(ts, time_base), time);
+        assert_eq!(time_base.to_time(ts), time);
+        assert_eq!(time_base.rational(), Rational::new(1, 90_000));
+    }
+
+    #[test]
+    fn time_bases_need_positive_parts() {
+        for (numerator, denominator) in [(0, 1), (1, 0), (-1, 1000), (1, -1000), (0, 0)] {
+            assert_eq!(TimeBase::new(Rational::new(numerator, denominator)), None);
+        }
+    }
+
+    #[test]
+    fn stream_timestamps_saturate() {
+        let time_base = TimeBase::new(Rational::new(1, i32::MAX)).unwrap();
+        let coarse = TimeBase::new(Rational::new(i32::MAX, 1)).unwrap();
+        assert_eq!(time_base.to_ts(Time::MAX), i64::MAX);
+        assert_eq!(time_base.to_ts(Time::MIN), i64::MIN);
+        assert_eq!(coarse.to_time(i64::MAX), Time::MAX);
+        assert_eq!(coarse.to_time(i64::MIN), Time::MIN);
     }
 
     #[test]

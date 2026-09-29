@@ -36,6 +36,8 @@ impl SnapTargets {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroI64;
+
     use tessera_timeline::{AssetId, Clip, TimeRange, Track, TrackKind};
 
     use super::*;
@@ -45,7 +47,7 @@ mod tests {
     }
 
     fn millis(value: i64) -> Time {
-        Time::from_rational(value, 1000)
+        Time::from_rational(value, NonZeroI64::new(1000).unwrap())
     }
 
     fn timeline() -> Timeline {

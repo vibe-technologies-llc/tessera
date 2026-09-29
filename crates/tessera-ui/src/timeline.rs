@@ -955,6 +955,8 @@ fn ruler_step(pixels_per_second: f32, frame_rate: FrameRate) -> RulerStep {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroI64;
+
     use gpui::{Modifiers, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext};
     use tessera_timeline::{MediaInfo, Stream, VideoStream};
 
@@ -1136,7 +1138,7 @@ mod tests {
         drag(cx, at(5.), at(5. - 0.05));
         assert_eq!(
             clip_of(&panel, cx, clips[0]).start,
-            FrameRate::FPS_30.frame_start(Time::from_rational(395, 100))
+            FrameRate::FPS_30.frame_start(Time::from_rational(395, NonZeroI64::new(100).unwrap()))
         );
     }
 

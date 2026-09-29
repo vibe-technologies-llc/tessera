@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+};
 
 use ffmpeg_next::{
     ChannelLayout, Dictionary, Packet, Rational, codec, encoder,
@@ -11,7 +14,7 @@ pub const WIDTH: u32 = 128;
 pub const HEIGHT: u32 = 96;
 pub const FRAME_COUNT: i64 = 20;
 pub const FRAME_RATE: FrameRate = FrameRate::FPS_25;
-pub const AUDIO_SAMPLE_RATE: u32 = 44_100;
+pub const AUDIO_SAMPLE_RATE: NonZeroU32 = NonZeroU32::new(44_100).unwrap();
 pub const AUDIO_CHANNELS: u16 = 1;
 const AUDIO_FORMAT: format::Sample = format::Sample::I16(sample::Type::Packed);
 const KEYFRAME_INTERVAL: u32 = 5;
@@ -28,7 +31,7 @@ pub fn audio_level(index: i64) -> f32 {
     0.04 * (index + 1) as f32
 }
 
-pub fn audio_frame_start(index: i64, sample_rate: u32) -> i64 {
+pub fn audio_frame_start(index: i64, sample_rate: NonZeroU32) -> i64 {
     FRAME_RATE.frame_to_time(index).to_samples(sample_rate)
 }
 
@@ -171,7 +174,10 @@ fn add_video(
     output: &mut format::context::Output,
     video_codec: VideoCodec,
 ) -> Result<Muxed<encoder::video::Encoder>, ffmpeg_next::Error> {
-    let time_base = Rational::new(FRAME_RATE.denominator as i32, FRAME_RATE.numerator as i32);
+    let time_base = Rational::new(
+        FRAME_RATE.denominator() as i32,
+        FRAME_RATE.numerator() as i32,
+    );
     let (codec, options) = match video_codec {
         VideoCodec::Mpeg4 => (
             encoder::find(codec::Id::MPEG4),
@@ -206,10 +212,10 @@ fn add_video(
 fn add_audio(
     output: &mut format::context::Output,
 ) -> Result<Muxed<encoder::audio::Encoder>, ffmpeg_next::Error> {
-    let time_base = Rational::new(1, AUDIO_SAMPLE_RATE as i32);
+    let time_base = Rational::new(1, AUDIO_SAMPLE_RATE.get() as i32);
     let codec = encoder::find(codec::Id::PCM_S16LE).ok_or(ffmpeg_next::Error::EncoderNotFound)?;
     let mut audio = codec::Context::new_with_codec(codec).encoder().audio()?;
-    audio.set_rate(AUDIO_SAMPLE_RATE as i32);
+    audio.set_rate(AUDIO_SAMPLE_RATE.get() as i32);
     audio.set_channel_layout(audio_layout());
     audio.set_format(AUDIO_FORMAT);
     audio.set_time_base(time_base);
@@ -244,7 +250,7 @@ fn audio_block(index: i64) -> frame::Audio {
     let end = audio_frame_start(index + 1, AUDIO_SAMPLE_RATE);
     let samples = usize::try_from(end - start).expect("fixture frames move forward");
     let mut block = frame::Audio::new(AUDIO_FORMAT, samples, audio_layout());
-    block.set_rate(AUDIO_SAMPLE_RATE);
+    block.set_rate(AUDIO_SAMPLE_RATE.get());
     let level = (audio_level(index) * f32::from(i16::MAX)).round() as i16;
     block.plane_mut::<i16>(0).fill(level);
     block.set_pts(Some(start));

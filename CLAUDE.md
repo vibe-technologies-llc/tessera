@@ -20,33 +20,39 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   depends only on `thiserror`. Time is `Time(i64)` in flicks (1/705 600 000 s). Every common frame
   rate, the NTSC 1000/1001 rates included, has an integral frame duration in flicks, so frame ↔ time
   conversion through `FrameRate` stays exact. Never store time as floating-point seconds;
-  `as_seconds_f64` exists only for drawing. `Timecode` labels a time at a frame rate, using
-  drop-frame (`;` before the frames) for the 30000/1001 and 60000/1001 rates. `Time::from_samples`
-  and `Time::to_samples` convert between time and sample indices at a sample rate the same way,
-  flooring, and every common audio rate from 8 kHz to 192 kHz has an integral sample duration.
-  `SequenceSettings` carries the project-wide `sample_rate`, 48 000 by default. A `Track` keeps its
-  clips sorted by start and refuses overlapping inserts. `Project::clip_for` builds the clip that
-  would cover a whole asset at a start time on a track, checking the stream kind, the duration and
-  overlaps without mutating, and `Project::place_clip` inserts it. Every clip carries a `ClipId`
-  unique in the project. Asset and clip ids come from the project's `NextIds` counters, which only
-  move forward: `clip_for` previews with the next clip id without taking it, `place_clip`,
-  `split_clip` and `add_asset` take one, and deleting a clip never frees its id. Moves and trims
-  follow the same pair of calls: `moved_clip` and `trimmed_clip` compute the result without
-  mutating, while `move_clip` and `trim_clip` apply it. A move is refused where it would overlap or
-  where the target track's kind has no matching stream. A trim is clamped instead, between the
-  neighbouring clips, the ends of the media and a minimum length of one frame. `split_clip` cuts a
-  clip strictly inside it, keeping the id on the head and giving the tail a new one.
-  `ripple_delete_clip` pulls the later clips on the same track back by the deleted clip's length,
-  while `delete_clip` leaves a gap. `Timeline::add_track` inserts a track after the last one of its
-  kind. `remove_track` only takes an empty track that isn't the last of its kind, and `swap_tracks`
-  only swaps tracks of the same kind. Later video tracks sit on top of earlier ones, so
-  `Timeline::video_clips_at` lists the video clips under a time from the bottom track up, the order
-  they composite in, and `top_video_clip_at` is its last. `History` is the undo stack:
-  `History::apply` runs one edit as a `Command`, keeps a snapshot of the project from before it when
-  the edit succeeds and changes something, and rolls the project back when the edit fails. `undo`
-  and `redo` swap those snapshots in, carrying the newer `NextIds` over so an undone clip or asset
-  never gives its id out again. The stack keeps the last `HISTORY_DEPTH` commands, and a new command
-  clears the redo stack.
+  `as_seconds_f64` exists only for drawing. `Time` arithmetic saturates at `Time::MIN` and
+  `Time::MAX` instead of wrapping or panicking, and so do the frame, sample and rational
+  conversions; `checked_add`, `checked_sub` and `TimeRange::checked_end` report an overflow instead.
+  Nothing divides by zero: a `FrameRate` exists only through `FrameRate::new`, which refuses a zero
+  numerator or denominator, and sample rates and `Time::from_rational` denominators are `NonZero`.
+  `Timecode` labels a time at a frame rate, using drop-frame (`;` before the frames) for the
+  30000/1001 and 60000/1001 rates. `Time::from_samples` and `Time::to_samples` convert between
+  time and sample indices at a sample rate the same way, flooring, and every common audio rate from
+  8 kHz to 192 kHz has an integral sample duration. `SequenceSettings` carries the project-wide
+  `sample_rate`, 48 000 by default. A `Track` keeps its clips sorted by start. `Track::insert` (and
+  `check_insert`, its non-mutating preview) refuses a clip that `Clip::check` finds invalid
+  (`InvalidClip`: no positive length, a timeline or source start before zero, or an end past
+  `Time::MAX`) or that overlaps another. `Project::clip_for` builds the clip that would cover a
+  whole asset at a start time on a track, checking the stream kind, the duration and the insert
+  without mutating, and `Project::place_clip` inserts it. Every clip carries a `ClipId` unique in
+  the project. Asset and clip ids come from the project's `NextIds` counters, which only move
+  forward: `clip_for` previews with the next clip id without taking it, `place_clip`, `split_clip`
+  and `add_asset` take one, and deleting a clip never frees its id. Moves and trims follow the same
+  pair of calls: `moved_clip` and `trimmed_clip` compute the result without mutating, while
+  `move_clip` and `trim_clip` apply it. A move is refused where it would overlap or where the target
+  track's kind has no matching stream. A trim is clamped instead, between the neighbouring clips,
+  the ends of the media and a minimum length of one frame. `split_clip` cuts a clip strictly inside
+  it, keeping the id on the head and giving the tail a new one. `ripple_delete_clip` pulls the later
+  clips on the same track back by the deleted clip's length, while `delete_clip` leaves a gap.
+  `Timeline::add_track` inserts a track after the last one of its kind. `remove_track` only takes an
+  empty track that isn't the last of its kind, and `swap_tracks` only swaps tracks of the same kind.
+  Later video tracks sit on top of earlier ones, so `Timeline::video_clips_at` lists the video clips
+  under a time from the bottom track up, the order they composite in, and `top_video_clip_at` is its
+  last. `History` is the undo stack: `History::apply` runs one edit as a `Command`, keeps a snapshot
+  of the project from before it when the edit succeeds and changes something, and rolls the project
+  back when the edit fails. `undo` and `redo` swap those snapshots in, carrying the newer `NextIds`
+  over so an undone clip or asset never gives its id out again. The stack keeps the last
+  `HISTORY_DEPTH` commands, and a new command clears the redo stack.
 - **`tessera-document`** reads and writes project files (`.tessera`, `EXTENSION`): pretty JSON in
   an envelope `{ "format": "tessera-project", "version": N, "project": … }`, with times as integer
   flicks. The model stays serde-free: each format version has its own DTO module (`v1.rs`, aliased
@@ -55,31 +61,32 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   source version, so a new version appends a step, and `CURRENT_VERSION` follows its length) and
   then deserializes the current DTO. While Tessera is in early development the format stays at
   version 1 and changes break it in place, fixture included, instead of adding a migration step.
-  Rebuilding the `Project` validates rather than trusts: clips go through `Track::insert`, and ids
-  (unique, and each below the stored next id), assets, stream kinds, clip ranges, rates and one
-  track of each kind are checked, each failure a distinct `ValidationError`. `to_string` and
-  `from_str` are pure; `save` writes a synced sibling temp file and renames it over the target,
-  and `open` and `save` errors carry the path. A fixture in `fixtures/v1.tessera` pins the v1
-  format.
+  Rebuilding the `Project` validates rather than trusts: clips go through `Clip::check` and
+  `Track::insert`, and ids (unique, and each below the stored next id), assets, stream kinds, clip
+  ranges, rates and one track of each kind are checked, each failure a distinct `ValidationError`.
+  `to_string` and `from_str` are pure; `save` writes a synced sibling temp file and renames it over
+  the target, and `open` and `save` errors carry the path. A fixture in `fixtures/v1.tessera` pins
+  the v1 format.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
   here. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
   byte-bounded LRU cache keyed by the span each frame covers. FFmpeg types do not cross its public
-  API, apart from the `FfmpegError` re-export. `VideoDecoder` is `Send` so it can move to a
-  background task: ffmpeg-next leaves its scaler context `!Send`, but an `SwsContext` has no thread
-  affinity and each one is owned by a single decoder, so `Scaler` implements `Send` by hand.
-  `VideoDecoder::open` decodes in hardware through the first of `PREFERRED_HW_ACCELS` (VAAPI, then
-  Vulkan Video) that the codec has a device config for and whose device can be created;
-  `open_with` takes the list, and an empty one decodes in software. Each device is created once
-  per process and shared by every decoder, and a failed creation is remembered too. FFmpeg's
-  default `get_format` picks the hardware format, and falls back to software by itself when the
-  hardware refuses the stream (a codec profile or size the driver lacks), so `hw_accel` reports
-  the accelerator only while decoded frames really come from it. Frames stay on the GPU while
-  decoding forward, with `extra_hw_frames` covering the two the decoder holds, and only the frame
-  being shown is downloaded (`av_hwframe_transfer_data`) before scaling to BGRA. The scaler
-  converts YUV to full-range RGB with the frame's tagged matrix and range
-  (`sws_setColorspaceDetails`, read before the download), reading an untagged matrix as BT.709
+  API, apart from the `FfmpegError` re-export. A decoder refuses a stream whose time base has a
+  part that isn't positive (`InvalidTimeBase`), and converts through the checked `TimeBase`.
+  `VideoDecoder` is `Send` so it can move to a background task: ffmpeg-next leaves its scaler
+  context `!Send`, but an `SwsContext` has no thread affinity and each one is owned by a single
+  decoder, so `Scaler` implements `Send` by hand. `VideoDecoder::open` decodes in hardware through
+  the first of `PREFERRED_HW_ACCELS` (VAAPI, then Vulkan Video) that the codec has a device config
+  for and whose device can be created; `open_with` takes the list, and an empty one decodes in
+  software. Each device is created once per process and shared by every decoder, and a failed
+  creation is remembered too. FFmpeg's default `get_format` picks the hardware format, and falls
+  back to software by itself when the hardware refuses the stream (a codec profile or size the
+  driver lacks), so `hw_accel` reports the accelerator only while decoded frames really come from
+  it. Frames stay on the GPU while decoding forward, with `extra_hw_frames` covering the two the
+  decoder holds, and only the frame being shown is downloaded (`av_hwframe_transfer_data`) before
+  scaling to BGRA. The scaler converts YUV to full-range RGB with the frame's tagged matrix and
+  range (`sws_setColorspaceDetails`, read before the download), reading an untagged matrix as BT.709
   from 1280×720 up and BT.601 below, and a `yuvj` format as full range. The test fixture
   is 128×96 so hardware accepts it, and an H.264 variant, generated when `libx264` is present, runs
   the decode tests through the preferred accelerators against software.

@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io::Cursor,
     iter,
+    num::NonZeroU32,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -36,7 +37,7 @@ const FEEDER_THREAD_NAME: &str = "tessera-audio-feeder";
 
 pub struct Output {
     shared: Arc<Shared>,
-    sample_rate: u32,
+    sample_rate: NonZeroU32,
     quit: pw::channel::Sender<()>,
     stream_thread: Option<JoinHandle<()>>,
 }
@@ -70,7 +71,7 @@ type Ready = mpsc::Sender<Result<(), Error>>;
 
 impl Output {
     pub fn start(
-        sample_rate: u32,
+        sample_rate: NonZeroU32,
         mut source: impl FnMut(&mut [f32]) + Send + 'static,
     ) -> Result<Self, Error> {
         let shared = Arc::new(Shared {
@@ -108,7 +109,7 @@ impl Output {
         Ok(output)
     }
 
-    pub fn sample_rate(&self) -> u32 {
+    pub fn sample_rate(&self) -> NonZeroU32 {
         self.sample_rate
     }
 
@@ -146,7 +147,7 @@ impl Clock {
         self.consumed += taken as i64;
     }
 
-    fn position(&mut self, now: Instant, sample_rate: u32) -> i64 {
+    fn position(&mut self, now: Instant, sample_rate: NonZeroU32) -> i64 {
         let Some(anchor) = self.anchor else {
             return self.reported;
         };
@@ -157,7 +158,7 @@ impl Clock {
     }
 }
 
-fn feed(shared: &Shared, sample_rate: u32, source: &mut impl FnMut(&mut [f32])) {
+fn feed(shared: &Shared, sample_rate: NonZeroU32, source: &mut impl FnMut(&mut [f32])) {
     let ahead = Time::from_duration(QUEUED_AHEAD).to_samples(sample_rate) as usize * CHANNELS;
     let mut block = vec![0.0; BLOCK_FRAMES * CHANNELS];
     loop {
@@ -180,7 +181,7 @@ fn feed(shared: &Shared, sample_rate: u32, source: &mut impl FnMut(&mut [f32])) 
 
 fn run_stream(
     shared: Arc<Shared>,
-    sample_rate: u32,
+    sample_rate: NonZeroU32,
     quit: pw::channel::Receiver<()>,
     ready: &Ready,
 ) -> Result<(), Error> {
@@ -220,10 +221,10 @@ fn run_stream(
     Ok(())
 }
 
-fn format_pod(sample_rate: u32) -> Result<Vec<u8>, Error> {
+fn format_pod(sample_rate: NonZeroU32) -> Result<Vec<u8>, Error> {
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
-    info.set_rate(sample_rate);
+    info.set_rate(sample_rate.get());
     info.set_channels(CHANNELS as u32);
     let mut position = [0; MAX_CHANNELS];
     position[..CHANNELS].copy_from_slice(&[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR]);
@@ -238,7 +239,7 @@ fn format_pod(sample_rate: u32) -> Result<Vec<u8>, Error> {
         .map_err(|error| Error::Format(format!("{error:?}")))
 }
 
-fn process(stream: &Stream, shared: &Shared, sample_rate: u32) {
+fn process(stream: &Stream, shared: &Shared, sample_rate: NonZeroU32) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
@@ -269,12 +270,12 @@ fn process(stream: &Stream, shared: &Shared, sample_rate: u32) {
     *chunk.size_mut() = (frames * FRAME_BYTES) as u32;
 }
 
-fn device_delay_frames(time: &pw::stream::Time, sample_rate: u32) -> i64 {
+fn device_delay_frames(time: &pw::stream::Time, sample_rate: NonZeroU32) -> i64 {
     let rate = time.rate();
     let graph_delay = match rate.denom {
         0 => 0,
         denom => {
-            i128::from(time.delay()) * i128::from(rate.num) * i128::from(sample_rate)
+            i128::from(time.delay()) * i128::from(rate.num) * i128::from(sample_rate.get())
                 / i128::from(denom)
         }
     };
@@ -296,7 +297,7 @@ fn fill(queue: &mut VecDeque<f32>, bytes: &mut [u8]) -> usize {
 mod tests {
     use super::*;
 
-    const RATE: u32 = 48_000;
+    const RATE: NonZeroU32 = NonZeroU32::new(48_000).unwrap();
 
     fn decoded(bytes: &[u8]) -> Vec<f32> {
         let (samples, _) = bytes.as_chunks::<SAMPLE_BYTES>();

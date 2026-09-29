@@ -49,6 +49,15 @@ pub enum Error {
         #[source]
         source: FfmpegError,
     },
+    #[error(
+        "stream {index} of {path} has the time base {numerator}/{denominator}, which is not positive"
+    )]
+    InvalidTimeBase {
+        path: std::path::PathBuf,
+        index: usize,
+        numerator: i32,
+        denominator: i32,
+    },
     #[error("no video frame could be decoded from {path}")]
     NoFrame { path: std::path::PathBuf },
 }

@@ -1,8 +1,5 @@
 ## Model
 
-- Check `Time`, `TimeRange::end` and `FrameRate` arithmetic for overflow and zero denominators, and
-  validate clips in `Track::insert` (positive duration, non-negative start) instead of relying on
-  `tessera-document` to have done it
 - Link the video and audio clips placed from one asset, so one drop places both and move, trim,
   split, delete and ripple delete keep them in sync (`ripple_delete_clip` shifts only its own track)
 - Edit several clips in one command (move, delete, ripple delete) for multi-selection
@@ -33,8 +30,6 @@
 - Give each save its own temp file (`create_new`) and serialise saves and opens: two quick Ctrl+S
   share `.{name}.{pid}.tmp`, so one truncates the other or fails its rename, and an older snapshot
   or a slow open can land after newer edits
-- Reject clip times whose sums overflow when loading, instead of panicking in debug and
-  wrapping to negative ends in release
 - Fsync the parent directory after the rename, and save through a symlink to its target while
   keeping the file's permissions
 - Validate sequence and stream width, height, sample rate and channels, negative asset durations and

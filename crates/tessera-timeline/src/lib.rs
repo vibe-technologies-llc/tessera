@@ -7,8 +7,8 @@ mod timecode;
 pub use history::{Command, HISTORY_DEPTH, History};
 pub use media::{AudioStream, MediaInfo, Stream, VideoStream};
 pub use project::{
-    Asset, AssetId, Clip, ClipEdge, ClipId, EditError, NextIds, OverlappingClip, Project,
-    SequenceSettings, Timeline, Track, TrackKind,
+    Asset, AssetId, Clip, ClipEdge, ClipId, EditError, InsertError, InvalidClip, NextIds,
+    OverlappingClip, Project, SequenceSettings, Timeline, Track, TrackKind,
 };
 pub use time::{FLICKS_PER_SECOND, FrameRate, Time, TimeRange};
 pub use timecode::Timecode;

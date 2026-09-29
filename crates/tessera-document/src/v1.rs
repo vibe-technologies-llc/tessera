@@ -1,8 +1,9 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, num::NonZeroU32, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
-    self as model, AssetId, ClipId, FrameRate, MediaInfo, NextIds, Time, TimeRange, Timeline,
+    self as model, AssetId, ClipId, FrameRate, InsertError, MediaInfo, NextIds, Time, TimeRange,
+    Timeline,
 };
 
 use crate::{FormatError, ValidationError};
@@ -110,7 +111,7 @@ impl From<model::SequenceSettings> for SequenceSettings {
             width: settings.width,
             height: settings.height,
             frame_rate: settings.frame_rate.into(),
-            sample_rate: settings.sample_rate,
+            sample_rate: settings.sample_rate.get(),
         }
     }
 }
@@ -118,8 +119,8 @@ impl From<model::SequenceSettings> for SequenceSettings {
 impl From<FrameRate> for Rational {
     fn from(rate: FrameRate) -> Self {
         Self {
-            numerator: rate.numerator,
-            denominator: rate.denominator,
+            numerator: rate.numerator(),
+            denominator: rate.denominator(),
         }
     }
 }
@@ -275,22 +276,20 @@ impl TryFrom<SequenceSettings> for model::SequenceSettings {
                     numerator,
                     denominator,
                 })?;
-        if settings.sample_rate == 0 {
-            return Err(ValidationError::ZeroSampleRate);
-        }
+        let sample_rate =
+            NonZeroU32::new(settings.sample_rate).ok_or(ValidationError::ZeroSampleRate)?;
         Ok(Self {
             width: settings.width,
             height: settings.height,
             frame_rate,
-            sample_rate: settings.sample_rate,
+            sample_rate,
         })
     }
 }
 
 impl Rational {
     fn positive(self) -> Option<FrameRate> {
-        (self.numerator > 0 && self.denominator > 0)
-            .then(|| FrameRate::new(self.numerator, self.denominator))
+        FrameRate::new(self.numerator, self.denominator)
     }
 }
 
@@ -359,12 +358,13 @@ impl Track {
         let mut track = model::Track::new(self.kind.into());
         for clip in self.clips {
             let clip = clip.rebuilt(project, track.kind)?;
-            track
-                .insert(clip)
-                .map_err(|source| ValidationError::Overlapping {
+            track.insert(clip).map_err(|refused| match refused {
+                InsertError::Invalid(invalid) => ValidationError::InvalidClip(invalid),
+                InsertError::Overlapping(source) => ValidationError::Overlapping {
                     clip: clip.id,
                     source,
-                })?;
+                },
+            })?;
         }
         Ok(track)
     }
@@ -398,12 +398,7 @@ impl Clip {
                 kind,
             });
         }
-        if clip.source.duration <= Time::ZERO {
-            return Err(ValidationError::EmptyClip(clip.id));
-        }
-        if clip.start < Time::ZERO || clip.source.start < Time::ZERO {
-            return Err(ValidationError::NegativeTime(clip.id));
-        }
+        clip.check()?;
         if asset
             .info
             .duration
@@ -421,7 +416,10 @@ impl Clip {
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
-    use tessera_timeline::TrackKind::{Audio, Video};
+    use tessera_timeline::{
+        InvalidClip,
+        TrackKind::{Audio, Video},
+    };
 
     use super::*;
 
@@ -616,15 +614,15 @@ mod tests {
     fn clips_must_have_a_length_and_lie_within_their_media() {
         assert_eq!(
             refused(|document| document["tracks"][0]["clips"][1] = clip(1, 4, 4, 4, 0)),
-            ValidationError::EmptyClip(ClipId(1))
+            ValidationError::InvalidClip(InvalidClip::Empty(ClipId(1)))
         );
         assert_eq!(
             refused(|document| document["tracks"][0]["clips"][0] = clip(0, 4, -1, 0, 1)),
-            ValidationError::NegativeTime(ClipId(0))
+            ValidationError::InvalidClip(InvalidClip::NegativeTime(ClipId(0)))
         );
         assert_eq!(
             refused(|document| document["tracks"][0]["clips"][0] = clip(0, 4, 0, -1, 4)),
-            ValidationError::NegativeTime(ClipId(0))
+            ValidationError::InvalidClip(InvalidClip::NegativeTime(ClipId(0)))
         );
         assert_eq!(
             refused(|document| document["tracks"][0]["clips"][1] = clip(1, 4, 4, 5, 6)),
@@ -632,6 +630,28 @@ mod tests {
                 clip: ClipId(1),
                 asset: AssetId(4)
             }
+        );
+    }
+
+    #[test]
+    fn clip_times_must_not_overflow_when_summed() {
+        assert_eq!(
+            refused(|document| {
+                document["tracks"][1]["clips"][0]["start_flicks"] = json!(i64::MAX - SECOND);
+            }),
+            ValidationError::InvalidClip(InvalidClip::EndOverflows(ClipId(2)))
+        );
+        assert_eq!(
+            refused(|document| {
+                document["tracks"][1]["clips"][0]["source_start_flicks"] = json!(i64::MAX - SECOND);
+            }),
+            ValidationError::InvalidClip(InvalidClip::EndOverflows(ClipId(2)))
+        );
+        assert_eq!(
+            refused(|document| {
+                document["tracks"][0]["clips"][1]["source_start_flicks"] = json!(i64::MAX - SECOND);
+            }),
+            ValidationError::InvalidClip(InvalidClip::EndOverflows(ClipId(1)))
         );
     }
 

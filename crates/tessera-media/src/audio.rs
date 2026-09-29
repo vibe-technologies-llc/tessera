@@ -1,10 +1,11 @@
 use std::{
     collections::VecDeque,
+    num::NonZeroU32,
     path::{Path, PathBuf},
 };
 
 use ffmpeg_next::{
-    ChannelLayout, Rational, Rescale, codec, decoder,
+    ChannelLayout, Rescale, codec, decoder,
     ffi::{AV_NOPTS_VALUE, swr_get_out_samples},
     format::{self, sample},
     frame, media, rescale,
@@ -12,10 +13,7 @@ use ffmpeg_next::{
 };
 use tessera_timeline::{FLICKS_PER_SECOND, Time};
 
-use crate::{
-    Error,
-    decode::{from_stream_ts, to_stream_ts},
-};
+use crate::{Error, decode::TimeBase};
 
 const OUTPUT_FORMAT: format::Sample = format::Sample::F32(sample::Type::Packed);
 const FORWARD_DECODE_WINDOW: Time = Time::from_seconds(1);
@@ -23,7 +21,7 @@ const SEEK_PREROLL: Time = Time::from_flicks(FLICKS_PER_SECOND / 10);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioBuffer {
-    pub sample_rate: u32,
+    pub sample_rate: NonZeroU32,
     pub samples: Vec<f32>,
 }
 
@@ -39,9 +37,9 @@ pub struct AudioDecoder {
     path: PathBuf,
     input: format::context::Input,
     stream_index: usize,
-    time_base: Rational,
+    time_base: TimeBase,
     start: i64,
-    sample_rate: u32,
+    sample_rate: NonZeroU32,
     decoder: decoder::Audio,
     resampler: Option<Resampler>,
     decoded: DecodedSamples,
@@ -76,7 +74,7 @@ struct DecodedSamples {
 }
 
 impl AudioDecoder {
-    pub fn open(path: impl AsRef<Path>, sample_rate: u32) -> Result<Self, Error> {
+    pub fn open(path: impl AsRef<Path>, sample_rate: NonZeroU32) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
         let input = format::input(&path).map_err(|source| Error::Open {
             path: path.clone(),
@@ -87,7 +85,7 @@ impl AudioDecoder {
             .best(media::Type::Audio)
             .ok_or_else(|| Error::NoAudio { path: path.clone() })?;
         let stream_index = stream.index();
-        let time_base = stream.time_base();
+        let time_base = TimeBase::of(&stream, &path)?;
         let start = match stream.start_time() {
             AV_NOPTS_VALUE => 0,
             start => start,
@@ -95,7 +93,7 @@ impl AudioDecoder {
         let decoder = codec::Context::from_parameters(stream.parameters())
             .and_then(|context| {
                 let mut decoder = context.decoder();
-                decoder.set_packet_time_base(time_base);
+                decoder.set_packet_time_base(time_base.rational());
                 decoder.audio()
             })
             .map_err(|source| Error::Stream {
@@ -154,8 +152,8 @@ impl AudioDecoder {
     fn seek(&mut self, target: i64) -> Result<(), Error> {
         let preroll_start =
             (Time::from_samples(target, self.sample_rate) - SEEK_PREROLL).max(Time::ZERO);
-        let stream_ts = self.start + to_stream_ts(preroll_start, self.time_base);
-        let seek_ts = stream_ts.rescale(self.time_base, rescale::TIME_BASE);
+        let stream_ts = self.start + self.time_base.to_ts(preroll_start);
+        let seek_ts = stream_ts.rescale(self.time_base.rational(), rescale::TIME_BASE);
         self.input
             .seek(seek_ts, ..seek_ts)
             .map_err(|source| Error::Seek {
@@ -171,7 +169,9 @@ impl AudioDecoder {
     }
 
     fn sample_index(&self, pts: i64) -> i64 {
-        from_stream_ts(pts - self.start, self.time_base).to_samples(self.sample_rate)
+        self.time_base
+            .to_time(pts - self.start)
+            .to_samples(self.sample_rate)
     }
 
     fn decode_more(&mut self) -> Result<bool, Error> {
@@ -275,7 +275,11 @@ impl ResampledChannels {
 }
 
 impl Resampler {
-    fn new(frame: &frame::Audio, source: SourceFormat, sample_rate: u32) -> Result<Self, Error> {
+    fn new(
+        frame: &frame::Audio,
+        source: SourceFormat,
+        sample_rate: NonZeroU32,
+    ) -> Result<Self, Error> {
         let channels = ResampledChannels::for_source(source.channels);
         let context = resampling::Context::get(
             source.format,
@@ -283,7 +287,7 @@ impl Resampler {
             source.rate,
             OUTPUT_FORMAT,
             channels.layout(),
-            sample_rate,
+            sample_rate.get(),
         )
         .map_err(|source| Error::Resample { source })?;
         Ok(Self {
@@ -380,7 +384,7 @@ mod tests {
     use super::*;
     use crate::fixture::{self, Fixture};
 
-    const OUTPUT_RATE: u32 = 48_000;
+    const OUTPUT_RATE: NonZeroU32 = NonZeroU32::new(48_000).unwrap();
     const BLOCK: usize = 256;
     const LEVEL_TOLERANCE: f32 = 0.01;
 
@@ -394,7 +398,7 @@ mod tests {
         fixture::FRAME_RATE.frame_to_time(fixture::FRAME_COUNT)
     }
 
-    fn block_inside_frame(index: i64, rate: u32) -> Time {
+    fn block_inside_frame(index: i64, rate: NonZeroU32) -> Time {
         let start = fixture::audio_frame_start(index, rate);
         let end = fixture::audio_frame_start(index + 1, rate);
         Time::from_samples((start + end) / 2 - BLOCK as i64 / 2, rate)
@@ -429,7 +433,7 @@ mod tests {
     #[test]
     fn output_is_stereo_at_the_requested_rate() {
         let fixture = Fixture::generate("audio_rates");
-        for rate in [22_050, 44_100, 48_000, 96_000] {
+        for rate in [22_050, 44_100, 48_000, 96_000].map(|rate| NonZeroU32::new(rate).unwrap()) {
             let mut decoder = AudioDecoder::open(fixture.path(), rate).unwrap();
             let block = decoder.samples(block_inside_frame(9, rate), BLOCK).unwrap();
             assert_eq!(block.sample_rate, rate);
@@ -449,7 +453,7 @@ mod tests {
         assert!(!decoder.needs_seek(11_500));
         assert!(decoder.needs_seek(10_999));
         assert!(decoder.needs_seek(10_000));
-        assert!(decoder.needs_seek(11_000 + 2 * i64::from(OUTPUT_RATE)));
+        assert!(decoder.needs_seek(11_000 + 2 * i64::from(OUTPUT_RATE.get())));
     }
 
     #[test]

@@ -117,7 +117,7 @@ fn temporary_sibling(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    use std::{ffi::OsStr, num::NonZeroU32, os::unix::ffi::OsStrExt};
 
     use serde_json::json;
     use tessera_timeline::{
@@ -150,7 +150,7 @@ mod tests {
     fn golden_project() -> Project {
         let mut project = Project::new("Golden");
         project.settings.frame_rate = FrameRate::NTSC_30;
-        project.settings.sample_rate = 44_100;
+        project.settings.sample_rate = NonZeroU32::new(44_100).unwrap();
         let asset = project.add_asset(
             "/media/interview.mkv".into(),
             MediaInfo {
@@ -172,7 +172,7 @@ mod tests {
             width: 3840,
             height: 2160,
             frame_rate: FrameRate::NTSC_60,
-            sample_rate: 96_000,
+            sample_rate: NonZeroU32::new(96_000).unwrap(),
         };
         let camera = project.add_asset(
             "/media/camera.mov".into(),

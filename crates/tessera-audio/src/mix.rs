@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroU32,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -31,7 +32,7 @@ impl Mixer {
         }
     }
 
-    pub fn sample_rate(&self) -> u32 {
+    pub fn sample_rate(&self) -> NonZeroU32 {
         self.project.settings.sample_rate
     }
 
@@ -84,7 +85,7 @@ impl Mixer {
     }
 }
 
-fn spans(project: &Project, sample_rate: u32, first: i64, frames: usize) -> Vec<Span<'_>> {
+fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) -> Vec<Span<'_>> {
     let end = first + frames as i64;
     project
         .timeline
@@ -110,7 +111,7 @@ fn spans(project: &Project, sample_rate: u32, first: i64, frames: usize) -> Vec<
         .collect()
 }
 
-fn clip_samples(clip: &Clip, sample_rate: u32) -> Range<i64> {
+fn clip_samples(clip: &Clip, sample_rate: NonZeroU32) -> Range<i64> {
     let range = clip.timeline_range();
     range.start.to_samples(sample_rate)..range.end().to_samples(sample_rate)
 }
@@ -121,8 +122,8 @@ mod tests {
 
     use super::*;
 
-    const RATE: u32 = 48_000;
-    const ONE_SECOND: i64 = RATE as i64;
+    const RATE: NonZeroU32 = NonZeroU32::new(48_000).unwrap();
+    const ONE_SECOND: i64 = RATE.get() as i64;
     const TONE: &str = "/media/tone.wav";
 
     fn project_with_tone() -> (Project, AssetId, usize) {
@@ -132,7 +133,7 @@ mod tests {
             streams: vec![Stream::Audio(AudioStream {
                 index: 0,
                 codec: "pcm_s16le".into(),
-                sample_rate: RATE,
+                sample_rate: RATE.get(),
                 channels: 2,
             })],
         };
@@ -183,14 +184,17 @@ mod tests {
     fn a_trimmed_clip_starts_inside_its_source() {
         let (mut project, asset, track) = project_with_tone();
         let clip = project.place_clip(asset, track, Time::ZERO).unwrap();
-        let half_second = Time::from_rational(1, 2);
+        let half_second = Time::from_samples(ONE_SECOND / 2, RATE);
         project
             .trim_clip(clip.id, ClipEdge::Start, half_second)
             .unwrap();
-        let spans = spans(&project, RATE, 0, RATE as usize);
+        let spans = spans(&project, RATE, 0, RATE.get() as usize);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].source, half_second);
-        assert_eq!(spans[0].frames, RATE as usize / 2..RATE as usize);
+        assert_eq!(
+            spans[0].frames,
+            RATE.get() as usize / 2..RATE.get() as usize
+        );
     }
 
     #[test]

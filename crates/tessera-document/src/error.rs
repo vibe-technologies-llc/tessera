@@ -1,7 +1,7 @@
 use std::{io, path::PathBuf};
 
 use serde_json::Value;
-use tessera_timeline::{AssetId, ClipId, OverlappingClip, TrackKind};
+use tessera_timeline::{AssetId, ClipId, InvalidClip, OverlappingClip, TrackKind};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -90,10 +90,8 @@ pub enum ValidationError {
         asset: AssetId,
         kind: TrackKind,
     },
-    #[error("clip {} has no length", .0.0)]
-    EmptyClip(ClipId),
-    #[error("clip {} starts before zero on the timeline or in its media", .0.0)]
-    NegativeTime(ClipId),
+    #[error(transparent)]
+    InvalidClip(#[from] InvalidClip),
     #[error("clip {} reaches past the end of asset {}", .clip.0, .asset.0)]
     BeyondMedia { clip: ClipId, asset: AssetId },
     #[error("clip {}: {source}", .clip.0)]

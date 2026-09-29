@@ -52,7 +52,7 @@ impl fmt::Display for Timecode {
 }
 
 fn uses_drop_frame(rate: FrameRate) -> bool {
-    rate.denominator == DROP_FRAME_DENOMINATOR
+    rate.denominator() == DROP_FRAME_DENOMINATOR
         && rate.nominal_frames_per_second() % DROP_FRAME_BASE == 0
 }
 

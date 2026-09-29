@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{num::NonZeroU32, path::PathBuf};
 
 use thiserror::Error;
 
@@ -31,7 +31,12 @@ pub struct SequenceSettings {
     pub width: u32,
     pub height: u32,
     pub frame_rate: FrameRate,
-    pub sample_rate: u32,
+    pub sample_rate: NonZeroU32,
+}
+
+impl SequenceSettings {
+    pub const DEFAULT_SAMPLE_RATE: NonZeroU32 =
+        NonZeroU32::new(48_000).expect("the default sample rate is not zero");
 }
 
 impl Default for SequenceSettings {
@@ -40,7 +45,7 @@ impl Default for SequenceSettings {
             width: 1920,
             height: 1080,
             frame_rate: FrameRate::FPS_30,
-            sample_rate: 48_000,
+            sample_rate: Self::DEFAULT_SAMPLE_RATE,
         }
     }
 }
@@ -117,6 +122,30 @@ impl Clip {
     pub fn is_cut_by(&self, time: Time) -> bool {
         self.start < time && time < self.timeline_range().end()
     }
+
+    pub fn check(&self) -> Result<(), InvalidClip> {
+        if self.source.duration <= Time::ZERO {
+            Err(InvalidClip::Empty(self.id))
+        } else if self.start < Time::ZERO || self.source.start < Time::ZERO {
+            Err(InvalidClip::NegativeTime(self.id))
+        } else if self.timeline_range().checked_end().is_none()
+            || self.source.checked_end().is_none()
+        {
+            Err(InvalidClip::EndOverflows(self.id))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum InvalidClip {
+    #[error("clip {} has no length", .0.0)]
+    Empty(ClipId),
+    #[error("clip {} starts before zero on the timeline or in its media", .0.0)]
+    NegativeTime(ClipId),
+    #[error("clip {} ends past the latest time Tessera can represent", .0.0)]
+    EndOverflows(ClipId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -124,6 +153,14 @@ impl Clip {
 pub struct OverlappingClip {
     pub inserted: TimeRange,
     pub existing: TimeRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum InsertError {
+    #[error(transparent)]
+    Invalid(#[from] InvalidClip),
+    #[error(transparent)]
+    Overlapping(#[from] OverlappingClip),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -147,7 +184,18 @@ pub enum EditError {
     #[error("the asset has no {0:?} stream")]
     MissingStream(TrackKind),
     #[error(transparent)]
+    Invalid(#[from] InvalidClip),
+    #[error(transparent)]
     Overlapping(#[from] OverlappingClip),
+}
+
+impl From<InsertError> for EditError {
+    fn from(error: InsertError) -> Self {
+        match error {
+            InsertError::Invalid(invalid) => Self::Invalid(invalid),
+            InsertError::Overlapping(overlapping) => Self::Overlapping(overlapping),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,15 +216,13 @@ impl Track {
         &self.clips
     }
 
-    pub fn check_free(&self, inserted: TimeRange) -> Result<(), OverlappingClip> {
-        self.check_free_of_others(inserted, None)
+    pub fn check_insert(&self, clip: &Clip) -> Result<(), InsertError> {
+        self.check_insert_moving(clip, None)
     }
 
-    fn check_free_of_others(
-        &self,
-        inserted: TimeRange,
-        moving: Option<ClipId>,
-    ) -> Result<(), OverlappingClip> {
+    fn check_insert_moving(&self, clip: &Clip, moving: Option<ClipId>) -> Result<(), InsertError> {
+        clip.check()?;
+        let inserted = clip.timeline_range();
         match self
             .clips
             .iter()
@@ -184,13 +230,13 @@ impl Track {
             .map(Clip::timeline_range)
             .find(|existing| existing.overlaps(inserted))
         {
-            Some(existing) => Err(OverlappingClip { inserted, existing }),
+            Some(existing) => Err(OverlappingClip { inserted, existing }.into()),
             None => Ok(()),
         }
     }
 
-    pub fn insert(&mut self, clip: Clip) -> Result<(), OverlappingClip> {
-        self.check_free(clip.timeline_range())?;
+    pub fn insert(&mut self, clip: Clip) -> Result<(), InsertError> {
+        self.check_insert(&clip)?;
         let index = self.clips.partition_point(|other| other.start < clip.start);
         self.clips.insert(index, clip);
         Ok(())
@@ -397,7 +443,7 @@ impl Project {
             source: TimeRange::new(Time::ZERO, duration),
             start: start.max(Time::ZERO),
         };
-        track_ref.check_free(clip.timeline_range())?;
+        track_ref.check_insert(&clip)?;
         Ok(clip)
     }
 
@@ -425,7 +471,7 @@ impl Project {
             ..clip
         };
         self.track_accepting(asset, track)?
-            .check_free_of_others(moved.timeline_range(), Some(id))?;
+            .check_insert_moving(&moved, Some(id))?;
         Ok(moved)
     }
 
@@ -529,11 +575,11 @@ impl Project {
     fn replace_clip(&mut self, clip: Clip, track: usize) -> Result<Clip, EditError> {
         let (from, _) = self.located_clip(clip.id)?;
         let removed = self.timeline.tracks[from].remove(clip.id);
-        if let Err(overlap) = self.timeline.tracks[track].insert(clip) {
+        if let Err(refused) = self.timeline.tracks[track].insert(clip) {
             if let Some(removed) = removed {
                 self.timeline.tracks[from].insert(removed)?;
             }
-            return Err(overlap.into());
+            return Err(refused.into());
         }
         Ok(clip)
     }
@@ -569,8 +615,98 @@ mod tests {
         let mut track = Track::new(TrackKind::Video);
         track.insert(clip(0, 4)).unwrap();
         let error = track.insert(clip(3, 2)).unwrap_err();
-        assert_eq!(error.existing.start, Time::from_seconds(0));
+        assert!(matches!(
+            error,
+            InsertError::Overlapping(overlap) if overlap.existing.start == Time::ZERO
+        ));
         assert_eq!(track.clips().len(), 1);
+    }
+
+    #[test]
+    fn inserted_clips_need_a_length_and_times_from_zero() {
+        let mut track = Track::new(TrackKind::Video);
+
+        let empty = clip(0, 0);
+        let backwards = clip(0, -1);
+        let before_zero = clip(-1, 2);
+        let before_media = Clip {
+            source: TimeRange::new(Time::from_seconds(-1), Time::from_seconds(2)),
+            ..clip(0, 2)
+        };
+
+        assert_eq!(
+            track.insert(empty),
+            Err(InvalidClip::Empty(empty.id).into())
+        );
+        assert_eq!(
+            track.insert(backwards),
+            Err(InvalidClip::Empty(backwards.id).into())
+        );
+        assert_eq!(
+            track.insert(before_zero),
+            Err(InvalidClip::NegativeTime(before_zero.id).into())
+        );
+        assert_eq!(
+            track.insert(before_media),
+            Err(InvalidClip::NegativeTime(before_media.id).into())
+        );
+        assert!(track.clips().is_empty());
+    }
+
+    #[test]
+    fn inserted_clips_must_end_within_representable_time() {
+        let mut track = Track::new(TrackKind::Video);
+
+        let past_the_end = Clip {
+            start: Time::MAX - Time::from_seconds(1),
+            ..clip(0, 2)
+        };
+        let source_past_the_end = Clip {
+            source: TimeRange::new(Time::MAX - Time::from_seconds(1), Time::from_seconds(2)),
+            ..clip(0, 2)
+        };
+        let at_the_end = Clip {
+            start: Time::MAX - Time::from_seconds(2),
+            ..clip(0, 2)
+        };
+
+        assert_eq!(
+            track.insert(past_the_end),
+            Err(InvalidClip::EndOverflows(past_the_end.id).into())
+        );
+        assert_eq!(
+            track.insert(source_past_the_end),
+            Err(InvalidClip::EndOverflows(source_past_the_end.id).into())
+        );
+        assert_eq!(track.insert(at_the_end), Ok(()));
+        assert_eq!(track.end(), Time::MAX);
+    }
+
+    #[test]
+    fn edits_refuse_clips_that_would_end_past_representable_time() {
+        let (mut project, asset, first, _) = two_clip_project();
+        let late = Time::MAX - Time::from_seconds(5);
+
+        assert_eq!(
+            project.clip_for(asset, 0, late),
+            Err(EditError::Invalid(InvalidClip::EndOverflows(
+                project.next_ids.clip
+            )))
+        );
+        assert_eq!(
+            project.place_clip(asset, 0, late),
+            Err(EditError::Invalid(InvalidClip::EndOverflows(
+                project.next_ids.clip
+            )))
+        );
+        assert_eq!(
+            project.move_clip(first, 0, late),
+            Err(EditError::Invalid(InvalidClip::EndOverflows(first)))
+        );
+        assert_eq!(
+            project.find_clip(first).map(|(_, clip)| clip.start),
+            Some(Time::ZERO)
+        );
     }
 
     #[test]

@@ -1,9 +1,12 @@
-use std::path::Path;
+use std::{num::NonZeroI64, path::Path};
 
 use ffmpeg_next::{codec, ffi::AV_TIME_BASE, format, media};
 use tessera_timeline::{AudioStream, FrameRate, MediaInfo, Stream, Time, VideoStream};
 
 use crate::Error;
+
+const CONTAINER_TIME_BASE: NonZeroI64 =
+    NonZeroI64::new(AV_TIME_BASE as i64).expect("FFmpeg's time base is not zero");
 
 pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo, Error> {
     let path = path.as_ref();
@@ -11,8 +14,8 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo, Error> {
         path: path.to_owned(),
         source,
     })?;
-    let duration = (input.duration() > 0)
-        .then(|| Time::from_rational(input.duration(), i64::from(AV_TIME_BASE)));
+    let duration =
+        (input.duration() > 0).then(|| Time::from_rational(input.duration(), CONTAINER_TIME_BASE));
     let streams = input
         .streams()
         .filter_map(|stream| describe(&stream).transpose())
@@ -58,9 +61,10 @@ fn describe(stream: &format::stream::Stream) -> Result<Option<Stream>, Error> {
 }
 
 fn frame_rate(rate: ffmpeg_next::Rational) -> Option<FrameRate> {
-    let numerator = u32::try_from(rate.numerator()).ok().filter(|&n| n > 0)?;
-    let denominator = u32::try_from(rate.denominator()).ok().filter(|&d| d > 0)?;
-    Some(FrameRate::new(numerator, denominator))
+    FrameRate::new(
+        u32::try_from(rate.numerator()).ok()?,
+        u32::try_from(rate.denominator()).ok()?,
+    )
 }
 
 #[cfg(test)]
@@ -83,7 +87,7 @@ mod tests {
         assert_eq!(audio[0].codec, "pcm_s16le");
         assert_eq!(
             (audio[0].sample_rate, audio[0].channels),
-            (fixture::AUDIO_SAMPLE_RATE, fixture::AUDIO_CHANNELS)
+            (fixture::AUDIO_SAMPLE_RATE.get(), fixture::AUDIO_CHANNELS)
         );
     }
 
