@@ -85,16 +85,18 @@ impl History {
 }
 
 fn swap_in(entry: Entry, project: &mut Project) -> Entry {
+    let swapped_out = std::mem::replace(project, entry.project);
+    project.next_ids = project.next_ids.covering(swapped_out.next_ids);
     Entry {
         command: entry.command,
-        project: std::mem::replace(project, entry.project),
+        project: swapped_out,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EditError, TrackKind};
+    use crate::{EditError, FrameRate, MediaInfo, Stream, Time, TrackKind, VideoStream};
 
     fn add_track(history: &mut History, project: &mut Project) {
         history
@@ -165,5 +167,68 @@ mod tests {
         }
         while history.undo(&mut project).is_some() {}
         assert_eq!(track_count(&project), 4);
+    }
+
+    fn clip_project() -> Project {
+        let mut project = Project::new("test");
+
+        project.add_asset(
+            "a.mkv".into(),
+            MediaInfo {
+                duration: Some(Time::from_seconds(4)),
+                streams: vec![Stream::Video(VideoStream {
+                    index: 0,
+                    codec: "h264".into(),
+                    width: 1280,
+                    height: 720,
+                    frame_rate: Some(FrameRate::FPS_30),
+                })],
+            },
+        );
+        project
+    }
+
+    #[test]
+    fn undone_clips_and_assets_keep_their_ids_retired() {
+        let mut history = History::default();
+        let mut project = clip_project();
+
+        let asset = project.assets[0].id;
+        let place = |history: &mut History, project: &mut Project| {
+            history
+                .apply(Command::PlaceClip, project, |project| {
+                    project.place_clip(asset, 0, Time::ZERO)
+                })
+                .unwrap()
+                .id
+        };
+        let import = |history: &mut History, project: &mut Project| {
+            history.apply(Command::ImportMedia, project, |project| {
+                Ok::<_, EditError>(project.add_asset("b.mkv".into(), MediaInfo::default()))
+            })
+        };
+        let split = |history: &mut History, project: &mut Project, clip, seconds| {
+            history
+                .apply(Command::SplitClips, project, |project| {
+                    project.split_clip(clip, Time::from_seconds(seconds))
+                })
+                .map(|(_, tail)| tail.id)
+        };
+
+        let first = place(&mut history, &mut project);
+        history.undo(&mut project);
+        let second = place(&mut history, &mut project);
+        let tail = split(&mut history, &mut project, second, 1).unwrap();
+        history.undo(&mut project);
+        history.undo(&mut project);
+        history.redo(&mut project);
+        let retail = split(&mut history, &mut project, second, 2).unwrap();
+        let imported = import(&mut history, &mut project).unwrap();
+        history.undo(&mut project);
+        let reimported = import(&mut history, &mut project).unwrap();
+
+        assert_ne!(first, second);
+        assert!(![first, second, tail].contains(&retail));
+        assert_ne!(imported, reimported);
     }
 }

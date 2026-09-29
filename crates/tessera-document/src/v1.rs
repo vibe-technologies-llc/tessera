@@ -2,7 +2,7 @@ use std::{collections::HashSet, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
-    self as model, AssetId, ClipId, FrameRate, MediaInfo, Time, TimeRange, Timeline,
+    self as model, AssetId, ClipId, FrameRate, MediaInfo, NextIds, Time, TimeRange, Timeline,
 };
 
 use crate::{FormatError, ValidationError};
@@ -12,6 +12,8 @@ use crate::{FormatError, ValidationError};
 pub struct Project {
     name: String,
     settings: SequenceSettings,
+    next_asset_id: u64,
+    next_clip_id: u64,
     assets: Vec<Asset>,
     tracks: Vec<Track>,
 }
@@ -90,6 +92,8 @@ impl TryFrom<&model::Project> for Project {
         Ok(Self {
             name: project.name.clone(),
             settings: project.settings.into(),
+            next_asset_id: project.next_ids.asset.0,
+            next_clip_id: project.next_ids.clip.0,
             assets: project
                 .assets
                 .iter()
@@ -205,11 +209,21 @@ impl TryFrom<Project> for model::Project {
             settings: project.settings.try_into()?,
             assets: Vec::with_capacity(project.assets.len()),
             timeline: Timeline::default(),
+            next_ids: NextIds {
+                asset: AssetId(project.next_asset_id),
+                clip: ClipId(project.next_clip_id),
+            },
         };
         for asset in project.assets {
             let asset = model::Asset::try_from(asset)?;
             if rebuilt.asset(asset.id).is_some() {
                 return Err(ValidationError::DuplicateAsset(asset.id));
+            }
+            if !rebuilt.next_ids.has_issued_asset(asset.id) {
+                return Err(ValidationError::UnissuedAsset {
+                    asset: asset.id,
+                    next: rebuilt.next_ids.asset,
+                });
             }
             rebuilt.assets.push(asset);
         }
@@ -218,6 +232,16 @@ impl TryFrom<Project> for model::Project {
             let track = track.rebuilt(&rebuilt)?;
             if let Some(repeated) = track.clips().iter().find(|clip| !clip_ids.insert(clip.id)) {
                 return Err(ValidationError::DuplicateClip(repeated.id));
+            }
+            if let Some(unissued) = track
+                .clips()
+                .iter()
+                .find(|clip| !rebuilt.next_ids.has_issued_clip(clip.id))
+            {
+                return Err(ValidationError::UnissuedClip {
+                    clip: unissued.id,
+                    next: rebuilt.next_ids.clip,
+                });
             }
             rebuilt.timeline.tracks.push(track);
         }
@@ -422,6 +446,8 @@ mod tests {
                 "frame_rate": { "numerator": 25, "denominator": 1 },
                 "sample_rate": 48000,
             },
+            "next_asset_id": 8,
+            "next_clip_id": 3,
             "assets": [
                 {
                     "id": 4,
@@ -477,6 +503,13 @@ mod tests {
         let project = rebuilt(valid()).unwrap();
         assert_eq!(project.settings.frame_rate, FrameRate::FPS_25);
         assert_eq!(project.asset(AssetId(7)).unwrap().info.duration, None);
+        assert_eq!(
+            project.next_ids,
+            NextIds {
+                asset: AssetId(8),
+                clip: ClipId(3)
+            }
+        );
         let ids: Vec<Vec<ClipId>> = project
             .timeline
             .tracks
@@ -532,6 +565,31 @@ mod tests {
         assert_eq!(
             refused(|document| document["tracks"][0]["clips"][1]["id"] = json!(0)),
             ValidationError::DuplicateClip(ClipId(0))
+        );
+    }
+
+    #[test]
+    fn every_id_must_have_been_issued_before_the_next_ones() {
+        assert_eq!(
+            refused(|document| document["next_asset_id"] = json!(7)),
+            ValidationError::UnissuedAsset {
+                asset: AssetId(7),
+                next: AssetId(7)
+            }
+        );
+        assert_eq!(
+            refused(|document| document["next_clip_id"] = json!(1)),
+            ValidationError::UnissuedClip {
+                clip: ClipId(1),
+                next: ClipId(1)
+            }
+        );
+        assert_eq!(
+            refused(|document| document["tracks"][1]["clips"][0]["id"] = json!(u64::MAX)),
+            ValidationError::UnissuedClip {
+                clip: ClipId(u64::MAX),
+                next: ClipId(3)
+            }
         );
     }
 

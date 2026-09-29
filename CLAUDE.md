@@ -28,32 +28,39 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   clips sorted by start and refuses overlapping inserts. `Project::clip_for` builds the clip that
   would cover a whole asset at a start time on a track, checking the stream kind, the duration and
   overlaps without mutating, and `Project::place_clip` inserts it. Every clip carries a `ClipId`
-  unique in the project. Moves and trims follow the same pair of calls: `moved_clip` and
-  `trimmed_clip` compute the result without mutating, while `move_clip` and `trim_clip` apply it. A
-  move is refused where it would overlap or where the target track's kind has no matching stream.
-  A trim is clamped instead, between the neighbouring clips, the ends of the media and a minimum
-  length of one frame. `split_clip` cuts a clip strictly inside it, keeping the id on the head
-  and giving the tail a new one. `ripple_delete_clip` pulls the later clips on the same track back
-  by the deleted clip's length, while `delete_clip` leaves a gap. `Timeline::add_track` inserts a
-  track after the last one of its kind. `remove_track` only takes an empty track that isn't the
-  last of its kind, and `swap_tracks` only swaps tracks of the same kind. Later video tracks sit on
-  top of earlier ones, so `Timeline::video_clips_at` lists the video clips under a time from the
-  bottom track up, the order they composite in, and `top_video_clip_at` is its last. `History` is
-  the undo stack: `History::apply` runs one edit as a `Command`, keeps a snapshot of the project from before it
-  when the edit succeeds and changes something, and rolls the project back when the edit fails.
-  `undo` and `redo` swap those snapshots in, the stack keeps the last `HISTORY_DEPTH` commands,
-  and a new command clears the redo stack.
+  unique in the project. Asset and clip ids come from the project's `NextIds` counters, which only
+  move forward: `clip_for` previews with the next clip id without taking it, `place_clip`,
+  `split_clip` and `add_asset` take one, and deleting a clip never frees its id. Moves and trims
+  follow the same pair of calls: `moved_clip` and `trimmed_clip` compute the result without
+  mutating, while `move_clip` and `trim_clip` apply it. A move is refused where it would overlap or
+  where the target track's kind has no matching stream. A trim is clamped instead, between the
+  neighbouring clips, the ends of the media and a minimum length of one frame. `split_clip` cuts a
+  clip strictly inside it, keeping the id on the head and giving the tail a new one.
+  `ripple_delete_clip` pulls the later clips on the same track back by the deleted clip's length,
+  while `delete_clip` leaves a gap. `Timeline::add_track` inserts a track after the last one of its
+  kind. `remove_track` only takes an empty track that isn't the last of its kind, and `swap_tracks`
+  only swaps tracks of the same kind. Later video tracks sit on top of earlier ones, so
+  `Timeline::video_clips_at` lists the video clips under a time from the bottom track up, the order
+  they composite in, and `top_video_clip_at` is its last. `History` is the undo stack:
+  `History::apply` runs one edit as a `Command`, keeps a snapshot of the project from before it when
+  the edit succeeds and changes something, and rolls the project back when the edit fails. `undo`
+  and `redo` swap those snapshots in, carrying the newer `NextIds` over so an undone clip or asset
+  never gives its id out again. The stack keeps the last `HISTORY_DEPTH` commands, and a new command
+  clears the redo stack.
 - **`tessera-document`** reads and writes project files (`.tessera`, `EXTENSION`): pretty JSON in
   an envelope `{ "format": "tessera-project", "version": N, "project": … }`, with times as integer
   flicks. The model stays serde-free: each format version has its own DTO module (`v1.rs`, aliased
   as `current`) with conversions to and from `Project`. Loading parses to a `serde_json::Value`,
   checks the marker, runs the `MIGRATIONS` chain (one `fn(Value) -> Result<Value, String>` step per
   source version, so a new version appends a step, and `CURRENT_VERSION` follows its length) and
-  then deserializes the current DTO. Rebuilding the `Project` validates rather than trusts: clips go
-  through `Track::insert`, and ids, assets, stream kinds, clip ranges, rates and one track of each
-  kind are checked, each failure a distinct `ValidationError`. `to_string`/`from_str` are pure;
-  `save` writes a synced sibling temp file and renames it over the target, and `open` and `save`
-  errors carry the path. A fixture in `fixtures/v1.tessera` pins the v1 format.
+  then deserializes the current DTO. While Tessera is in early development the format stays at
+  version 1 and changes break it in place, fixture included, instead of adding a migration step.
+  Rebuilding the `Project` validates rather than trusts: clips go through `Track::insert`, and ids
+  (unique, and each below the stored next id), assets, stream kinds, clip ranges, rates and one
+  track of each kind are checked, each failure a distinct `ValidationError`. `to_string` and
+  `from_str` are pure; `save` writes a synced sibling temp file and renames it over the target,
+  and `open` and `save` errors carry the path. A fixture in `fixtures/v1.tessera` pins the v1
+  format.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
   here. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the

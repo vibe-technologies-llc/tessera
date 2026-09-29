@@ -1,8 +1,5 @@
 ## Model
 
-- Allocate `ClipId`s and `AssetId`s from a counter kept in the project and its file instead of
-  max + 1: undoing or deleting the newest clip frees its id, so a later split or drop reuses it and
-  a stale timeline selection or `DraggedClip` silently points at the new clip
 - Check `Time`, `TimeRange::end` and `FrameRate` arithmetic for overflow and zero denominators, and
   validate clips in `Track::insert` (positive duration, non-negative start) instead of relying on
   `tessera-document` to have done it
@@ -27,8 +24,7 @@
   time round trip, and probing hands VFR files an arbitrary `avg_frame_rate`
 - `Timecode` edge cases: `as u8` truncation above 255 fps, `abs` of `i64::MIN`, the untested
   120000/1001 drop-frame rate, and parsing a typed timecode back into a time
-- Binary-search the sorted clips in `check_free_of_others` and the clip lookups, and stop
-  `next_clip_id` scanning every clip on each drag move
+- Binary-search the sorted clips in `check_free_of_others` and the clip lookups
 
 ## Project files
 
@@ -37,7 +33,7 @@
 - Give each save its own temp file (`create_new`) and serialise saves and opens: two quick Ctrl+S
   share `.{name}.{pid}.tmp`, so one truncates the other or fails its rename, and an older snapshot
   or a slow open can land after newer edits
-- Reject clip times and ids whose sums overflow when loading, instead of panicking in debug and
+- Reject clip times whose sums overflow when loading, instead of panicking in debug and
   wrapping to negative ends in release
 - Fsync the parent directory after the rename, and save through a symlink to its target while
   keeping the file's permissions

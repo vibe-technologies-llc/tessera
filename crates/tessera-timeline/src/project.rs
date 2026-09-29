@@ -7,7 +7,7 @@ use crate::{
     time::{FrameRate, Time, TimeRange},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssetId(pub u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,8 +51,43 @@ pub enum TrackKind {
     Audio,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClipId(pub u64);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NextIds {
+    pub asset: AssetId,
+    pub clip: ClipId,
+}
+
+impl NextIds {
+    pub fn has_issued_asset(&self, id: AssetId) -> bool {
+        id < self.asset
+    }
+
+    pub fn has_issued_clip(&self, id: ClipId) -> bool {
+        id < self.clip
+    }
+
+    pub fn covering(self, other: Self) -> Self {
+        Self {
+            asset: self.asset.max(other.asset),
+            clip: self.clip.max(other.clip),
+        }
+    }
+
+    fn take_asset(&mut self) -> AssetId {
+        let id = self.asset;
+        self.asset = AssetId(id.0 + 1);
+        id
+    }
+
+    fn take_clip(&mut self) -> ClipId {
+        let id = self.clip;
+        self.clip = ClipId(id.0 + 1);
+        id
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClipEdge {
@@ -295,6 +330,7 @@ pub struct Project {
     pub settings: SequenceSettings,
     pub assets: Vec<Asset>,
     pub timeline: Timeline,
+    pub next_ids: NextIds,
 }
 
 impl Project {
@@ -306,6 +342,7 @@ impl Project {
             timeline: Timeline {
                 tracks: vec![Track::new(TrackKind::Video), Track::new(TrackKind::Audio)],
             },
+            next_ids: NextIds::default(),
         }
     }
 
@@ -314,13 +351,7 @@ impl Project {
     }
 
     pub fn add_asset(&mut self, path: PathBuf, info: MediaInfo) -> AssetId {
-        let id = AssetId(
-            self.assets
-                .iter()
-                .map(|asset| asset.id.0 + 1)
-                .max()
-                .unwrap_or(0),
-        );
+        let id = self.next_ids.take_asset();
         self.assets.push(Asset { id, path, info });
         id
     }
@@ -331,18 +362,6 @@ impl Project {
             .iter()
             .enumerate()
             .find_map(|(index, track)| Some((index, track.clip(id)?)))
-    }
-
-    fn next_clip_id(&self) -> ClipId {
-        ClipId(
-            self.timeline
-                .tracks
-                .iter()
-                .flat_map(Track::clips)
-                .map(|clip| clip.id.0 + 1)
-                .max()
-                .unwrap_or(0),
-        )
     }
 
     fn track_accepting(&self, asset: &Asset, track: usize) -> Result<&Track, EditError> {
@@ -373,7 +392,7 @@ impl Project {
             .filter(|duration| *duration > Time::ZERO)
             .ok_or(EditError::NoDuration)?;
         let clip = Clip {
-            id: self.next_clip_id(),
+            id: self.next_ids.clip,
             asset: asset.id,
             source: TimeRange::new(Time::ZERO, duration),
             start: start.max(Time::ZERO),
@@ -388,7 +407,10 @@ impl Project {
         track: usize,
         start: Time,
     ) -> Result<Clip, EditError> {
-        let clip = self.clip_for(asset, track, start)?;
+        let clip = Clip {
+            id: self.next_ids.take_clip(),
+            ..self.clip_for(asset, track, start)?
+        };
         self.timeline.tracks[track].insert(clip)?;
         Ok(clip)
     }
@@ -471,7 +493,7 @@ impl Project {
             ..clip
         };
         let tail = Clip {
-            id: self.next_clip_id(),
+            id: self.next_ids.take_clip(),
             start: at,
             source: TimeRange::new(
                 clip.source.start + head_duration,
@@ -792,6 +814,44 @@ mod tests {
             Some((0, Time::from_seconds(20)))
         );
         assert_eq!(project.find_clip(ClipId(99)), None);
+    }
+
+    #[test]
+    fn deleted_ids_are_not_given_out_again() {
+        let (mut project, asset, _, second) = two_clip_project();
+
+        project.delete_clip(second).unwrap();
+        let placed = project
+            .place_clip(asset, 0, Time::from_seconds(20))
+            .unwrap();
+        let (_, tail) = project
+            .split_clip(placed.id, Time::from_seconds(25))
+            .unwrap();
+        project.ripple_delete_clip(tail.id).unwrap();
+        let (_, retail) = project
+            .split_clip(placed.id, Time::from_seconds(22))
+            .unwrap();
+
+        assert_ne!(placed.id, second);
+        assert!(![second, placed.id, tail.id].contains(&retail.id));
+        assert_eq!(project.next_ids.clip, ClipId(retail.id.0 + 1));
+        assert!(project.next_ids.has_issued_clip(retail.id));
+        assert!(!project.next_ids.has_issued_clip(project.next_ids.clip));
+    }
+
+    #[test]
+    fn previewing_a_placement_gives_out_no_id() {
+        let mut project = Project::new("test");
+
+        let asset = project.add_asset("a.mkv".into(), video_info(3));
+        let preview = project.clip_for(asset, 0, Time::ZERO).unwrap();
+        let again = project.clip_for(asset, 0, Time::from_seconds(5)).unwrap();
+        let placed = project.place_clip(asset, 0, Time::ZERO).unwrap();
+
+        assert_eq!(preview.id, again.id);
+        assert_eq!(placed, preview);
+        assert_eq!(project.next_ids.clip, ClipId(placed.id.0 + 1));
+        assert_eq!(project.next_ids.asset, AssetId(asset.0 + 1));
     }
 
     #[test]

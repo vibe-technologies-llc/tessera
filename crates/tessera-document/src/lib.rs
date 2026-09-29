@@ -236,6 +236,24 @@ mod tests {
     }
 
     #[test]
+    fn ids_of_deleted_clips_stay_retired_across_a_save() {
+        let mut project = golden_project();
+
+        let newest = project.timeline.tracks[1].clips()[0].id;
+        project.delete_clip(newest).unwrap();
+
+        let mut reopened = from_str(&to_string(&project).unwrap()).unwrap();
+        let asset = reopened.assets[0].id;
+        let placed = reopened.place_clip(asset, 1, Time::ZERO).unwrap();
+
+        assert_eq!(
+            reopened.next_ids,
+            project.next_ids.covering(reopened.next_ids)
+        );
+        assert_ne!(placed.id, newest);
+    }
+
+    #[test]
     fn the_golden_v1_file_loads_and_is_written_unchanged() {
         assert_eq!(from_str(GOLDEN_V1).unwrap(), golden_project());
         assert_eq!(to_string(&golden_project()).unwrap(), GOLDEN_V1);

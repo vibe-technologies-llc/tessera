@@ -12,6 +12,8 @@
       },
       "sample_rate": 44100
     },
+    "next_asset_id": 1,
+    "next_clip_id": 2,
     "assets": [
       {
         "id": 0,

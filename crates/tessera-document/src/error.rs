@@ -78,6 +78,10 @@ pub enum ValidationError {
     DuplicateAsset(AssetId),
     #[error("clip {} appears more than once", .0.0)]
     DuplicateClip(ClipId),
+    #[error("asset {} is not below the next asset id {}", .asset.0, .next.0)]
+    UnissuedAsset { asset: AssetId, next: AssetId },
+    #[error("clip {} is not below the next clip id {}", .clip.0, .next.0)]
+    UnissuedClip { clip: ClipId, next: ClipId },
     #[error("clip {} uses asset {}, which the project does not hold", .clip.0, .asset.0)]
     UnknownAsset { clip: ClipId, asset: AssetId },
     #[error("clip {} sits on a {kind:?} track, but asset {} has no {kind:?} stream", .clip.0, .asset.0)]
