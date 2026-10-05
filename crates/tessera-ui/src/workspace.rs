@@ -9,9 +9,9 @@ use tessera_document::EXTENSION;
 use tessera_timeline::{Project, Time};
 
 use crate::{
-    DeleteClip, Import, Open, Pause, PlayPause, Redo, RippleDeleteClip, Save, SelectAll,
-    ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping,
-    Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    DeleteClip, Import, NEW_PROJECT_NAME, NewProject, Open, Pause, PlayPause, Redo,
+    RippleDeleteClip, Save, SaveAs, SelectAll, ShuttleBackward, ShuttleForward, SplitAtPlayhead,
+    StepBackward, StepForward, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
@@ -152,7 +152,7 @@ impl Workspace {
                 return false;
             };
             let saving = this.update_in(cx, |workspace, window, cx| match chosen {
-                Ok(Some(path)) => workspace.save_to(with_project_extension(path), window, cx),
+                Ok(Some(path)) => workspace.save_chosen(path, window, cx),
                 Ok(None) => Task::ready(false),
                 Err(error) => {
                     report_failure(
@@ -169,6 +169,52 @@ impl Workspace {
                 Err(_) => false,
             }
         })
+    }
+
+    fn save_chosen(
+        &mut self,
+        chosen: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<bool> {
+        let target = with_project_extension(chosen.clone());
+        if target == chosen || !target.exists() {
+            return self.save_to(target, window, cx);
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("“{}” already exists. Replace it?", file_name(&target)),
+            Some("The dialog did not ask about this file, because Tessera added its extension."),
+            &["Replace", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await.ok() != Some(0) {
+                return false;
+            }
+            match this.update_in(cx, |workspace, window, cx| {
+                workspace.save_to(target, window, cx)
+            }) {
+                Ok(saving) => saving.await,
+                Err(_) => false,
+            }
+        })
+    }
+
+    fn new_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let confirming = self.confirm_discard(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if !confirming.await {
+                return;
+            }
+            this.update_in(cx, |workspace, window, cx| {
+                workspace.replace_project(Project::new(NEW_PROJECT_NAME), cx);
+                workspace.file = None;
+                window.set_window_title(&workspace.title(cx));
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn save_to(
@@ -335,8 +381,14 @@ impl Render for Workspace {
         div()
             .track_focus(&self.focus_handle)
             .key_context(WORKSPACE_CONTEXT)
+            .on_action(cx.listener(|workspace, _: &NewProject, window, cx| {
+                workspace.new_project(window, cx);
+            }))
             .on_action(cx.listener(|workspace, _: &Save, window, cx| {
                 workspace.save(window, cx).detach();
+            }))
+            .on_action(cx.listener(|workspace, _: &SaveAs, window, cx| {
+                workspace.prompt_save(window, cx).detach();
             }))
             .on_action(cx.listener(|workspace, _: &Open, window, cx| {
                 workspace.prompt_open(window, cx);
@@ -828,5 +880,128 @@ mod tests {
             with_project_extension("/work/cut.tessera".into()),
             PathBuf::from("/work/cut.tessera")
         );
+    }
+
+    #[gpui::test]
+    fn an_added_extension_that_would_replace_a_file_asks_first(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("overwrite");
+        let chosen = dir.0.join("cut");
+        let existing = dir.0.join("cut.tessera");
+        std::fs::write(&existing, "an older project").unwrap();
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let save_as = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.prompt_save(window, cx).detach();
+            });
+            cx.run_until_parked();
+            cx.simulate_new_path_selection(|_| Some(chosen.clone()));
+            cx.run_until_parked();
+        };
+
+        save_as(cx);
+
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message).as_deref(),
+            Some("“cut.tessera” already exists. Replace it?")
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&existing).unwrap(),
+            "an older project"
+        );
+        assert_eq!(cx.read(|cx| workspace.read(cx).file.clone()), None);
+
+        save_as(cx);
+        cx.simulate_prompt_answer("Replace");
+        cx.run_until_parked();
+
+        assert!(tessera_document::open(&existing).is_ok());
+        assert_eq!(
+            cx.read(|cx| workspace.read(cx).file.clone()),
+            Some(existing)
+        );
+    }
+
+    #[gpui::test]
+    fn a_chosen_name_that_already_has_the_extension_needs_no_confirmation(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("no-overwrite-prompt");
+        let chosen = dir.0.join("cut.tessera");
+        std::fs::write(&chosen, "an older project").unwrap();
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prompt_save(window, cx).detach();
+        });
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(chosen.clone()));
+        cx.run_until_parked();
+
+        assert!(!cx.has_pending_prompt());
+        assert!(tessera_document::open(&chosen).is_ok());
+    }
+
+    #[gpui::test]
+    fn a_new_project_replaces_the_current_one_after_asking_about_changes(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("new-project");
+        let path = dir.0.join("cut.tessera");
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_to(path.clone(), window, cx).detach();
+        });
+        cx.run_until_parked();
+        split_at(&workspace, 4, cx);
+
+        cx.simulate_keystrokes("ctrl-n");
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.pending_prompt().map(|(message, _)| message).as_deref(),
+            Some("Save the changes to “cut.tessera”?")
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert_eq!(starts(&workspace, cx), [1, 4, 10].map(Time::from_seconds));
+
+        cx.simulate_keystrokes("ctrl-n");
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Don't Save");
+        cx.run_until_parked();
+
+        assert_eq!(current(&workspace, cx), Project::new(NEW_PROJECT_NAME));
+        assert_eq!(cx.read(|cx| workspace.read(cx).file.clone()), None);
+        assert_eq!(cx.window_title().as_deref(), Some("Untitled — Tessera"));
+    }
+
+    #[gpui::test]
+    fn save_as_asks_for_a_path_even_when_the_project_has_a_file(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("save-as");
+        let first = dir.0.join("first.tessera");
+        let second = dir.0.join("second.tessera");
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_to(first.clone(), window, cx).detach();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("ctrl-shift-s");
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(second.clone()));
+        cx.run_until_parked();
+
+        assert!(second.exists());
+        assert_eq!(cx.read(|cx| workspace.read(cx).file.clone()), Some(second));
     }
 }

@@ -18,11 +18,15 @@ pub const APP_ID: &str = "tessera";
 
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 
+pub const NEW_PROJECT_NAME: &str = "Untitled";
+
 actions!(
     tessera,
     [
         Quit,
+        NewProject,
         Save,
+        SaveAs,
         Open,
         Import,
         PlayPause,
@@ -48,7 +52,9 @@ pub fn init(cx: &mut App) {
     cx.on_action(quit);
     cx.bind_keys([
         KeyBinding::new("ctrl-q", Quit, None),
+        KeyBinding::new("ctrl-n", NewProject, None),
         KeyBinding::new("ctrl-s", Save, None),
+        KeyBinding::new("ctrl-shift-s", SaveAs, None),
         KeyBinding::new("ctrl-o", Open, None),
         KeyBinding::new("ctrl-i", Import, None),
         KeyBinding::new("space", PlayPause, Some(WORKSPACE_CONTEXT)),

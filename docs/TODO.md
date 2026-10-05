@@ -11,8 +11,7 @@
 
 ## Project files
 
-- Confirm the overwrite when `.tessera` is appended to a name the save dialog approved without it
-- Save As and recent projects
+- Recent projects
 - Relink media that has moved or gone missing, and mark missing media in the bin
 - Autosave and recovery after a crash
 
@@ -87,8 +86,7 @@
 ## Media bin and workspace
 
 - Filter unsupported files in the import dialog and for files dropped one by one
-- A sequence settings dialog and a New Project action; every project starts as a hardcoded
-  1920×1080, 30 fps "Untitled"
+- A sequence settings dialog; every project starts as a hardcoded 1920×1080, 30 fps "Untitled"
 - Remove assets, sort and search them, show their metadata and mark unused ones
 - Compare canonical paths when skipping duplicate imports
 - Menus, a shortcut reference and preferences

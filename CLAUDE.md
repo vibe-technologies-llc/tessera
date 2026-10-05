@@ -184,7 +184,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   command and notify the project, so every panel updates and Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y can
   undo and redo it. The `MediaBin` and `TimelinePanel` get a clone of it, and imports are commands
   too. Never mutate the project entity directly. Ctrl+S saves to the file the project was last
-  saved to or opened from, or asks for one (appending `.tessera`), and Ctrl+O opens one; the
+  saved to or opened from, or asks for one (appending `.tessera`, and asking before it replaces an
+  existing file the dialog did not know about), Ctrl+Shift+S always asks, Ctrl+O opens one and
+  Ctrl+N starts an empty `NEW_PROJECT_NAME` project (after the same unsaved-changes prompt); the
   `Workspace` does the file IO on the background executor through `save_to` and `open_from`, one
   job at a time in the order they were asked for (`queue_file_io`), reports failures in a prompt,
   and titles the window after the file. A save marks the revision it snapshotted, not the one
