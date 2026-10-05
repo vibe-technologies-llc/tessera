@@ -16,6 +16,7 @@ pub enum Command {
     SplitClips,
     DeleteClip,
     RippleDeleteClip,
+    SetSequenceSettings,
     AddTrack,
     RemoveTrack,
     SwapTracks,
@@ -34,6 +35,7 @@ impl fmt::Display for Command {
             Self::SplitClips => "Split Clips",
             Self::DeleteClip => "Delete Clip",
             Self::RippleDeleteClip => "Ripple Delete Clip",
+            Self::SetSequenceSettings => "Sequence Settings",
             Self::AddTrack => "Add Track",
             Self::RemoveTrack => "Remove Track",
             Self::SwapTracks => "Swap Tracks",
@@ -152,7 +154,9 @@ mod tests {
     use std::num::NonZero;
 
     use super::*;
-    use crate::{EditError, FrameRate, MediaInfo, Stream, Time, TrackKind, VideoStream};
+    use crate::{
+        EditError, FrameRate, MediaInfo, SequenceSettings, Stream, Time, TrackKind, VideoStream,
+    };
 
     fn add_track(history: &mut History, project: &mut Project) {
         history
@@ -422,5 +426,39 @@ mod tests {
         assert_eq!(refused, Err(EditError::AssetInUse(removed[0].id)));
         assert_eq!(project.assets, removed);
         assert!(project.timeline.tracks[0].clips().is_empty());
+    }
+
+    #[test]
+    fn sequence_settings_changes_undo_and_unchanged_ones_are_not_recorded() {
+        let mut history = History::default();
+        let mut project = Project::new("test");
+
+        let original = project.settings;
+        let changed = SequenceSettings {
+            frame_rate: FrameRate::FPS_24,
+            width: NonZero::new(3840).unwrap(),
+            ..original
+        };
+        let set = |history: &mut History, project: &mut Project, settings| {
+            history
+                .apply(Command::SetSequenceSettings, project, |project| {
+                    Ok::<_, EditError>(project.set_settings(settings))
+                })
+                .unwrap()
+        };
+
+        assert_eq!(set(&mut history, &mut project, changed), original);
+        assert_eq!(project.settings, changed);
+        assert_eq!(history.next_undo(), Some(Command::SetSequenceSettings));
+
+        set(&mut history, &mut project, changed);
+        history.undo(&mut project);
+
+        assert_eq!(project.settings, original);
+        assert!(!history.can_undo());
+
+        history.redo(&mut project);
+
+        assert_eq!(project.settings, changed);
     }
 }

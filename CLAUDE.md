@@ -40,7 +40,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   that doesn't match the rate, a dropped label and a time `Time` can't hold. `Time::from_samples`
   and `Time::to_samples` convert between time and sample indices at a sample rate the same way, flooring, and every common audio rate from
   8 kHz to 192 kHz has an integral sample duration. `SequenceSettings` carries the project-wide
-  `sample_rate`, 48 000 by default. A `Track` keeps its clips sorted by start, and since they never
+  `sample_rate`, 48 000 by default, and `Project::set_settings` swaps the whole set in and returns the old
+  one, as the `SetSequenceSettings` command. A `Track` keeps its clips sorted by start, and since they never
   overlap, by end too, so `clip_at`, `clips_overlapping` and the overlap check on insert
   binary-search them. `Track::insert` (and
   `check_insert`, its non-mutating preview) refuses a clip that `Clip::check` finds invalid

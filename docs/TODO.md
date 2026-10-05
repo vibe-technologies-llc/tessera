@@ -10,7 +10,6 @@
   `clip_for` refusing them with `NoDuration`
 - Carry rotation, sample aspect ratio, pixel format, stream disposition and per-stream start time in
   `MediaInfo`, and let a clip choose which of several audio streams it plays
-- A `SetSequenceSettings` command for resolution, frame rate and sample rate
 - Share unchanged assets and tracks between undo snapshots instead of deep-cloning the whole project
   up to `HISTORY_DEPTH` times, and skip the clone and compare for edits that fail
 

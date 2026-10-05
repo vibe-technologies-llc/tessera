@@ -405,6 +405,10 @@ impl Project {
         }
     }
 
+    pub fn set_settings(&mut self, settings: SequenceSettings) -> SequenceSettings {
+        std::mem::replace(&mut self.settings, settings)
+    }
+
     pub fn asset(&self, id: AssetId) -> Option<&Asset> {
         self.assets.iter().find(|asset| asset.id == id)
     }
