@@ -126,14 +126,26 @@ impl Renderer {
         self.failed.retain(|key, _| live(key));
     }
 
-    fn render(&mut self, request: &FrameRequest) -> Picture {
+    fn render(&mut self, request: &FrameRequest) -> Rendering {
         let decoded = decode_layers(&mut self.decoders, &mut self.failed, &request.layers);
-        if decoded.frames.is_empty() {
-            let reason = decoded.first_failure.unwrap_or_else(|| NO_VIDEO.into());
+        let picture = self.assemble(request.bounds, decoded.frames, decoded.first_failure);
+        Rendering {
+            picture,
+            decoded_anew: decoded.decoded_anew,
+        }
+    }
+
+    fn assemble(
+        &mut self,
+        bounds: (u32, u32),
+        frames: Vec<Arc<VideoFrame>>,
+        first_failure: Option<SharedString>,
+    ) -> Picture {
+        if frames.is_empty() {
+            let reason = first_failure.unwrap_or_else(|| NO_VIDEO.into());
             return Picture::Failed(reason);
         }
-        let assembled =
-            assemble_image(self.compositor.compositor(), request.bounds, decoded.frames);
+        let assembled = assemble_image(self.compositor.compositor(), bounds, frames);
         if assembled.compositing_failed {
             self.compositor_strikes += 1;
             self.compositor = if self.compositor_strikes >= COMPOSITOR_STRIKES {
@@ -153,16 +165,25 @@ impl Renderer {
 
 fn render_guarded<R>(
     mut renderer: R,
-    render: impl FnOnce(&mut R) -> Picture,
+    render: impl FnOnce(&mut R) -> Rendering,
     replacement: impl FnOnce() -> R,
-) -> (R, Picture) {
+) -> (R, Rendering) {
     match panic::catch_unwind(AssertUnwindSafe(|| render(&mut renderer))) {
-        Ok(picture) => (renderer, picture),
+        Ok(rendering) => (renderer, rendering),
         Err(_) => {
             tracing::error!("the viewer renderer panicked, starting a new one");
-            (replacement(), Picture::Failed(RENDERER_PANICKED.into()))
+            let panicked = Rendering {
+                picture: Picture::Failed(RENDERER_PANICKED.into()),
+                decoded_anew: true,
+            };
+            (replacement(), panicked)
         }
     }
+}
+
+struct Rendering {
+    picture: Picture,
+    decoded_anew: bool,
 }
 
 enum Picture {
@@ -332,15 +353,19 @@ impl Viewer {
             )
         });
         cx.spawn(async move |this, cx| {
-            let (renderer, picture) = rendered.await;
+            let (renderer, rendering) = rendered.await;
+            let elapsed = started.elapsed();
             this.update(cx, |viewer, cx| {
                 viewer.idle_renderer = Some(renderer);
-                viewer.latency = smoothed_latency(viewer.latency, started.elapsed());
+                if rendering.decoded_anew {
+                    viewer.latency = smoothed_latency(viewer.latency, elapsed);
+                }
                 let live = target
                     .request
                     .as_ref()
                     .is_some_and(|request| viewer.is_live_request(request, cx));
                 if live {
+                    let picture = rendering.picture;
                     viewer.settle(Rendered { target, picture }, cx);
                 }
                 viewer.render_wanted(cx);
@@ -563,6 +588,7 @@ fn speed_label(speed: Speed) -> Option<String> {
 struct Decoded {
     frames: Vec<Arc<VideoFrame>>,
     first_failure: Option<SharedString>,
+    decoded_anew: bool,
 }
 
 enum LayerFailure {
@@ -574,6 +600,7 @@ enum LayerFailure {
 struct LayerDecode {
     decoder: Option<VideoDecoder>,
     frame: Result<Arc<VideoFrame>, LayerFailure>,
+    decoded_anew: bool,
 }
 
 fn decode_layers(
@@ -600,6 +627,7 @@ fn decode_layers(
                     running.join().unwrap_or_else(|_| LayerDecode {
                         decoder: None,
                         frame: Err(LayerFailure::Remembered(RENDERER_PANICKED.into())),
+                        decoded_anew: true,
                     })
                 })
                 .collect()
@@ -612,8 +640,10 @@ fn decode_layers(
     let mut decoded = Decoded {
         frames: Vec::new(),
         first_failure: None,
+        decoded_anew: false,
     };
     for (layer, outcome) in layers.iter().zip(outcomes) {
+        decoded.decoded_anew |= outcome.decoded_anew;
         if let Some(decoder) = outcome.decoder {
             decoders.insert(layer.decoder.clone(), decoder);
         }
@@ -650,6 +680,7 @@ fn decode_layer(
             return LayerDecode {
                 decoder: None,
                 frame: Err(LayerFailure::Remembered(reason)),
+                decoded_anew: false,
             };
         }
         Ok(Some(decoder)) => decoder,
@@ -670,15 +701,18 @@ fn decode_layer(
                     return LayerDecode {
                         decoder: None,
                         frame: Err(LayerFailure::Open(error)),
+                        decoded_anew: true,
                     };
                 }
             }
         }
     };
+    let decoded_anew = !decoder.is_cached(layer.time);
     let frame = decoder.frame_at(layer.time).map_err(LayerFailure::Frame);
     LayerDecode {
         decoder: Some(decoder),
         frame,
+        decoded_anew,
     }
 }
 
@@ -1149,27 +1183,36 @@ mod tests {
 
         assert!(decoded.frames.is_empty());
         assert!(decoded.first_failure.is_some());
+        assert!(decoded.decoded_anew);
         assert_eq!(failed.len(), 2);
         assert!(decoders.is_empty());
 
         let again = decode_layers(&mut decoders, &mut failed, &layers[..1]);
 
         assert_eq!(again.first_failure, decoded.first_failure);
+        assert!(!again.decoded_anew);
         assert_eq!(failed.len(), 2);
     }
 
     #[test]
     fn a_panicking_render_gives_back_a_fresh_renderer_and_a_failure() {
-        let (renderer, picture) =
+        let black = |_: &mut u32| Rendering {
+            picture: Picture::Black,
+            decoded_anew: false,
+        };
+
+        let (renderer, rendering) =
             render_guarded(1_u32, |_| panic!("the device was lost"), || 2_u32);
 
         assert_eq!(renderer, 2);
-        assert!(matches!(picture, Picture::Failed(reason) if reason == RENDERER_PANICKED));
+        assert!(
+            matches!(rendering.picture, Picture::Failed(reason) if reason == RENDERER_PANICKED)
+        );
 
-        let (renderer, picture) = render_guarded(1_u32, |_| Picture::Black, || 2_u32);
+        let (renderer, rendering) = render_guarded(1_u32, black, || 2_u32);
 
         assert_eq!(renderer, 1);
-        assert!(matches!(picture, Picture::Black));
+        assert!(matches!(rendering.picture, Picture::Black));
     }
 
     #[gpui::test]

@@ -123,7 +123,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   which the model can't hold, an attached picture (cover art) and a stream whose decoder cannot be
   set up (warned about), instead of failing the import. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
-  byte-bounded LRU cache keyed by the span each frame covers. FFmpeg types do not cross its public
+  byte-bounded LRU cache keyed by the span each frame covers; `is_cached` says whether a time would be answered
+  from it, without changing the eviction order. FFmpeg types do not cross its public
   API, apart from the `FfmpegError` re-export. A decoder refuses a stream whose time base has a
   part that isn't positive (`InvalidTimeBase`), and converts through the checked `TimeBase`.
   `VideoDecoder` is `Send` so it can move to a background task: ffmpeg-next leaves its scaler
@@ -244,7 +245,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   joins the project at once, and the bin then queues its thumbnail (decoded in software at
   thumbnail size) for every video asset that has none, so a thumbnail also returns after an undo
   brings the asset back and is released from the atlas when the asset goes. A dropped folder is
-  scanned for files with a media extension. A path that is not valid UTF-8 is refused, since a
+  scanned for files with a media extension (`MEDIA_EXTENSIONS`), leaving out images such as cover
+  art. A file chosen in the dialog (which can't filter by type) or dropped on its own is refused
+  without probing unless it has a media or still-image extension (`STILL_EXTENSIONS`). An import
+  is skipped when its path, or its canonical path, matches an asset's path or the canonical path
+  the presence check resolved for it; the probe and the presence check canonicalize on their
+  background jobs, and a finished import records its canonical path at once, so two paths to one
+  file dropped together import it once. A path that is not valid UTF-8 is refused, since a
   project could not save it. Failures show as one dismissible row. Each row shows the asset's metadata (duration, size, codec
   and rate), is marked Unused when no clip uses it and Missing when a background check found the
   file gone, and has a Remove button (refused while a clip uses the asset) or, when missing, a
@@ -309,7 +316,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   playhead is still at it (when paused it must also still match the wanted frame). One job runs at a time, so while scrubbing only the newest request runs next, and the viewer
   releases each replaced frame from the GPUI atlas with `Window::drop_image`. While playing, it
   asks for the frame at the time it will reach the screen instead of the playhead's: the playhead
-  plus the render latency (a smoothed average of recent jobs) times the speed, clamped to the
+  plus the render latency (a smoothed average of recent jobs that decoded something: a job whose
+  layers all came from the decoders' caches or from remembered failures is left out) times the
+  speed, clamped to the
   timeline (`presentation_time`). A frame that lands early is held until the playhead reaches it,
   one overtaken by a newer frame is dropped, and a change of speed drops a held frame
   (`fate`), so a slow decode or composite shows fewer frames rather than lagging the audio.

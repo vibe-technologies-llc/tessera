@@ -6,10 +6,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, AppContext, Context, ElementId, Entity, ExternalPaths, FocusHandle, FontWeight,
-    InteractiveElement, IntoElement, ObjectFit, ParentElement, PathPromptOptions, Render,
-    RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription,
-    Window, div, img, px,
+    AnyElement, App, AppContext, Context, ElementId, Entity, ExternalPaths, FocusHandle,
+    FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement, PathPromptOptions,
+    Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage,
+    Subscription, Window, div, img, px,
 };
 use tessera_media::{VideoDecoder, VideoFrame, probe};
 use tessera_timeline::{Asset, AssetId, Command, FLICKS_PER_SECOND, MediaInfo, Project, Time};
@@ -32,8 +32,12 @@ const MAX_FAILURE_LINES: usize = 3;
 const MAX_FOLDER_DEPTH: usize = 8;
 const MEDIA_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "m4v", "mov", "avi", "webm", "mpg", "mpeg", "ts", "mts", "m2ts", "wmv", "flv",
-    "ogv", "3gp", "mxf", "mp3", "wav", "flac", "ogg", "opus", "aac", "m4a", "aif", "aiff", "wma",
+    "ogv", "3gp", "mxf", "dv", "vob", "m2v", "mp3", "wav", "flac", "ogg", "opus", "aac", "m4a",
+    "mka", "ac3", "aif", "aiff", "caf", "wma",
 ];
+const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"];
+const UNSUPPORTED_FILE: &str = "not a media file Tessera can import";
+const NOT_UTF8: &str = "the path is not valid UTF-8, so a project could not save it";
 
 #[derive(Clone)]
 pub struct DraggedAsset {
@@ -86,6 +90,7 @@ enum Job {
 enum Finished {
     Probed {
         path: PathBuf,
+        canonical: Option<PathBuf>,
         info: Result<MediaInfo, tessera_media::Error>,
     },
     Scanned {
@@ -100,7 +105,7 @@ enum Finished {
     Exists {
         id: AssetId,
         path: PathBuf,
-        present: bool,
+        canonical: Option<PathBuf>,
     },
     Thumbnail {
         id: AssetId,
@@ -114,6 +119,7 @@ impl Job {
         match self {
             Self::Probe(path) => Finished::Probed {
                 info: probe(&path),
+                canonical: fs::canonicalize(&path).ok(),
                 path,
             },
             Self::Scan(folder) => Finished::Scanned {
@@ -126,7 +132,7 @@ impl Job {
                 path,
             },
             Self::Exists { id, path } => Finished::Exists {
-                present: path.exists(),
+                canonical: fs::canonicalize(&path).ok(),
                 id,
                 path,
             },
@@ -186,6 +192,7 @@ fn visible_assets(assets: &[Asset], query: &str, order: SortOrder) -> Vec<AssetI
 struct Presence {
     path: PathBuf,
     present: Option<bool>,
+    canonical: Option<PathBuf>,
 }
 
 struct ImportFailure {
@@ -341,6 +348,7 @@ impl MediaBin {
                         Presence {
                             path: path.clone(),
                             present: None,
+                            canonical: None,
                         },
                     );
                 }
@@ -376,7 +384,11 @@ impl MediaBin {
 
     fn finish(&mut self, finished: Finished, cx: &mut Context<Self>) {
         match finished {
-            Finished::Probed { path, info } => self.finish_probe(path, info, cx),
+            Finished::Probed {
+                path,
+                canonical,
+                info,
+            } => self.finish_probe(path, canonical, info, cx),
             Finished::Scanned { folder, files } => {
                 if self.probing.contains(&folder) {
                     self.probing.retain(|probing| *probing != folder);
@@ -384,13 +396,18 @@ impl MediaBin {
                 }
             }
             Finished::Relinked { id, path, info } => self.finish_relink(id, path, info, cx),
-            Finished::Exists { id, path, present } => {
+            Finished::Exists {
+                id,
+                path,
+                canonical,
+            } => {
                 if let Some(known) = self
                     .presence
                     .get_mut(&id)
                     .filter(|known| known.path == path)
                 {
-                    known.present = Some(present);
+                    known.present = Some(canonical.is_some());
+                    known.canonical = canonical;
                     cx.notify();
                 }
             }
@@ -440,37 +457,45 @@ impl MediaBin {
     fn import(&mut self, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
         for path in paths {
             if path.to_str().is_none() {
-                self.fail(
-                    file_name(&path),
-                    "the path is not valid UTF-8, so a project could not save it".into(),
-                    cx,
-                );
+                self.fail(file_name(&path), NOT_UTF8.into(), cx);
                 continue;
             }
-            let known = self.probing.contains(&path)
-                || self
-                    .project
-                    .read(cx)
-                    .assets
-                    .iter()
-                    .any(|asset| asset.path == path);
-            if known {
+            if self.probing.contains(&path) || self.already_imported(&path, None, cx) {
                 continue;
             }
-            self.probing.push(path.clone());
-            self.waiting.push_back(if path.is_dir() {
-                Job::Scan(path)
+            let job = if path.is_dir() {
+                Job::Scan(path.clone())
+            } else if is_importable_file(&path) {
+                Job::Probe(path.clone())
             } else {
-                Job::Probe(path)
-            });
+                self.fail(file_name(&path), UNSUPPORTED_FILE.into(), cx);
+                continue;
+            };
+            self.probing.push(path);
+            self.waiting.push_back(job);
         }
         self.pump(cx);
         cx.notify();
     }
 
+    fn already_imported(&self, path: &Path, canonical: Option<&Path>, cx: &App) -> bool {
+        self.project.read(cx).assets.iter().any(|asset| {
+            let known_canonical = self
+                .presence
+                .get(&asset.id)
+                .filter(|known| known.path == asset.path)
+                .and_then(|known| known.canonical.as_deref());
+            asset.path == path
+                || canonical.is_some_and(|canonical| {
+                    asset.path == canonical || known_canonical == Some(canonical)
+                })
+        })
+    }
+
     fn finish_probe(
         &mut self,
         path: PathBuf,
+        canonical: Option<PathBuf>,
         probed: Result<MediaInfo, tessera_media::Error>,
         cx: &mut Context<Self>,
     ) {
@@ -482,10 +507,21 @@ impl MediaBin {
             Ok(info) if info.streams.is_empty() => {
                 self.fail(file_name(&path), "no audio or video streams".into(), cx);
             }
+            Ok(_) if self.already_imported(&path, canonical.as_deref(), cx) => {}
             Ok(info) => {
-                self.editor.perform(Command::ImportMedia, cx, |project| {
-                    project.add_asset(path, info)
+                let id = self.editor.perform(Command::ImportMedia, cx, |project| {
+                    project.add_asset(path.clone(), info)
                 });
+                if let Some(canonical) = canonical {
+                    self.presence.insert(
+                        id,
+                        Presence {
+                            path,
+                            present: Some(true),
+                            canonical: Some(canonical),
+                        },
+                    );
+                }
             }
             Err(error) => self.fail(file_name(&path), error.to_string(), cx),
         }
@@ -512,11 +548,7 @@ impl MediaBin {
 
     fn relink(&mut self, id: AssetId, path: PathBuf, cx: &mut Context<Self>) {
         if path.to_str().is_none() {
-            self.fail(
-                file_name(&path),
-                "the path is not valid UTF-8, so a project could not save it".into(),
-                cx,
-            );
+            self.fail(file_name(&path), NOT_UTF8.into(), cx);
             return;
         }
         self.waiting.push_back(Job::Relink { id, path });
@@ -934,17 +966,23 @@ fn collect_media_files(folder: &Path, depth: usize, found: &mut Vec<PathBuf>) {
                     collect_media_files(&path, deeper, found);
                 }
             }
-            Ok(kind) if kind.is_file() && has_media_extension(&path) => found.push(path),
+            Ok(kind) if kind.is_file() && has_extension(&path, MEDIA_EXTENSIONS) => {
+                found.push(path)
+            }
             _ => {}
         }
     }
 }
 
-fn has_media_extension(path: &Path) -> bool {
+fn is_importable_file(path: &Path) -> bool {
+    has_extension(path, MEDIA_EXTENSIONS) || has_extension(path, STILL_EXTENSIONS)
+}
+
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            MEDIA_EXTENSIONS
+            extensions
                 .iter()
                 .any(|known| known.eq_ignore_ascii_case(extension))
         })
@@ -1053,7 +1091,7 @@ mod tests {
         bin.update(cx, |bin, cx| {
             bin.editor.replace(second.clone(), cx);
             bin.project_replaced(cx);
-            bin.finish_probe("/missing/late.mkv".into(), Ok(video_info()), cx);
+            bin.finish_probe("/missing/late.mkv".into(), None, Ok(video_info()), cx);
         });
         cx.run_until_parked();
 
@@ -1148,6 +1186,87 @@ mod tests {
             assert!(bin.probing.is_empty());
         });
         fs::remove_dir_all(&folder).ok();
+    }
+
+    #[gpui::test]
+    fn files_that_are_not_media_are_refused_without_probing(cx: &mut TestAppContext) {
+        let project = cx.new(|_| Project::new("test"));
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+        let chosen: Vec<PathBuf> = ["notes.txt", "a.mkv", "photo.PNG", "archive"]
+            .into_iter()
+            .map(|name| PathBuf::from("/missing").join(name))
+            .collect();
+
+        bin.update(cx, |bin, cx| bin.import(chosen, cx));
+
+        cx.read(|cx| {
+            let bin = bin.read(cx);
+            assert_eq!(failure_sources(bin), ["archive", "notes.txt"]);
+            assert_eq!(
+                bin.probing,
+                [PathBuf::from("/missing/a.mkv"), "/missing/photo.PNG".into()]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn two_paths_to_one_file_import_it_once(cx: &mut TestAppContext) {
+        let project = cx.new(|_| Project::new("test"));
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+        let canonical = PathBuf::from("/media/a.mkv");
+
+        bin.update(cx, |bin, cx| {
+            bin.probing
+                .extend(["/media/a.mkv".into(), "/media/./link.mkv".into()]);
+            bin.finish_probe(
+                "/media/./link.mkv".into(),
+                Some(canonical.clone()),
+                Ok(video_info()),
+                cx,
+            );
+            bin.finish_probe(
+                "/media/a.mkv".into(),
+                Some(canonical.clone()),
+                Ok(video_info()),
+                cx,
+            );
+        });
+
+        cx.read(|cx| {
+            let bin = bin.read(cx);
+            assert!(bin.probing.is_empty());
+            assert_eq!(bin.project.read(cx).assets.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn a_file_already_imported_through_a_symlink_is_skipped(cx: &mut TestAppContext) {
+        let dir = scratch_dir("symlink");
+        let real = dir.join("real.mkv");
+        let link = dir.join("link.mkv");
+        fs::write(&real, "").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut project = Project::new("test");
+        project.add_asset(link, video_info());
+        let project = cx.new(|_| project);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+        cx.run_until_parked();
+
+        bin.update(cx, |bin, cx| {
+            bin.probing.push(real.clone());
+            bin.finish_probe(
+                real.clone(),
+                fs::canonicalize(&real).ok(),
+                Ok(video_info()),
+                cx,
+            );
+        });
+
+        cx.read(|cx| assert_eq!(bin.read(cx).project.read(cx).assets.len(), 1));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui::test]

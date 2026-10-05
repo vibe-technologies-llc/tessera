@@ -37,7 +37,6 @@
 ## Viewer
 
 - Read the composited frame back without waiting on the GPU in the same job
-- Keep cache hits out of the render latency average
 - Release replaced frames from the atlas when they are replaced, not on the next paint
 - Zoom and a 100 % view
 
@@ -50,8 +49,6 @@
 
 ## Media bin and workspace
 
-- Filter unsupported files in the import dialog and for files dropped one by one
-- Compare canonical paths when skipping duplicate imports
 - Menus, a shortcut reference and preferences
 
 ## Infrastructure

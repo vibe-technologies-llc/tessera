@@ -153,6 +153,10 @@ impl VideoDecoder {
         self.hw_accel
     }
 
+    pub fn is_cached(&self, time: Time) -> bool {
+        self.cache.contains(self.stream_ts(time))
+    }
+
     pub fn frame_at(&mut self, time: Time) -> Result<Arc<VideoFrame>, Error> {
         let target = self.stream_ts(time);
         if let Some(cached) = self.cache.get(target) {
@@ -720,9 +724,13 @@ mod tests {
         decoder
             .frame_at(fixture::FRAME_RATE.frame_to_time(12))
             .unwrap();
-        let again = decoder
-            .frame_at(middle_of_frame(fixture::FRAME_RATE, 4))
-            .unwrap();
+        let middle = middle_of_frame(fixture::FRAME_RATE, 4);
+
+        assert!(decoder.is_cached(middle));
+        assert!(!decoder.is_cached(fixture::FRAME_RATE.frame_to_time(20)));
+
+        let again = decoder.frame_at(middle).unwrap();
+
         assert!(Arc::ptr_eq(&first, &again));
     }
 

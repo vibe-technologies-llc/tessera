@@ -33,6 +33,10 @@ impl FrameCache {
         Some(frame)
     }
 
+    pub fn contains(&self, ts: i64) -> bool {
+        self.entries.iter().any(|entry| entry.span.contains(&ts))
+    }
+
     pub fn insert(&mut self, span: Range<i64>, frame: Arc<VideoFrame>) {
         let size = frame.bgra.len();
         if size > self.capacity_bytes || span.is_empty() {
@@ -99,6 +103,21 @@ mod tests {
         assert!(cache.get(1).is_none());
         assert!(cache.get(2).is_some());
         assert!(cache.get(3).is_some());
+    }
+
+    #[test]
+    fn asking_whether_a_frame_is_held_leaves_the_eviction_order_alone() {
+        let mut cache = FrameCache::new(8);
+        cache.insert(0..1, frame(4));
+        cache.insert(1..2, frame(4));
+
+        assert!(cache.contains(0));
+        assert!(!cache.contains(2));
+
+        cache.insert(2..3, frame(4));
+
+        assert!(!cache.contains(0));
+        assert!(cache.contains(1));
     }
 
     #[test]
