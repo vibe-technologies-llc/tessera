@@ -413,7 +413,7 @@ impl Timeline {
     pub fn video_clips_at(&self, time: Time) -> impl DoubleEndedIterator<Item = &Clip> {
         self.tracks
             .iter()
-            .filter(|track| track.kind == TrackKind::Video)
+            .filter(|track| track.kind == TrackKind::Video && !track.muted)
             .filter_map(move |track| track.clip_at(time))
     }
 
@@ -1605,5 +1605,34 @@ mod tests {
         assert_eq!(track.name, "");
         assert!(!track.locked && !track.muted && !track.solo);
         assert_eq!(track.height, TrackHeight::Normal);
+    }
+
+    #[test]
+    fn a_muted_video_track_is_left_out_of_the_composite() {
+        let mut timeline = Timeline {
+            tracks: [TrackKind::Video, TrackKind::Video]
+                .map(Track::new)
+                .to_vec(),
+        };
+        for (track, asset) in [(0, 1), (1, 2)] {
+            let clip = Clip {
+                asset: AssetId(asset),
+                ..clip(0, 4)
+            };
+            timeline.tracks[track].insert(clip).unwrap();
+        }
+
+        timeline.tracks[1].muted = true;
+
+        assert_eq!(
+            timeline
+                .top_video_clip_at(Time::from_seconds(1))
+                .map(|clip| clip.asset),
+            Some(AssetId(1))
+        );
+
+        timeline.tracks[0].muted = true;
+
+        assert_eq!(timeline.top_video_clip_at(Time::from_seconds(1)), None);
     }
 }

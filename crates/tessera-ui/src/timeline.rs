@@ -17,7 +17,7 @@ use tessera_timeline::{
 };
 
 use self::{
-    header::{add_track_row, content_height, track_header, track_rows},
+    header::{add_track_row, content_height, next_height_of, row_height, track_header, track_rows},
     snap::{Snap, SnapTargets},
     viewport::Viewport,
 };
@@ -30,8 +30,10 @@ use crate::{
 
 const ZOOM_STEP: f32 = 2.;
 const WHEEL_PIXELS_PER_DOUBLING: f32 = 120.;
-const TRACK_HEADER_WIDTH: f32 = 96.;
+const TRACK_HEADER_WIDTH: f32 = 128.;
 const TRACK_HEIGHT: f32 = 48.;
+const COMPACT_TRACK_HEIGHT: f32 = 32.;
+const TALL_TRACK_HEIGHT: f32 = 80.;
 const RULER_HEIGHT: f32 = 24.;
 const MIN_MAJOR_TICK_SPACING: f32 = 96.;
 const MAJOR_TICK_HEIGHT: f32 = 10.;
@@ -157,6 +159,13 @@ impl DropPreview {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrackFlag {
+    Locked,
+    Muted,
+    Solo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Grip {
     Body,
     Edge(ClipEdge),
@@ -264,17 +273,22 @@ impl TimelinePanel {
     pub fn split_at_playhead(&mut self, cx: &mut Context<Self>) {
         let time = self.playhead.read(cx).time();
         let project = self.project.read(cx);
+        let editable = |track: usize| !project.timeline.tracks[track].locked;
         let selected: Vec<ClipId> = self
             .selection
             .iter()
             .filter_map(|id| project.find_clip(*id))
-            .filter(|(_, clip)| clip.is_cut_by(time))
+            .filter(|(track, clip)| editable(*track) && clip.is_cut_by(time))
             .map(|(_, clip)| clip.id)
             .collect();
         let targets: Vec<ClipId> = if selected.is_empty() {
             project
                 .timeline
-                .clips_cut_by(time)
+                .tracks
+                .iter()
+                .filter(|track| !track.locked)
+                .filter_map(|track| track.clip_at(time))
+                .filter(|clip| clip.is_cut_by(time))
                 .map(|clip| clip.id)
                 .collect()
         } else {
@@ -304,10 +318,21 @@ impl TimelinePanel {
         remove: impl FnOnce(&mut Project, &[ClipId]) -> Result<Vec<Clip>, EditError>,
         cx: &mut Context<Self>,
     ) {
-        if self.selection.is_empty() {
+        let project = self.project.read(cx);
+        let ids: Vec<ClipId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                project
+                    .find_clip(*id)
+                    .is_some_and(|(track, _)| !project.timeline.tracks[track].locked)
+            })
+            .collect();
+        if ids.is_empty() {
             return;
         }
-        let ids: Vec<ClipId> = std::mem::take(&mut self.selection).into_iter().collect();
+        self.selection.retain(|id| !ids.contains(id));
         if let Err(error) = self
             .editor
             .apply(command, cx, |project| remove(project, &ids))
@@ -349,17 +374,53 @@ impl TimelinePanel {
         }
     }
 
-    fn scroll_tracks(&mut self, delta: Pixels, rows: usize, cx: &mut Context<Self>) {
-        let scroll = self.clamped_track_scroll(self.track_scroll - delta, rows);
+    fn scroll_tracks(&mut self, delta: Pixels, content: f32, cx: &mut Context<Self>) {
+        let scroll = self.clamped_track_scroll(self.track_scroll - delta, content);
         if scroll != self.track_scroll {
             self.track_scroll = scroll;
             cx.notify();
         }
     }
 
-    fn clamped_track_scroll(&self, scroll: Pixels, rows: usize) -> Pixels {
-        let overflow = px(content_height(rows)) - self.tracks_view.size.height;
+    fn clamped_track_scroll(&self, scroll: Pixels, content: f32) -> Pixels {
+        let overflow = px(content) - self.tracks_view.size.height;
         scroll.min(overflow).max(px(0.))
+    }
+
+    fn toggle_track(&mut self, index: usize, flag: TrackFlag, cx: &mut Context<Self>) {
+        let command = match flag {
+            TrackFlag::Locked => Command::LockTrack,
+            TrackFlag::Muted => Command::MuteTrack,
+            TrackFlag::Solo => Command::SoloTrack,
+        };
+        self.edit_track(command, index, cx, |track| {
+            let value = match flag {
+                TrackFlag::Locked => &mut track.locked,
+                TrackFlag::Muted => &mut track.muted,
+                TrackFlag::Solo => &mut track.solo,
+            };
+            *value = !*value;
+        });
+    }
+
+    fn cycle_track_height(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.edit_track(Command::ResizeTrack, index, cx, |track| {
+            track.height = next_height_of(track);
+        });
+    }
+
+    fn edit_track(
+        &mut self,
+        command: Command,
+        index: usize,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&mut Track),
+    ) {
+        self.editor.perform(command, cx, |project| {
+            if let Some(track) = project.timeline.tracks.get_mut(index) {
+                edit(track);
+            }
+        });
     }
 
     fn zoom_around_playhead(&mut self, factor: f32, cx: &mut Context<Self>) {
@@ -376,8 +437,8 @@ impl TimelinePanel {
         let delta = event.delta.pixel_delta(window.line_height());
         cx.stop_propagation();
         if event.modifiers.shift {
-            let rows = self.project.read(cx).timeline.tracks.len();
-            self.scroll_tracks(delta.x + delta.y, rows, cx);
+            let content = content_height(&self.project.read(cx).timeline.tracks);
+            self.scroll_tracks(delta.x + delta.y, content, cx);
             return;
         }
         let limit = self.scroll_limit(cx);
@@ -731,7 +792,7 @@ impl Render for TimelinePanel {
         let frame_rate = project.settings.frame_rate;
         let tracks = &project.timeline.tracks;
         let rows = track_rows(&project.timeline);
-        self.track_scroll = self.clamped_track_scroll(self.track_scroll, rows.len());
+        self.track_scroll = self.clamped_track_scroll(self.track_scroll, content_height(tracks));
         let scroll = self.track_scroll;
         let lanes = rows.iter().map(|row| {
             let lane = Lane {
@@ -848,7 +909,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
         .filter(|preview| preview.track == index)
         .map(|preview| drop_ghost(preview, viewport));
     div()
-        .h(px(TRACK_HEIGHT))
+        .h(px(row_height(track.height)))
         .flex_none()
         .relative()
         .border_b_1()
@@ -1176,7 +1237,7 @@ mod tests {
     use std::num::{NonZero, NonZeroI64};
 
     use gpui::{Modifiers, Point, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext};
-    use tessera_timeline::{MediaInfo, Stream, VideoStream};
+    use tessera_timeline::{MediaInfo, Stream, TrackHeight, VideoStream};
 
     use super::{header::*, *};
 
@@ -1187,6 +1248,15 @@ mod tests {
 
     fn row_y(row: usize) -> Pixels {
         px(RULER_HEIGHT + TRACK_HEIGHT * (row as f32 + 0.5))
+    }
+
+    fn header_line_y(row: usize, line: usize) -> Pixels {
+        px(RULER_HEIGHT + TRACK_HEIGHT * row as f32 + HEADER_LINE_HEIGHT * (line as f32 + 0.5))
+    }
+
+    fn header_toggle_x(from_left: usize) -> Pixels {
+        let step = HEADER_BUTTON_SIZE + HEADER_BUTTON_GAP;
+        px(HEADER_PADDING + HEADER_BUTTON_SIZE / 2. + step * from_left as f32)
     }
 
     fn header_button_x(from_right: usize) -> Pixels {
@@ -1451,17 +1521,26 @@ mod tests {
             kinds_and_clip_track(&panel, cx, clip),
             (vec![Video, Video, Audio, Audio], Some(0))
         );
-        cx.simulate_click(point(header_button_x(DOWN), row_y(0)), Modifiers::none());
+        cx.simulate_click(
+            point(header_button_x(DOWN), header_line_y(0, 0)),
+            Modifiers::none(),
+        );
         assert_eq!(
             kinds_and_clip_track(&panel, cx, clip),
             (vec![Video, Video, Audio, Audio], Some(1))
         );
-        cx.simulate_click(point(header_button_x(REMOVE), row_y(0)), Modifiers::none());
+        cx.simulate_click(
+            point(header_button_x(REMOVE), header_line_y(0, 0)),
+            Modifiers::none(),
+        );
         assert_eq!(
             kinds_and_clip_track(&panel, cx, clip),
             (vec![Video, Video, Audio, Audio], Some(1))
         );
-        cx.simulate_click(point(header_button_x(REMOVE), row_y(1)), Modifiers::none());
+        cx.simulate_click(
+            point(header_button_x(REMOVE), header_line_y(1, 0)),
+            Modifiers::none(),
+        );
         assert_eq!(
             kinds_and_clip_track(&panel, cx, clip),
             (vec![Video, Audio, Audio], Some(0))
@@ -1493,14 +1572,14 @@ mod tests {
         cx.simulate_click(point(at(4.), row_y(V1_ROW - 1)), Modifiers::none());
         assert_eq!(selected(&panel, cx), BTreeSet::from([clip]));
         wheel(cx, -100_000.);
-        let (rows, view) = cx.read(|cx| {
+        let (content, view) = cx.read(|cx| {
             let panel = panel.read(cx);
             (
-                panel.project.read(cx).timeline.tracks.len(),
+                content_height(&panel.project.read(cx).timeline.tracks),
                 panel.tracks_view,
             )
         });
-        assert_eq!(scroll(cx), px(content_height(rows)) - view.size.height);
+        assert_eq!(scroll(cx), px(content) - view.size.height);
         wheel(cx, 100_000.);
         assert_eq!(scroll(cx), px(0.));
         assert_eq!(cx.read(|cx| panel.read(cx).viewport), Viewport::default());
@@ -1842,5 +1921,85 @@ mod tests {
 
         assert_eq!(ids(Some(view)), [ClipId(1), ClipId(2)]);
         assert_eq!(ids(None), [ClipId(0), ClipId(1), ClipId(2), ClipId(3)]);
+    }
+
+    fn track_of(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext, index: usize) -> Track {
+        cx.read(|cx| panel.read(cx).project.read(cx).timeline.tracks[index].clone())
+    }
+
+    #[gpui::test]
+    fn header_toggles_lock_mute_solo_and_resize_a_track(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        click_add(cx, 3, TrackKind::Audio);
+        let audio_row = 2;
+        let audio = 2;
+        let click = |cx: &mut VisualTestContext, row: usize, nth: usize| {
+            cx.simulate_click(
+                point(header_toggle_x(nth), header_line_y(row, 1)),
+                Modifiers::none(),
+            );
+        };
+
+        click(cx, V1_ROW, 0);
+
+        assert!(track_of(&panel, cx, 0).locked);
+
+        click(cx, V1_ROW, 0);
+
+        assert!(!track_of(&panel, cx, 0).locked);
+
+        click(cx, audio_row, 1);
+        click(cx, audio_row, 2);
+
+        let track = track_of(&panel, cx, audio);
+        assert!(track.muted && track.solo);
+
+        click(cx, V1_ROW, 1);
+
+        assert!(track_of(&panel, cx, 0).muted);
+
+        click(cx, V1_ROW, 2);
+
+        assert_eq!(track_of(&panel, cx, 0).height, TrackHeight::Tall);
+
+        panel.update(cx, |panel, cx| panel.editor.undo(cx));
+
+        assert_eq!(track_of(&panel, cx, 0).height, TrackHeight::Normal);
+    }
+
+    #[gpui::test]
+    fn a_shorter_track_pulls_the_rows_below_it_up(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+        panel.update(cx, |panel, cx| {
+            panel.edit_track(Command::ResizeTrack, 1, cx, |track| {
+                track.height = TrackHeight::Compact;
+            });
+        });
+        let row_center = RULER_HEIGHT + COMPACT_TRACK_HEIGHT + TRACK_HEIGHT * 0.5;
+
+        cx.simulate_click(point(at(4.), px(row_center)), Modifiers::none());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clip]));
+    }
+
+    #[gpui::test]
+    fn commands_skip_the_clips_of_locked_tracks(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (1, 1)]);
+        seek(&panel, cx, 3);
+        panel.update(cx, |panel, cx| {
+            panel.edit_track(Command::LockTrack, 0, cx, |track| track.locked = true);
+        });
+
+        panel.update(cx, TimelinePanel::split_at_playhead);
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1]));
+        assert_eq!(starts_on(&panel, cx, 1), seconds(&[1, 3]));
+
+        panel.update(cx, TimelinePanel::select_all);
+        panel.update(cx, TimelinePanel::delete_selection);
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1]));
+        assert!(starts_on(&panel, cx, 1).is_empty());
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clips[0]]));
     }
 }

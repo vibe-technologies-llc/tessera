@@ -506,7 +506,7 @@ mod tests {
 
     const TIMELINE_HEIGHT: f32 = 260.;
     const V1_BELOW_TIMELINE_TOP: f32 = 1. + 24. + 24.;
-    const LANES_LEFT: f32 = 96.;
+    const LANES_LEFT: f32 = 128.;
     const ONE_SECOND: f32 = 48.;
 
     fn starts(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Vec<Time> {

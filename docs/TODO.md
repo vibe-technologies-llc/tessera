@@ -80,8 +80,7 @@
   mid-drag
 - Copy, paste, cut and duplicate clips
 - Go to the next and previous edit, set in and out points and markers, and cancel a drag with Escape
-- Track headers with names, lock, mute, solo and a height, and an explanation on the disabled remove
-  button
+- Rename tracks in their headers, which needs a text input
 
 ## Media bin and workspace
 

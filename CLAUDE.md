@@ -71,7 +71,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   the timeline and the id counters when it fails. A `Track` carries a `name`
   (empty shows the default label), `locked`, `muted`, `solo` and a `TrackHeight`; a locked track
   refuses every edit of its clips and every placement onto it (`TrackLocked`), through
-  `located_clip` and `track_accepting`. The project holds `markers` (sorted by time, with
+  `located_clip` and `track_accepting`. A muted video track is left out of the composite
+  (`video_clips_at`), a muted audio track is silent, and `solo` applies to audio tracks only. The project holds `markers` (sorted by time, with
   `MarkerId`s from `NextIds` that are never reused; `add_marker`, `move_marker`, `rename_marker`,
   `remove_marker`, `next_marker_after`, `previous_marker_before`) and an `in_point` and
   `out_point` that stay in order (`set_in_point`, `set_out_point`, `clear_in_out`). `ripple_delete_clip` pulls the later
@@ -246,8 +247,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   playhead, or every clip under it when none of the selection is there. Delete or Backspace
   deletes the selection, and with Shift held they ripple delete it. The timeline draws video tracks
   from the highest index down, then audio tracks in order (`header::display_order`). Each track
-  header has buttons to swap it with its same-kind neighbour or remove it, and a row below the
-  tracks adds video or audio tracks. Shift+wheel scrolls the track rows vertically, under a fixed
+  header shows the track's name (or its numbered label), has buttons to swap it with its same-kind
+  neighbour or remove it (the disabled remove button's tooltip says why), toggles for lock, mute
+  (hide on a video track) and solo (audio only) and a button that cycles the row height between
+  compact, normal and tall (`header::row_height`), and a row below the tracks adds video or audio
+  tracks. Split and delete skip the clips of locked tracks. Renaming a track has no UI yet. Shift+wheel scrolls the track rows vertically, under a fixed
   ruler. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` requests every video clip under the
