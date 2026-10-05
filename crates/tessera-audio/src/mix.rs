@@ -13,13 +13,16 @@ use crate::CHANNELS;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Span<'a> {
     path: &'a Path,
-    source: Time,
+    track: usize,
+    source_sample: i64,
     frames: Range<usize>,
 }
 
+type DecoderKey = (PathBuf, usize);
+
 pub struct Mixer {
     project: Project,
-    decoders: HashMap<PathBuf, AudioDecoder>,
+    decoders: HashMap<DecoderKey, AudioDecoder>,
     failed: HashSet<PathBuf>,
 }
 
@@ -44,7 +47,8 @@ impl Mixer {
         }
         let project = &self.project;
         let held = |path: &PathBuf| project.assets.iter().any(|asset| asset.path == *path);
-        self.decoders.retain(|path, _| held(path));
+        self.decoders
+            .retain(|(path, track), _| held(path) && *track < project.timeline.tracks.len());
         self.failed.retain(held);
     }
 
@@ -57,10 +61,11 @@ impl Mixer {
             if self.failed.contains(path) {
                 continue;
             }
-            let decoder = match self.decoders.get_mut(path) {
+            let key = (path.to_owned(), span.track);
+            let decoder = match self.decoders.get_mut(&key) {
                 Some(decoder) => decoder,
                 None => match AudioDecoder::open(path, sample_rate) {
-                    Ok(opened) => self.decoders.entry(path.to_owned()).or_insert(opened),
+                    Ok(opened) => self.decoders.entry(key.clone()).or_insert(opened),
                     Err(error) => {
                         tracing::warn!(path = %path.display(), %error, "audio clip cannot be played");
                         self.failed.insert(path.to_owned());
@@ -68,7 +73,7 @@ impl Mixer {
                     }
                 },
             };
-            match decoder.samples(span.source, span.frames.len()) {
+            match decoder.samples_from(span.source_sample, span.frames.len()) {
                 Ok(buffer) => {
                     let mixed = &mut out[span.frames.start * CHANNELS..span.frames.end * CHANNELS];
                     for (mixed, sample) in mixed.iter_mut().zip(&buffer.samples) {
@@ -77,7 +82,7 @@ impl Mixer {
                 }
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "audio clip stopped playing");
-                    self.decoders.remove(path);
+                    self.decoders.remove(&key);
                     self.failed.insert(path.to_owned());
                 }
             }
@@ -109,25 +114,28 @@ fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) 
             .timeline
             .tracks
             .iter()
-            .filter(|track| track.kind == TrackKind::Audio)
+            .enumerate()
+            .filter(|(_, track)| track.kind == TrackKind::Audio)
     };
-    let any_solo = audio().any(|track| track.solo);
+    let any_solo = audio().any(|(_, track)| track.solo);
     audio()
-        .filter(|track| !track.muted && (track.solo || !any_solo))
-        .flat_map(|track| track.clips_overlapping(block))
-        .filter_map(|clip| {
+        .filter(|(_, track)| !track.muted && (track.solo || !any_solo))
+        .flat_map(|(index, track)| {
+            track
+                .clips_overlapping(block)
+                .iter()
+                .map(move |clip| (index, clip))
+        })
+        .filter_map(|(track, clip)| {
             let path = &project.asset(clip.asset)?.path;
             let covered = clip_samples(clip, sample_rate);
             let start = covered.start.max(first);
             let stop = covered.end.min(end);
-            (start < stop).then(|| {
-                let offset_in_clip =
-                    (Time::from_samples(start, sample_rate) - clip.start).max(Time::ZERO);
-                Span {
-                    path,
-                    source: clip.source.start + offset_in_clip,
-                    frames: (start - first) as usize..(stop - first) as usize,
-                }
+            (start < stop).then(|| Span {
+                path,
+                track,
+                source_sample: clip.source.start.to_samples(sample_rate) + (start - covered.start),
+                frames: (start - first) as usize..(stop - first) as usize,
             })
         })
         .collect()
@@ -142,9 +150,18 @@ fn time_touching_samples(samples: Range<i64>, sample_rate: NonZeroU32) -> TimeRa
     )
 }
 
+fn ceil_samples(time: Time, sample_rate: NonZeroU32) -> i64 {
+    let floor = time.to_samples(sample_rate);
+    if Time::from_samples(floor, sample_rate) < time {
+        floor + 1
+    } else {
+        floor
+    }
+}
+
 fn clip_samples(clip: &Clip, sample_rate: NonZeroU32) -> Range<i64> {
     let range = clip.timeline_range();
-    range.start.to_samples(sample_rate)..range.end().to_samples(sample_rate)
+    ceil_samples(range.start, sample_rate)..ceil_samples(range.end(), sample_rate)
 }
 
 #[cfg(test)]
@@ -198,7 +215,7 @@ mod tests {
             .unwrap();
         let spans = spans(&project, RATE, ONE_SECOND - 100, 1024);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].source, Time::ZERO);
+        assert_eq!(spans[0].source_sample, 0);
         assert_eq!(spans[0].frames, 100..1024);
     }
 
@@ -209,7 +226,7 @@ mod tests {
         let first = spans(&project, RATE, 0, 1024);
         let second = spans(&project, RATE, 1024, 1024);
         assert_eq!(first[0].frames, 0..1024);
-        assert_eq!(second[0].source, Time::from_samples(1024, RATE));
+        assert_eq!(second[0].source_sample, 1024);
         assert_eq!(second[0].frames, 0..1024);
     }
 
@@ -223,7 +240,7 @@ mod tests {
             .unwrap();
         let spans = spans(&project, RATE, 0, RATE.get() as usize);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].source, half_second);
+        assert_eq!(spans[0].source_sample, ONE_SECOND / 2);
         assert_eq!(
             spans[0].frames,
             RATE.get() as usize / 2..RATE.get() as usize
@@ -231,17 +248,56 @@ mod tests {
     }
 
     #[test]
-    fn a_clip_starting_on_the_flick_a_block_ends_at_still_sounds_its_first_sample() {
+    fn a_clip_starting_between_samples_sounds_from_the_next_sample() {
         let (mut project, asset, track) = project_with_tone();
         let rate = NonZeroU32::new(11).unwrap();
-        let block_end = Time::from_samples(1, rate);
+        let start = Time::from_samples(1, rate);
 
-        project.place_clip(asset, track, block_end).unwrap();
-        let spans = spans(&project, rate, 0, 1);
+        project.place_clip(asset, track, start).unwrap();
 
-        assert_eq!(block_end.to_samples(rate), 0);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].frames, 0..1);
+        assert_eq!(start.to_samples(rate), 0);
+        assert!(spans(&project, rate, 0, 1).is_empty());
+
+        let next = spans(&project, rate, 1, 1);
+
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].source_sample, 0);
+    }
+
+    #[test]
+    fn blocks_continue_exactly_when_the_clip_starts_between_samples() {
+        let (mut project, asset, track) = project_with_tone();
+        let start = tessera_timeline::FrameRate::NTSC_30.frame_to_time(1);
+        let first_sample = ceil_samples(start, RATE);
+        project.place_clip(asset, track, start).unwrap();
+
+        assert_ne!(Time::from_samples(first_sample, RATE), start);
+
+        let mut next_source = 0;
+        for block in 0..4 {
+            let spans = spans(&project, RATE, block * 1024, 1024);
+            let Some(span) = spans.first() else {
+                continue;
+            };
+            assert_eq!(span.source_sample, next_source, "block {block}");
+            next_source = span.source_sample + span.frames.len() as i64;
+        }
+
+        assert_eq!(next_source, 4 * 1024 - first_sample);
+    }
+
+    #[test]
+    fn two_clips_of_one_file_on_different_tracks_read_separately() {
+        let (mut project, asset, track) = project_with_tone();
+        let second_track = project.timeline.add_track(TrackKind::Audio);
+        project.place_clip(asset, track, Time::ZERO).unwrap();
+        project.place_clip(asset, second_track, Time::ZERO).unwrap();
+
+        let spans = spans(&project, RATE, 0, 1024);
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].path, spans[1].path);
+        assert_ne!(spans[0].track, spans[1].track);
     }
 
     #[test]

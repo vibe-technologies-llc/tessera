@@ -116,7 +116,10 @@ impl AudioDecoder {
     }
 
     pub fn samples(&mut self, start: Time, frames: usize) -> Result<AudioBuffer, Error> {
-        let first = start.to_samples(self.sample_rate);
+        self.samples_from(start.to_samples(self.sample_rate), frames)
+    }
+
+    pub fn samples_from(&mut self, first: i64, frames: usize) -> Result<AudioBuffer, Error> {
         let end = first + frames as i64;
         if self.needs_seek(first) {
             self.seek(first)?;

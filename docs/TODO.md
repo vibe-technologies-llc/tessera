@@ -31,10 +31,6 @@
 - Mix the audio tracks, with per-clip gain and per-track volume
 - Flush the queued audio when the project changes while playing, instead of playing up to 200 ms of
   the old timeline
-- Give each clip its own read position, so two clips of one file overlapping in time don't seek on
-  every block
-- Carry the fraction of a clip start that isn't sample-aligned (NTSC frame starts), which repeats
-  one sample at the clip's first block boundary
 - Restart the output when the sequence's sample rate changes while playing
 - Play sound at shuttle speeds, in reverse and while scrubbing or stepping
 - Play the last frame's sound at the end of the timeline instead of stopping at its start

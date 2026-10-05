@@ -170,8 +170,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   soloed ones) that overlaps the block (`clips_overlapping`) is read
   from an `AudioDecoder` (one per media path, at the project's sample rate) and summed into its
   part of the block; the sum then goes through a soft limiter that leaves samples up to ±0.9 alone
-  and eases the rest toward ±1.0. A clip reads from its source start plus its offset into the clip, so blocks
-  that follow each other continue in the source without seeking. Media that fails to open or
+  and eases the rest toward ±1.0. A clip's first sample is the first one at or after its start
+  (`ceil_samples`), and the source sample for every later one is counted from there in whole
+  samples (`AudioDecoder::samples_from`), so blocks that follow each other continue in the source
+  without seeking or repeating a sample even when the clip starts between samples. Decoders are
+  kept per media path and track, so two clips of one file overlapping in time do not seek each
+  other. Media that fails to open or
   decode is warned about once and stays silent. `Output` runs a PipeWire playback stream on its
   own thread, whose process callback copies whole frames out of a shared queue (silence on
   underrun), and a feeder thread that keeps about 200 ms queued by calling the source closure.
