@@ -2,6 +2,8 @@ use std::{num::NonZeroU32, path::PathBuf};
 
 use thiserror::Error;
 
+mod edits;
+
 use crate::{
     media::MediaInfo,
     time::{FrameRate, Time, TimeRange},
@@ -185,6 +187,10 @@ pub enum EditError {
     LastTrack(TrackKind),
     #[error("cannot swap a {first:?} track with a {second:?} track")]
     MixedTrackKinds { first: TrackKind, second: TrackKind },
+    #[error("clip {0:?} is named more than once")]
+    RepeatedClip(ClipId),
+    #[error("clips {left:?} and {right:?} do not meet on one track")]
+    NotAdjacent { left: ClipId, right: ClipId },
     #[error("the asset has no known duration")]
     NoDuration,
     #[error("the asset has no {0:?} stream")]
@@ -474,21 +480,25 @@ impl Project {
             .ok_or(EditError::UnknownClip(id))
     }
 
-    pub fn clip_for(&self, asset: AssetId, track: usize, start: Time) -> Result<Clip, EditError> {
+    fn whole_clip(&self, asset: AssetId, track: usize, start: Time) -> Result<Clip, EditError> {
         let asset = self.asset(asset).ok_or(EditError::UnknownAsset(asset))?;
-        let track_ref = self.track_accepting(asset, track)?;
+        self.track_accepting(asset, track)?;
         let duration = asset
             .info
             .duration
             .filter(|duration| *duration > Time::ZERO)
             .ok_or(EditError::NoDuration)?;
-        let clip = Clip {
+        Ok(Clip {
             id: self.next_ids.clip,
             asset: asset.id,
             source: TimeRange::new(Time::ZERO, duration),
             start: start.max(Time::ZERO),
-        };
-        track_ref.check_insert(&clip)?;
+        })
+    }
+
+    pub fn clip_for(&self, asset: AssetId, track: usize, start: Time) -> Result<Clip, EditError> {
+        let clip = self.whole_clip(asset, track, start)?;
+        self.timeline.tracks[track].check_insert(&clip)?;
         Ok(clip)
     }
 
@@ -506,17 +516,21 @@ impl Project {
         Ok(clip)
     }
 
-    pub fn pasted_clip(&self, clip: &Clip, track: usize, start: Time) -> Result<Clip, EditError> {
+    fn copied_clip(&self, clip: &Clip, track: usize, start: Time) -> Result<Clip, EditError> {
         let asset = self
             .asset(clip.asset)
             .ok_or(EditError::UnknownAsset(clip.asset))?;
-        let track_ref = self.track_accepting(asset, track)?;
-        let pasted = Clip {
+        self.track_accepting(asset, track)?;
+        Ok(Clip {
             id: self.next_ids.clip,
             start: start.max(Time::ZERO),
             ..*clip
-        };
-        track_ref.check_insert(&pasted)?;
+        })
+    }
+
+    pub fn pasted_clip(&self, clip: &Clip, track: usize, start: Time) -> Result<Clip, EditError> {
+        let pasted = self.copied_clip(clip, track, start)?;
+        self.timeline.tracks[track].check_insert(&pasted)?;
         Ok(pasted)
     }
 

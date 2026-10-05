@@ -60,7 +60,15 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   place a copy of an existing `Clip` (its asset and source range) at a track and start under the
   next clip id, with the same checks as placing an asset. `remove_asset` refuses an asset a clip
   still uses (`AssetInUse`), `prune_assets` removes every unused one and returns them, and a
-  removed asset's id is never given out again. `ripple_delete_clip` pulls the later
+  removed asset's id is never given out again. `delete_clips`, `ripple_delete_clips`
+  and `move_clips` edit several clips by id in one call (a group move may land on the clips it
+  leaves, and a refused one changes nothing). `insert_asset` and `insert_clip` split the clip
+  under the start and push the later clips on the track right, `overwrite_asset` and
+  `overwrite_clip` trim or remove what the new clip covers, `ripple_trim_clip` trims an edge and
+  moves the later clips with it, `roll_clips` moves the cut between two touching clips, `slip_clip`
+  moves a clip's source window and `slide_clip` moves a clip while its touching neighbours give or
+  take the time. These live in `project/edits.rs`, and every one that spans several clips restores
+  the timeline and the id counters when it fails. `ripple_delete_clip` pulls the later
   clips on the same track back by the deleted clip's length, while `delete_clip` leaves a gap.
   `Timeline::add_track` inserts a track after the last one of its kind. `remove_track` only takes an
   empty track that isn't the last of its kind, and `swap_tracks` only swaps tracks of the same kind.
