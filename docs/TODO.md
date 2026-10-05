@@ -27,9 +27,6 @@
 - Read the composited frame back without waiting on the GPU in the same job
 - Zoom and a 100 % view
 
-## Timeline editing
-
-
 ## Media bin and workspace
 
 - Menus, a shortcut reference and preferences
