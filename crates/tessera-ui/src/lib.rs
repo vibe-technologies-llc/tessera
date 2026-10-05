@@ -2,6 +2,8 @@ mod editor;
 mod frame_image;
 mod media_bin;
 mod playhead;
+mod sequence_dialog;
+mod text_field;
 mod theme;
 mod timeline;
 mod viewer;
@@ -18,6 +20,8 @@ pub const APP_ID: &str = "tessera";
 
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 
+const SHORTCUT_CONTEXT: &str = "Workspace && !TextField";
+
 pub const NEW_PROJECT_NAME: &str = "Untitled";
 
 actions!(
@@ -29,6 +33,8 @@ actions!(
         SaveAs,
         Open,
         Import,
+        FocusSearch,
+        OpenSequenceSettings,
         PlayPause,
         ShuttleBackward,
         Pause,
@@ -72,40 +78,42 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", SaveAs, None),
         KeyBinding::new("ctrl-o", Open, None),
         KeyBinding::new("ctrl-i", Import, None),
-        KeyBinding::new("space", PlayPause, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("j", ShuttleBackward, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("k", Pause, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("l", ShuttleForward, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("left", StepBackward, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("right", StepForward, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("=", ZoomIn, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("-", ZoomOut, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("shift-z", ZoomToFit, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-k", SplitAtPlayhead, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-a", SelectAll, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-c", CopyClips, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-x", CutClips, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-v", PasteClips, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-d", DuplicateClips, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("m", AddMarker, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("shift-m", RemoveMarker, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("i", SetInPoint, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("o", SetOutPoint, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("alt-x", ClearInOut, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("down", NextEdit, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("up", PreviousEdit, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-right", NextMarker, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-left", PreviousMarker, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("escape", Cancel, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("delete", DeleteClip, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("backspace", DeleteClip, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("shift-delete", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("shift-backspace", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("n", ToggleSnapping, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("'", ToggleSafeAreas, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-z", Undo, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-shift-z", Redo, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-y", Redo, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("ctrl-f", FocusSearch, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-,", OpenSequenceSettings, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("space", PlayPause, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("j", ShuttleBackward, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("k", Pause, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("l", ShuttleForward, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("left", StepBackward, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("right", StepForward, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("=", ZoomIn, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("-", ZoomOut, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("shift-z", ZoomToFit, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-k", SplitAtPlayhead, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-a", SelectAll, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-c", CopyClips, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-x", CutClips, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-v", PasteClips, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-d", DuplicateClips, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("m", AddMarker, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("shift-m", RemoveMarker, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("i", SetInPoint, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("o", SetOutPoint, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("alt-x", ClearInOut, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("down", NextEdit, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("up", PreviousEdit, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-right", NextMarker, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-left", PreviousMarker, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("escape", Cancel, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("delete", DeleteClip, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("backspace", DeleteClip, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("shift-delete", RippleDeleteClip, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("shift-backspace", RippleDeleteClip, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("n", ToggleSnapping, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("'", ToggleSafeAreas, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-z", Undo, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-y", Redo, Some(SHORTCUT_CONTEXT)),
     ]);
 }
 

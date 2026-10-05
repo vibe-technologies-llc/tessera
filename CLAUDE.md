@@ -248,8 +248,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   Relink button that probes a chosen file and swaps it in through `relink_asset`, which refuses
   media that lacks a stream a clip needs or ends before a clip does. A Remove unused button
   appears while there are unused assets. Thumbnail and presence checks are keyed by asset id and
-  path, so a relinked asset gets both again. Thumbnails are UI state kept in
-  the bin by `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
+  path, so a relinked asset gets both again. A search field (Ctrl+F) filters the assets by name and a button cycles their order
+  between added, name and length (`visible_assets`). Thumbnails are UI state kept in the bin by
+  `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
   previews the drop as a ghost (red where it would overlap) through `on_drag_move`, and the drop
   places the clip at the previewed, frame-snapped start. Clips on the timeline work the same way.
   The selection is a set of clips. Pressing a lane selects the clip under the pointer (keeping the
@@ -275,7 +276,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   neighbour or remove it (the disabled remove button's tooltip says why), toggles for lock, mute
   (hide on a video track) and solo (audio only) and a button that cycles the row height between
   compact, normal and tall (`header::row_height`), and a row below the tracks adds video or audio
-  tracks. Split and delete skip the clips of locked tracks. Renaming a track has no UI yet. Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+D copy, cut, paste
+  tracks. Split and delete skip the clips of locked tracks. Double-clicking a track's name edits it in a `TextField`. Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+D copy, cut, paste
   and duplicate the selection: the panel keeps a clipboard of clips with their tracks, a paste
   lands at the playhead (a duplicate right after the selection) keeping the clips' relative
   offsets and tracks, as one `paste_clips` command that is refused whole when anything overlaps or
@@ -309,6 +310,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   timeline (`presentation_time`). A frame that lands early is held until the playhead reaches it,
   one overtaken by a newer frame is dropped, and a change of speed drops a held frame
   (`fate`), so a slow decode or composite shows fewer frames rather than lagging the audio.
+  `TextField` (`text_field.rs`) is a single-line text input built on key events: it appends the
+  typed character, backspace deletes, Enter submits and Escape cancels, emitting
+  `TextFieldEvent`s, and it ignores keys with Ctrl or Alt. Every workspace binding is scoped to
+  `Workspace && !TextField` (`SHORTCUT_CONTEXT`), so typing in a field never triggers a shortcut.
+  Ctrl+, opens the sequence settings dialog (`SequenceSettingsDialog`, an overlay in the
+  `Workspace`): width and height fields (Enter moves from one to the next and applies), the
+  standard frame rates and a few sample rates as choices, applied through `SetSequenceSettings`.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
   opens the main window.
 

@@ -6,15 +6,20 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, AppContext, Context, ElementId, Entity, ExternalPaths, FontWeight,
+    AnyElement, AppContext, Context, ElementId, Entity, ExternalPaths, FocusHandle, FontWeight,
     InteractiveElement, IntoElement, ObjectFit, ParentElement, PathPromptOptions, Render,
-    RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img,
-    px,
+    RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription,
+    Window, div, img, px,
 };
 use tessera_media::{VideoDecoder, VideoFrame, probe};
 use tessera_timeline::{Asset, AssetId, Command, FLICKS_PER_SECOND, MediaInfo, Project, Time};
 
-use crate::{editor::ProjectEditor, frame_image::render_image, theme};
+use crate::{
+    editor::ProjectEditor,
+    frame_image::render_image,
+    text_field::{TextField, TextFieldEvent},
+    theme,
+};
 
 const THUMBNAIL_WIDTH: u32 = 96;
 const THUMBNAIL_HEIGHT: u32 = 54;
@@ -22,6 +27,7 @@ const THUMBNAIL_PIXEL_DENSITY: u32 = 2;
 const THUMBNAIL_POSITION_DIVISOR: i64 = 10;
 const UNKNOWN_DURATION: &str = "--:--";
 const MAX_RUNNING_JOBS: usize = 4;
+const SEARCH_ROW_HEIGHT: f32 = 30.;
 const MAX_FAILURE_LINES: usize = 3;
 const MAX_FOLDER_DEPTH: usize = 8;
 const MEDIA_EXTENSIONS: &[&str] = &[
@@ -133,6 +139,50 @@ impl Job {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SortOrder {
+    #[default]
+    Added,
+    Name,
+    Duration,
+}
+
+impl SortOrder {
+    fn next(self) -> Self {
+        match self {
+            Self::Added => Self::Name,
+            Self::Name => Self::Duration,
+            Self::Duration => Self::Added,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Added => "Sort: added",
+            Self::Name => "Sort: name",
+            Self::Duration => "Sort: length",
+        }
+    }
+}
+
+fn visible_assets(assets: &[Asset], query: &str, order: SortOrder) -> Vec<AssetId> {
+    let needle = query.trim().to_lowercase();
+    let mut matching: Vec<&Asset> = assets
+        .iter()
+        .filter(|asset| {
+            needle.is_empty() || file_name(&asset.path).to_lowercase().contains(&needle)
+        })
+        .collect();
+    match order {
+        SortOrder::Added => {}
+        SortOrder::Name => matching.sort_by_key(|asset| file_name(&asset.path).to_lowercase()),
+        SortOrder::Duration => {
+            matching.sort_by_key(|asset| std::cmp::Reverse(asset.info.duration));
+        }
+    }
+    matching.into_iter().map(|asset| asset.id).collect()
+}
+
 struct Presence {
     path: PathBuf,
     present: Option<bool>,
@@ -152,6 +202,11 @@ pub struct MediaBin {
     thumbnail_requested: HashMap<AssetId, PathBuf>,
     presence: HashMap<AssetId, Presence>,
     retired: Vec<Arc<RenderImage>>,
+    search: Option<Entity<TextField>>,
+    search_subscription: Option<Subscription>,
+    query: String,
+    sort: SortOrder,
+    focus_return: Option<FocusHandle>,
     waiting: VecDeque<Job>,
     running: usize,
     generation: u64,
@@ -174,12 +229,56 @@ impl MediaBin {
             thumbnail_requested: HashMap::new(),
             presence: HashMap::new(),
             retired: Vec::new(),
+            search: None,
+            search_subscription: None,
+            query: String::new(),
+            sort: SortOrder::default(),
+            focus_return: None,
             waiting: VecDeque::new(),
             running: 0,
             generation: 0,
         };
         bin.sync_assets(cx);
         bin
+    }
+
+    pub fn return_focus_to(&mut self, handle: FocusHandle) {
+        self.focus_return = Some(handle);
+    }
+
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let field = self.search_field(window, cx);
+        field.read(cx).focus(window);
+    }
+
+    fn search_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextField> {
+        if let Some(field) = &self.search {
+            return field.clone();
+        }
+        let field = cx.new(|cx| TextField::new("", "Search media", cx));
+        self.search_subscription = Some(cx.subscribe_in(
+            &field,
+            window,
+            |bin, field, event, window, cx| match event {
+                TextFieldEvent::Changed(query) => {
+                    bin.query = query.clone();
+                    cx.notify();
+                }
+                TextFieldEvent::Submitted(_) => bin.give_focus_back(window),
+                TextFieldEvent::Cancelled => {
+                    field.update(cx, |field, cx| field.clear(cx));
+                    bin.give_focus_back(window);
+                }
+            },
+        ));
+        self.search = Some(field.clone());
+        field
+    }
+
+    fn give_focus_back(&self, window: &mut Window) {
+        if let Some(handle) = &self.focus_return {
+            window.focus(handle);
+        }
     }
 
     pub fn project_replaced(&mut self, cx: &mut Context<Self>) {
@@ -532,6 +631,12 @@ impl MediaBin {
         }
         let used = used_assets(self.project.read(cx));
         let held = self.project.read(cx).assets.clone();
+        let shown = visible_assets(&held, &self.query, self.sort);
+        let nothing_matches = !held.is_empty() && shown.is_empty();
+        let held: Vec<&Asset> = shown
+            .iter()
+            .filter_map(|id| held.iter().find(|asset| asset.id == *id))
+            .collect();
         let assets = held.iter().map(|asset| {
             let state = RowState {
                 used: used.contains(&asset.id),
@@ -550,7 +655,14 @@ impl MediaBin {
                 .child("Probing…")
                 .into_any_element()
         });
-        assets.chain(probing).chain(failures).collect()
+        let empty = nothing_matches.then(|| {
+            div()
+                .p_3()
+                .text_color(theme::text_muted())
+                .child("No media matches the search")
+                .into_any_element()
+        });
+        assets.chain(empty).chain(probing).chain(failures).collect()
     }
 }
 
@@ -561,6 +673,8 @@ impl Render for MediaBin {
                 tracing::warn!(%error, "failed to release a thumbnail");
             }
         }
+        let search = self.search_field(window, cx);
+        let sort = self.sort;
         let body = self.body(cx);
         let has_unused = {
             let project = self.project.read(cx);
@@ -600,6 +714,27 @@ impl Render for MediaBin {
                                 bin_button("import", "Import…")
                                     .on_click(cx.listener(|bin, _, _, cx| bin.prompt_import(cx))),
                             ),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .h(px(SEARCH_ROW_HEIGHT))
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .text_color(theme::text_muted())
+                    .child(div().flex_1().min_w_0().h_full().child(search))
+                    .child(
+                        bin_button("sort", sort.label())
+                            .flex_none()
+                            .on_click(cx.listener(|bin, _, _, cx| {
+                                bin.sort = bin.sort.next();
+                                cx.notify();
+                            })),
                     ),
             )
             .child(
@@ -1235,5 +1370,55 @@ mod tests {
                 std::path::PathBuf::from("/missing/old.mkv")
             );
         });
+    }
+
+    fn asset_named(id: u64, name: &str, seconds: Option<i64>) -> Asset {
+        Asset {
+            id: AssetId(id),
+            path: format!("/media/{name}").into(),
+            info: MediaInfo {
+                duration: seconds.map(Time::from_seconds),
+                ..video_info()
+            },
+        }
+    }
+
+    #[test]
+    fn assets_are_filtered_by_name_and_sorted() {
+        let assets = [
+            asset_named(0, "Beach.mkv", Some(30)),
+            asset_named(1, "alpha.mp4", None),
+            asset_named(2, "city.mov", Some(90)),
+        ];
+        let ids = |query, order| -> Vec<u64> {
+            visible_assets(&assets, query, order)
+                .into_iter()
+                .map(|id| id.0)
+                .collect()
+        };
+
+        assert_eq!(ids("", SortOrder::Added), [0, 1, 2]);
+        assert_eq!(ids("", SortOrder::Name), [1, 0, 2]);
+        assert_eq!(ids("", SortOrder::Duration), [2, 0, 1]);
+        assert_eq!(ids("  CI ", SortOrder::Added), [2]);
+        assert_eq!(ids(".m", SortOrder::Name), [1, 0, 2]);
+        assert!(ids("zebra", SortOrder::Name).is_empty());
+        assert_eq!(SortOrder::Added.next().next().next(), SortOrder::Added);
+    }
+
+    #[gpui::test]
+    fn typing_in_the_search_field_filters_the_bin_and_escape_clears_it(cx: &mut TestAppContext) {
+        let project = cx.new(|_| Project::new("test"));
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+        bin.update_in(cx, |bin, window, cx| bin.focus_search(window, cx));
+
+        cx.simulate_keystrokes("c i t");
+
+        assert_eq!(cx.read(|cx| bin.read(cx).query.clone()), "cit");
+
+        cx.simulate_keystrokes("escape");
+
+        assert_eq!(cx.read(|cx| bin.read(cx).query.clone()), "");
     }
 }

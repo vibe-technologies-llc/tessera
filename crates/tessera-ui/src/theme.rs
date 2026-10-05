@@ -79,3 +79,7 @@ pub fn black() -> Rgba {
 pub fn safe_area() -> Rgba {
     rgba(0xffffff88)
 }
+
+pub fn backdrop() -> Rgba {
+    rgba(0x00000099)
+}

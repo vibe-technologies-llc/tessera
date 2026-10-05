@@ -1,12 +1,12 @@
 use gpui::{
-    AnyView, App, AppContext, ClickEvent, Context, ElementId, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    AnyView, App, AppContext, ClickEvent, Context, ElementId, Entity, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, prelude::FluentBuilder, px,
 };
 use tessera_timeline::{Timeline, Track, TrackHeight, TrackKind};
 
 use super::{COMPACT_TRACK_HEIGHT, TALL_TRACK_HEIGHT, TRACK_HEIGHT, TimelinePanel, TrackFlag};
-use crate::theme;
+use crate::{text_field::TextField, theme};
 
 pub const HEADER_PADDING: f32 = 8.;
 pub const HEADER_BUTTON_SIZE: f32 = 16.;
@@ -131,7 +131,11 @@ fn track_labels(tracks: &[Track]) -> impl Iterator<Item = String> {
     })
 }
 
-pub fn track_header(row: TrackRow, cx: &Context<TimelinePanel>) -> impl IntoElement {
+pub fn track_header(
+    row: TrackRow,
+    editing: Option<&Entity<TextField>>,
+    cx: &Context<TimelinePanel>,
+) -> impl IntoElement {
     let TrackRow {
         index,
         label,
@@ -232,7 +236,27 @@ pub fn track_header(row: TrackRow, cx: &Context<TimelinePanel>) -> impl IntoElem
             remove,
             remove_hint,
         ));
-    let name = div().flex_1().min_w_0().truncate().child(label);
+    let name = match editing {
+        Some(field) => div()
+            .flex_1()
+            .min_w_0()
+            .child(field.clone())
+            .into_any_element(),
+        None => div()
+            .id(("track-name", index))
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .on_click(cx.listener(
+                move |panel: &mut TimelinePanel, event: &ClickEvent, window, cx| {
+                    if event.click_count() == 2 {
+                        panel.start_rename(index, window, cx);
+                    }
+                },
+            ))
+            .child(label)
+            .into_any_element(),
+    };
     let (first_line_end, second_line) = if height == TrackHeight::Compact {
         (toggles, None)
     } else {

@@ -5,11 +5,11 @@ mod viewport;
 use std::collections::BTreeSet;
 
 use gpui::{
-    App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity, Hitbox,
-    HitboxBehavior, InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Rgba, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, fill, point,
-    prelude::FluentBuilder, px, size,
+    App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity,
+    FocusHandle, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Rgba,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use tessera_timeline::{
     AssetId, Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Project, Time, TimeRange,
@@ -25,6 +25,7 @@ use crate::{
     editor::ProjectEditor,
     media_bin::{DraggedAsset, file_name},
     playhead::Playhead,
+    text_field::{TextField, TextFieldEvent},
     theme,
 };
 
@@ -200,6 +201,14 @@ pub struct TimelinePanel {
     tracks_view: Bounds<Pixels>,
     snapping: bool,
     clipboard: Vec<(Clip, usize)>,
+    renaming: Option<TrackRename>,
+    focus_return: Option<FocusHandle>,
+}
+
+struct TrackRename {
+    track: usize,
+    field: Entity<TextField>,
+    _subscriptions: [Subscription; 2],
 }
 
 impl TimelinePanel {
@@ -226,6 +235,8 @@ impl TimelinePanel {
             tracks_view: Bounds::default(),
             snapping: true,
             clipboard: Vec::new(),
+            renaming: None,
+            focus_return: None,
         }
     }
 
@@ -246,6 +257,59 @@ impl TimelinePanel {
             .flat_map(|track| track.clips())
             .map(|clip| clip.id)
             .collect();
+        cx.notify();
+    }
+
+    pub fn return_focus_to(&mut self, handle: FocusHandle) {
+        self.focus_return = Some(handle);
+    }
+
+    fn start_rename(&mut self, track: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self
+            .project
+            .read(cx)
+            .timeline
+            .tracks
+            .get(track)
+            .map(|track| track.name.clone())
+        else {
+            return;
+        };
+        let field = cx.new(|cx| TextField::new(current, "Track name", cx));
+        let focus_handle = field.read(cx).focus_handle().clone();
+        let subscriptions = [
+            cx.subscribe_in(&field, window, |panel, _, event, window, cx| match event {
+                TextFieldEvent::Changed(_) => {}
+                TextFieldEvent::Submitted(name) => {
+                    panel.finish_rename(Some(name.trim().to_owned()), window, cx);
+                }
+                TextFieldEvent::Cancelled => panel.finish_rename(None, window, cx),
+            }),
+            cx.on_focus_out(&focus_handle, window, |panel, _, window, cx| {
+                panel.finish_rename(None, window, cx);
+            }),
+        ];
+        field.read(cx).focus(window);
+        self.renaming = Some(TrackRename {
+            track,
+            field,
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(renaming) = self.renaming.take() else {
+            return;
+        };
+        if let Some(name) = name {
+            self.edit_track(Command::RenameTrack, renaming.track, cx, |track| {
+                track.name = name;
+            });
+        }
+        if let Some(handle) = &self.focus_return {
+            window.focus(handle);
+        }
         cx.notify();
     }
 
@@ -405,6 +469,7 @@ impl TimelinePanel {
     pub fn project_replaced(&mut self, cx: &mut Context<Self>) {
         self.selection.clear();
         self.drop_preview = None;
+        self.renaming = None;
         self.clipboard.clear();
         self.viewport = Viewport::default();
         self.track_scroll = px(0.);
@@ -967,9 +1032,19 @@ impl Render for TimelinePanel {
             track_lane(lane, project, cx)
         });
         let lanes = scrolled_tracks(scroll, lanes).child(tracks_view_probe(panel.clone()));
+        let renaming = self
+            .renaming
+            .as_ref()
+            .map(|renaming| (renaming.track, renaming.field.clone()));
         let headers = rows
             .into_iter()
-            .map(|row| track_header(row, cx))
+            .map(|row| {
+                let editing = renaming
+                    .as_ref()
+                    .filter(|(track, _)| *track == row.index)
+                    .map(|(_, field)| field);
+                track_header(row, editing, cx)
+            })
             .map(IntoElement::into_any_element)
             .chain([add_track_row(cx).into_any_element()]);
         div()
@@ -2209,5 +2284,52 @@ mod tests {
         assert_eq!(starts_on(&panel, cx, 0), seconds(&[1]));
         assert!(starts_on(&panel, cx, 1).is_empty());
         assert_eq!(selected(&panel, cx), BTreeSet::from([clips[0]]));
+    }
+
+    fn double_click(cx: &mut VisualTestContext, position: Point<Pixels>) {
+        let (modifiers, button) = (Modifiers::none(), MouseButton::Left);
+        cx.simulate_event(MouseDownEvent {
+            button,
+            position,
+            modifiers,
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            button,
+            position,
+            modifiers,
+            click_count: 2,
+        });
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_track_name_renames_it(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        let name_at = point(px(HEADER_PADDING + 6.), header_line_y(V1_ROW, 0));
+
+        double_click(cx, name_at);
+
+        assert!(cx.read(|cx| panel.read(cx).renaming.is_some()));
+
+        cx.simulate_keystrokes("b - r o l l enter");
+
+        assert_eq!(track_of(&panel, cx, 0).name, "b-roll");
+        assert!(cx.read(|cx| panel.read(cx).renaming.is_none()));
+
+        panel.update(cx, |panel, cx| panel.editor.undo(cx));
+
+        assert_eq!(track_of(&panel, cx, 0).name, "");
+    }
+
+    #[gpui::test]
+    fn escape_leaves_a_track_name_as_it_was(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+
+        double_click(cx, point(px(HEADER_PADDING + 6.), header_line_y(V1_ROW, 0)));
+        cx.simulate_keystrokes("x escape");
+
+        assert_eq!(track_of(&panel, cx, 0).name, "");
+        assert!(cx.read(|cx| panel.read(cx).renaming.is_none()));
     }
 }

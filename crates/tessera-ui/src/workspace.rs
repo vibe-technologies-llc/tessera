@@ -3,21 +3,22 @@ use std::{ffi::OsStr, path::PathBuf};
 use futures::{FutureExt, channel::oneshot, future::Shared};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, PromptLevel, Render, Styled, Task, Window, div, px,
+    PathPromptOptions, PromptLevel, Render, Styled, Subscription, Task, Window, div, px,
 };
 use tessera_document::EXTENSION;
-use tessera_timeline::{Project, Time};
+use tessera_timeline::{Command, Project, Time};
 
 use crate::{
-    AddMarker, Cancel, ClearInOut, CopyClips, CutClips, DeleteClip, DuplicateClips, Import,
-    NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, PasteClips, Pause, PlayPause,
-    PreviousEdit, PreviousMarker, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll,
-    SetInPoint, SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward,
-    StepForward, ToggleSafeAreas, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
-    ZoomToFit,
+    AddMarker, Cancel, ClearInOut, CopyClips, CutClips, DeleteClip, DuplicateClips, FocusSearch,
+    Import, NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, OpenSequenceSettings,
+    PasteClips, Pause, PlayPause, PreviousEdit, PreviousMarker, Redo, RemoveMarker,
+    RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint, SetOutPoint, ShuttleBackward,
+    ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSafeAreas, ToggleSnapping,
+    Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
+    sequence_dialog::{SequenceDialogEvent, SequenceSettingsDialog},
     theme,
     timeline::TimelinePanel,
     viewer::Viewer,
@@ -55,6 +56,7 @@ pub struct Workspace {
     file: Option<PathBuf>,
     file_io: Shared<Task<()>>,
     asking_to_discard: bool,
+    dialog: Option<(Entity<SequenceSettingsDialog>, Subscription)>,
 }
 
 impl Workspace {
@@ -72,17 +74,50 @@ impl Workspace {
             this.update(cx, |workspace, cx| workspace.should_close(window, cx))
                 .unwrap_or(true)
         });
+        let timeline_focus_return = focus_handle.clone();
+        let bin_focus_return = focus_handle.clone();
         Self {
             focus_handle,
-            media_bin: cx.new(|cx| MediaBin::new(editor.clone(), cx)),
+            media_bin: cx.new(|cx| {
+                let mut bin = MediaBin::new(editor.clone(), cx);
+                bin.return_focus_to(bin_focus_return);
+                bin
+            }),
             viewer: cx.new(|cx| Viewer::new(project, playhead.clone(), cx)),
-            timeline: cx.new(|cx| TimelinePanel::new(editor.clone(), playhead.clone(), cx)),
+            timeline: cx.new(|cx| {
+                let mut timeline = TimelinePanel::new(editor.clone(), playhead.clone(), cx);
+                timeline.return_focus_to(timeline_focus_return);
+                timeline
+            }),
             playhead,
             editor,
             file: None,
             file_io: Task::ready(()).shared(),
             asking_to_discard: false,
+            dialog: None,
         }
+    }
+
+    fn open_sequence_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let settings = self.project().read(cx).settings;
+        let dialog = cx.new(|cx| SequenceSettingsDialog::new(settings, window, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |workspace, _, event, window, cx| {
+            if let SequenceDialogEvent::Apply(settings) = *event {
+                workspace
+                    .editor
+                    .perform(Command::SetSequenceSettings, cx, |project| {
+                        project.set_settings(settings);
+                    });
+            }
+            workspace.dialog = None;
+            window.focus(&workspace.focus_handle);
+            cx.notify();
+        });
+        self.dialog = Some((dialog, subscription));
+        cx.notify();
     }
 
     pub fn project(&self) -> &Entity<Project> {
@@ -396,6 +431,16 @@ impl Render for Workspace {
             .on_action(cx.listener(|workspace, _: &Open, window, cx| {
                 workspace.prompt_open(window, cx);
             }))
+            .on_action(
+                cx.listener(|workspace, _: &OpenSequenceSettings, window, cx| {
+                    workspace.open_sequence_settings(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|workspace, _: &FocusSearch, window, cx| {
+                workspace
+                    .media_bin
+                    .update(cx, |media_bin, cx| media_bin.focus_search(window, cx));
+            }))
             .on_action(cx.listener(|workspace, _: &Import, _, cx| {
                 workspace
                     .media_bin
@@ -491,12 +536,24 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &Undo, _, cx| workspace.editor.undo(cx)))
             .on_action(cx.listener(|workspace, _: &Redo, _, cx| workspace.editor.redo(cx)))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme::background())
             .text_color(theme::text())
             .text_sm()
+            .children(self.dialog.as_ref().map(|(dialog, _)| {
+                div()
+                    .absolute()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .occlude()
+                    .bg(theme::backdrop())
+                    .child(dialog.clone())
+            }))
             .child(
                 div()
                     .flex_1()
@@ -1231,5 +1288,103 @@ mod tests {
         cx.simulate_keystrokes("'");
 
         assert!(!shown(cx));
+    }
+
+    fn dialog_of(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Entity<SequenceSettingsDialog>> {
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .map(|(dialog, _)| dialog.clone())
+        })
+    }
+
+    fn settings_of(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> tessera_timeline::SequenceSettings {
+        cx.read(|cx| workspace.read(cx).project().read(cx).settings)
+    }
+
+    #[gpui::test]
+    fn the_sequence_settings_dialog_applies_a_new_size_rate_and_can_be_undone(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let original = settings_of(&workspace, cx);
+
+        cx.simulate_keystrokes("ctrl-,");
+
+        let dialog = dialog_of(&workspace, cx).expect("the dialog opens");
+        dialog.update(cx, |dialog, cx| {
+            dialog.select_frame_rate(tessera_timeline::FrameRate::FPS_24, cx);
+            dialog.select_sample_rate(NonZero::new(96_000).unwrap(), cx);
+        });
+        cx.simulate_keystrokes("backspace backspace backspace backspace 1 2 8 0 enter");
+        cx.simulate_keystrokes("backspace backspace backspace backspace 7 2 0 enter");
+
+        let applied = settings_of(&workspace, cx);
+        assert_eq!((applied.width.get(), applied.height.get()), (1280, 720));
+        assert_eq!(applied.frame_rate, tessera_timeline::FrameRate::FPS_24);
+        assert_eq!(applied.sample_rate.get(), 96_000);
+        assert!(dialog_of(&workspace, cx).is_none());
+
+        cx.simulate_keystrokes("ctrl-z");
+
+        assert_eq!(settings_of(&workspace, cx), original);
+    }
+
+    #[gpui::test]
+    fn the_sequence_settings_dialog_refuses_a_zero_size_and_escape_closes_it(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let original = settings_of(&workspace, cx);
+
+        cx.simulate_keystrokes("ctrl-,");
+        cx.simulate_keystrokes("backspace backspace backspace backspace 0 enter enter");
+
+        assert!(dialog_of(&workspace, cx).is_some());
+        assert_eq!(settings_of(&workspace, cx), original);
+
+        cx.simulate_keystrokes("escape");
+
+        assert!(dialog_of(&workspace, cx).is_none());
+        assert_eq!(settings_of(&workspace, cx), original);
+
+        cx.simulate_keystrokes("space");
+
+        assert!(cx.read(|cx| !workspace.read(cx).playhead.read(cx).speed().is_paused()));
+    }
+
+    #[gpui::test]
+    fn typing_in_a_text_field_does_not_trigger_the_single_key_shortcuts(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        cx.simulate_keystrokes("ctrl-,");
+        cx.simulate_keystrokes("m j l space n i o");
+
+        let (markers, paused, snapping_points) = cx.read(|cx| {
+            let workspace = workspace.read(cx);
+            let project = workspace.project().read(cx);
+            (
+                project.markers.len(),
+                workspace.playhead.read(cx).speed().is_paused(),
+                (project.in_point, project.out_point),
+            )
+        });
+        assert_eq!(markers, 0);
+        assert!(paused);
+        assert_eq!(snapping_points, (None, None));
     }
 }
