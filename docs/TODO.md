@@ -7,7 +7,6 @@
 
 ## Project files
 
-- Recent projects
 - Autosave and recovery after a crash
 
 ## Media decode

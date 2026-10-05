@@ -342,12 +342,21 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `TextField` (`text_field.rs`) is a single-line text input built on key events: it appends the
   typed character, backspace deletes, Enter submits and Escape cancels, emitting
   `TextFieldEvent`s, and it ignores keys with Ctrl or Alt. Every workspace binding is scoped to
-  `Workspace && !TextField` (`SHORTCUT_CONTEXT`), so typing in a field never triggers a shortcut.
-  Ctrl+, opens the sequence settings dialog (`SequenceSettingsDialog`, an overlay in the
-  `Workspace`): width and height fields (Enter moves from one to the next and applies), the
-  standard frame rates and a few sample rates as choices, applied through `SetSequenceSettings`.
-- **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend and
-  opens the main window.
+  `Workspace && !TextField && !Dialog` (`SHORTCUT_CONTEXT`), so typing in a field or moving
+  through a dialog never triggers a shortcut; a dialog without fields keys its own context
+  (`DIALOG_CONTEXT`), where Up, Down, Enter and Escape are `SelectPrevious`, `SelectNext`,
+  `Confirm` and `Dismiss`. The `Workspace` shows one dialog at a time as an overlay (`Dialog`).
+  Ctrl+, opens the sequence settings dialog (`SequenceSettingsDialog`): width and height fields
+  (Enter moves from one to the next and applies), the standard frame rates and a few sample rates
+  as choices, applied through `SetSequenceSettings`. Ctrl+Shift+O opens the recent projects
+  (`RecentProjectsDialog`), and choosing one opens it like Ctrl+O. `RecentProjects` (`recent.rs`)
+  is a GPUI global: every file a project is saved to or opened from moves to the front of it (at
+  most `MAX_RECENT_PROJECTS`, UTF-8 paths only), and a file that fails to open drops out. It is
+  in memory unless `restore_recent_projects` loaded it from `$XDG_STATE_HOME/tessera/recent-projects`
+  (`~/.local/state` without one, one path per line), which it is then written back to on a
+  background task after each change; only the binary calls that, so tests never touch it.
+- **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend,
+  restores the recent projects and opens the main window.
 
 GPUI 0.2.2 renders through blade and cannot share a `wgpu` device. Until that changes, composited
 frames reach the viewer as a GPUI image read back to the CPU, not through a shared GPU texture.

@@ -10,14 +10,15 @@ use tessera_timeline::{Command, Project, Time};
 
 use crate::{
     AddMarker, Cancel, ClearInOut, CopyClips, CutClips, DeleteClip, DuplicateClips, FocusSearch,
-    Import, NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, OpenSequenceSettings,
-    PasteClips, Pause, PlayPause, PreviousEdit, PreviousMarker, Redo, RemoveMarker,
-    RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint, SetOutPoint, ShuttleBackward,
-    ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSafeAreas, ToggleSnapping,
-    Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    Import, NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, OpenRecent,
+    OpenSequenceSettings, PasteClips, Pause, PlayPause, PreviousEdit, PreviousMarker, Redo,
+    RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint, SetOutPoint,
+    ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSafeAreas,
+    ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
+    recent::{self, RecentDialogEvent, RecentProjects, RecentProjectsDialog},
     sequence_dialog::{SequenceDialogEvent, SequenceSettingsDialog},
     theme,
     timeline::TimelinePanel,
@@ -56,7 +57,21 @@ pub struct Workspace {
     file: Option<PathBuf>,
     file_io: Shared<Task<()>>,
     asking_to_discard: bool,
-    dialog: Option<(Entity<SequenceSettingsDialog>, Subscription)>,
+    dialog: Option<(Dialog, Subscription)>,
+}
+
+enum Dialog {
+    SequenceSettings(Entity<SequenceSettingsDialog>),
+    RecentProjects(Entity<RecentProjectsDialog>),
+}
+
+impl Dialog {
+    fn view(&self) -> gpui::AnyView {
+        match self {
+            Self::SequenceSettings(dialog) => dialog.clone().into(),
+            Self::RecentProjects(dialog) => dialog.clone().into(),
+        }
+    }
 }
 
 impl Workspace {
@@ -112,11 +127,31 @@ impl Workspace {
                         project.set_settings(settings);
                     });
             }
-            workspace.dialog = None;
-            window.focus(&workspace.focus_handle);
-            cx.notify();
+            workspace.close_dialog(window, cx);
         });
-        self.dialog = Some((dialog, subscription));
+        self.dialog = Some((Dialog::SequenceSettings(dialog), subscription));
+        cx.notify();
+    }
+
+    fn open_recent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let paths = cx.default_global::<RecentProjects>().paths().to_vec();
+        let dialog = cx.new(|cx| RecentProjectsDialog::new(paths, window, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |workspace, _, event, window, cx| {
+            workspace.close_dialog(window, cx);
+            if let RecentDialogEvent::Open(path) = event {
+                workspace.open_from(path.clone(), window, cx);
+            }
+        });
+        self.dialog = Some((Dialog::RecentProjects(dialog), subscription));
+        cx.notify();
+    }
+
+    fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = None;
+        window.focus(&self.focus_handle);
         cx.notify();
     }
 
@@ -327,6 +362,7 @@ impl Workspace {
                 Ok(Ok(project)) => project,
                 Ok(Err(error)) => {
                     this.update_in(cx, |_, window, cx| {
+                        recent::update(cx, |recent| recent.forget(&path));
                         report_failure("Could not open the project", &error.to_string(), window, cx)
                     })
                     .ok();
@@ -377,6 +413,7 @@ impl Workspace {
     }
 
     fn set_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        recent::update(cx, |recent| recent.remember(path.clone()));
         self.file = Some(path);
         window.set_window_title(&self.title(cx));
     }
@@ -430,6 +467,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &Open, window, cx| {
                 workspace.prompt_open(window, cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &OpenRecent, window, cx| {
+                workspace.open_recent(window, cx);
             }))
             .on_action(
                 cx.listener(|workspace, _: &OpenSequenceSettings, window, cx| {
@@ -552,7 +592,7 @@ impl Render for Workspace {
                     .justify_center()
                     .occlude()
                     .bg(theme::backdrop())
-                    .child(dialog.clone())
+                    .child(dialog.view())
             }))
             .child(
                 div()
@@ -761,6 +801,55 @@ mod tests {
         cx.simulate_keystrokes("ctrl-s");
         cx.run_until_parked();
         assert_eq!(tessera_document::open(&path).unwrap(), saved);
+    }
+
+    fn recent_paths(cx: &mut VisualTestContext) -> Vec<PathBuf> {
+        cx.update(|_, cx| cx.default_global::<RecentProjects>().paths().to_vec())
+    }
+
+    #[gpui::test]
+    fn a_saved_project_reopens_from_the_recent_list(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("recent");
+        let (first, second) = (dir.0.join("first.tessera"), dir.0.join("second.tessera"));
+        let saved = sample_project("First", "/media/first.mkv");
+        let project = cx.new(|_| saved.clone());
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        for path in [&first, &second] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.save_to(path.clone(), window, cx).detach();
+            });
+            cx.run_until_parked();
+        }
+
+        assert_eq!(recent_paths(cx), [second.clone(), first.clone()]);
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.replace_project(sample_project("Other", "/media/other.mkv"), cx);
+            workspace
+                .editor
+                .mark_saved(workspace.editor.revision(cx), cx);
+        });
+        cx.simulate_keystrokes("ctrl-shift-o");
+
+        assert!(cx.read(|cx| workspace.read(cx).dialog.is_some()));
+
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+
+        assert!(cx.read(|cx| workspace.read(cx).dialog.is_none()));
+        assert_eq!(current(&workspace, cx), saved);
+        assert_eq!(recent_paths(cx), [first.clone(), second.clone()]);
+
+        std::fs::remove_file(&second).unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_from(second.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Ok");
+
+        assert_eq!(recent_paths(cx), [first]);
     }
 
     #[gpui::test]
@@ -1294,12 +1383,9 @@ mod tests {
         workspace: &Entity<Workspace>,
         cx: &mut VisualTestContext,
     ) -> Option<Entity<SequenceSettingsDialog>> {
-        cx.read(|cx| {
-            workspace
-                .read(cx)
-                .dialog
-                .as_ref()
-                .map(|(dialog, _)| dialog.clone())
+        cx.read(|cx| match &workspace.read(cx).dialog {
+            Some((Dialog::SequenceSettings(dialog), _)) => Some(dialog.clone()),
+            _ => None,
         })
     }
 

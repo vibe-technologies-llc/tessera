@@ -2,6 +2,7 @@ mod editor;
 mod frame_image;
 mod media_bin;
 mod playhead;
+mod recent;
 mod sequence_dialog;
 mod text_field;
 mod theme;
@@ -20,7 +21,9 @@ pub const APP_ID: &str = "tessera";
 
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 
-const SHORTCUT_CONTEXT: &str = "Workspace && !TextField";
+const DIALOG_CONTEXT: &str = "Dialog";
+
+const SHORTCUT_CONTEXT: &str = "Workspace && !TextField && !Dialog";
 
 pub const NEW_PROJECT_NAME: &str = "Untitled";
 
@@ -32,6 +35,7 @@ actions!(
         Save,
         SaveAs,
         Open,
+        OpenRecent,
         Import,
         FocusSearch,
         OpenSequenceSettings,
@@ -65,7 +69,11 @@ actions!(
         ToggleSnapping,
         ToggleSafeAreas,
         Undo,
-        Redo
+        Redo,
+        SelectNext,
+        SelectPrevious,
+        Confirm,
+        Dismiss
     ]
 );
 
@@ -77,6 +85,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-s", Save, None),
         KeyBinding::new("ctrl-shift-s", SaveAs, None),
         KeyBinding::new("ctrl-o", Open, None),
+        KeyBinding::new("ctrl-shift-o", OpenRecent, None),
         KeyBinding::new("ctrl-i", Import, None),
         KeyBinding::new("ctrl-f", FocusSearch, Some(SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSequenceSettings, Some(SHORTCUT_CONTEXT)),
@@ -114,7 +123,17 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, Some(SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-shift-z", Redo, Some(SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-y", Redo, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("down", SelectNext, Some(DIALOG_CONTEXT)),
+        KeyBinding::new("up", SelectPrevious, Some(DIALOG_CONTEXT)),
+        KeyBinding::new("enter", Confirm, Some(DIALOG_CONTEXT)),
+        KeyBinding::new("escape", Dismiss, Some(DIALOG_CONTEXT)),
     ]);
+}
+
+pub fn restore_recent_projects(cx: &mut App) {
+    if let Some(file) = recent::default_file() {
+        cx.set_global(recent::RecentProjects::stored_in(file));
+    }
 }
 
 pub fn open_main_window(project: Project, cx: &mut App) -> gpui::Result<WindowHandle<Workspace>> {
