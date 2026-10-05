@@ -17,7 +17,10 @@ use tessera_timeline::{
 };
 
 use self::{
-    header::{add_track_row, content_height, next_height_of, row_height, track_header, track_rows},
+    header::{
+        add_track_row, content_height, display_order, next_height_of, row_height, track_header,
+        track_rows,
+    },
     snap::{Snap, SnapTargets},
     viewport::Viewport,
 };
@@ -153,6 +156,7 @@ struct DropPreview {
     reason: Option<&'static str>,
     mode: DropMode,
     snapped_to: Option<Time>,
+    group_shift: Option<Time>,
 }
 
 impl DropPreview {
@@ -195,6 +199,7 @@ pub struct TimelinePanel {
     playhead: Entity<Playhead>,
     scrubbing: bool,
     marker_drag: Option<MarkerDrag>,
+    marquee: Option<Marquee>,
     drop_preview: Option<DropPreview>,
     viewport: Viewport,
     lanes: Bounds<Pixels>,
@@ -213,6 +218,56 @@ struct MarkerDrag {
     id: MarkerId,
     grab: Pixels,
     time: Time,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Marquee {
+    anchor: MarqueeCorner,
+    reach: MarqueeCorner,
+    base: BTreeSet<ClipId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MarqueeCorner {
+    time: Time,
+    content_y: Pixels,
+}
+
+impl Marquee {
+    fn times(&self) -> (Time, Time) {
+        let (a, b) = (self.anchor.time, self.reach.time);
+        (a.min(b), a.max(b))
+    }
+
+    fn content_ys(&self) -> (Pixels, Pixels) {
+        let (a, b) = (self.anchor.content_y, self.reach.content_y);
+        (a.min(b), a.max(b))
+    }
+
+    fn enclosed(&self, timeline: &Timeline) -> BTreeSet<ClipId> {
+        let (first, last) = self.times();
+        let (top, bottom) = self.content_ys();
+        let mut row_top = px(0.);
+        let mut enclosed = self.base.clone();
+        for index in display_order(&timeline.tracks) {
+            let track = &timeline.tracks[index];
+            let row_bottom = row_top + px(row_height(track.height));
+            if row_top < bottom.max(top + px(1.)) && row_bottom > top {
+                enclosed.extend(
+                    track
+                        .clips()
+                        .iter()
+                        .filter(|clip| {
+                            let range = clip.timeline_range();
+                            range.start <= last && range.end() > first
+                        })
+                        .map(|clip| clip.id),
+                );
+            }
+            row_top = row_bottom;
+        }
+        enclosed
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +298,7 @@ impl TimelinePanel {
             playhead,
             scrubbing: false,
             marker_drag: None,
+            marquee: None,
             drop_preview: None,
             viewport: Viewport::default(),
             lanes: Bounds::default(),
@@ -345,6 +401,7 @@ impl TimelinePanel {
     pub fn drag_cancelled(&mut self, cx: &mut Context<Self>) {
         self.drop_preview = None;
         self.marker_drag = None;
+        self.marquee = None;
         cx.notify();
     }
 
@@ -579,6 +636,7 @@ impl TimelinePanel {
         self.drop_preview = None;
         self.renaming = None;
         self.marker_drag = None;
+        self.marquee = None;
         self.clipboard.clear();
         self.viewport = Viewport::default();
         self.track_scroll = px(0.);
@@ -808,7 +866,14 @@ impl TimelinePanel {
         }
     }
 
-    fn press_lane(&mut self, track: usize, offset: Pixels, extend: bool, cx: &mut Context<Self>) {
+    fn press_lane(
+        &mut self,
+        track: usize,
+        position: Point<Pixels>,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = position.x - self.lanes.left();
         let time = self.viewport.time_at(offset);
         let pressed = self
             .project
@@ -833,10 +898,45 @@ impl TimelinePanel {
                     self.selection = BTreeSet::from([clip.id]);
                 }
             }
-            None if !extend => self.selection.clear(),
-            None => {}
+            None => {
+                if !extend {
+                    self.selection.clear();
+                }
+                let corner = self.marquee_corner(position);
+                self.marquee = Some(Marquee {
+                    anchor: corner,
+                    reach: corner,
+                    base: self.selection.clone(),
+                });
+            }
         }
         if self.selection != before {
+            cx.notify();
+        }
+    }
+
+    fn marquee_corner(&self, position: Point<Pixels>) -> MarqueeCorner {
+        MarqueeCorner {
+            time: self.viewport.time_at(position.x - self.lanes.left()),
+            content_y: position.y - self.tracks_view.top() + self.track_scroll,
+        }
+    }
+
+    fn extend_marquee(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let reach = self.marquee_corner(position);
+        let Some(marquee) = &mut self.marquee else {
+            return;
+        };
+        if marquee.reach == reach {
+            return;
+        }
+        marquee.reach = reach;
+        self.selection = marquee.enclosed(&self.project.read(cx).timeline);
+        cx.notify();
+    }
+
+    fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        if self.marquee.take().is_some() {
             cx.notify();
         }
     }
@@ -905,6 +1005,7 @@ impl TimelinePanel {
                         reason: (!fits).then_some(OVERLAP_REASON),
                         mode: DropMode::Place,
                         snapped_to: None,
+                        group_shift: Some(start - clip.start),
                     };
                     Some(preview.snapped(snap))
                 });
@@ -1140,7 +1241,13 @@ impl Render for TimelinePanel {
             };
             track_lane(lane, project, cx)
         });
-        let lanes = scrolled_tracks(scroll, lanes).child(tracks_view_probe(panel.clone()));
+        let marquee = self
+            .marquee
+            .as_ref()
+            .map(|marquee| marquee_rect(marquee, viewport, scroll));
+        let lanes = scrolled_tracks(scroll, lanes)
+            .children(marquee)
+            .child(tracks_view_probe(panel.clone()));
         let renaming = self
             .renaming
             .as_ref()
@@ -1234,11 +1341,54 @@ fn scrolled_tracks(scroll: Pixels, rows: impl IntoIterator<Item = impl IntoEleme
 
 fn tracks_view_probe(panel: Entity<TimelinePanel>) -> impl IntoElement {
     canvas(
-        move |bounds, _, cx| panel.update(cx, |panel, _| panel.tracks_view = bounds),
-        |_, _, _, _| {},
+        {
+            let panel = panel.clone();
+            move |bounds, _, cx| panel.update(cx, |panel, _| panel.tracks_view = bounds)
+        },
+        move |_, _, window, _| listen_for_marquee(panel, window),
     )
     .absolute()
     .size_full()
+}
+
+fn listen_for_marquee(panel: Entity<TimelinePanel>, window: &mut Window) {
+    window.on_mouse_event({
+        let panel = panel.clone();
+        move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble && panel.read(cx).marquee.is_some() {
+                panel.update(cx, |panel, cx| {
+                    if event.dragging() {
+                        panel.extend_marquee(event.position, cx);
+                    } else {
+                        panel.end_marquee(cx);
+                    }
+                });
+            }
+        }
+    });
+    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+        if phase == DispatchPhase::Bubble
+            && event.button == MouseButton::Left
+            && panel.read(cx).marquee.is_some()
+        {
+            panel.update(cx, |panel, cx| panel.end_marquee(cx));
+        }
+    });
+}
+
+fn marquee_rect(marquee: &Marquee, viewport: Viewport, scroll: Pixels) -> impl IntoElement {
+    let (first, last) = marquee.times();
+    let (top, bottom) = marquee.content_ys();
+    let left = viewport.x_at(first);
+    div()
+        .absolute()
+        .left(left)
+        .top(top - scroll)
+        .w(viewport.x_at(last) - left)
+        .h(bottom - top)
+        .border_1()
+        .border_color(theme::selection())
+        .bg(theme::marquee())
 }
 
 fn timecode_readout(timecode: Timecode) -> impl IntoElement {
@@ -1276,8 +1426,8 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
         TrackKind::Video => theme::video_clip(),
         TrackKind::Audio => theme::audio_clip(),
     };
-    let ghost = drop_preview
-        .filter(|preview| preview.track == index)
+    let ghosts = ghosts_on(index, track, drop_preview, selection)
+        .into_iter()
         .map(|preview| drop_ghost(preview, viewport));
     div()
         .h(px(row_height(track.height)))
@@ -1288,8 +1438,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |panel, event: &MouseDownEvent, _, cx| {
-                let offset = event.position.x - panel.lanes.left();
-                panel.press_lane(index, offset, event.modifiers.shift, cx);
+                panel.press_lane(index, event.position, event.modifiers.shift, cx);
             }),
         )
         .on_drag_move(cx.listener(move |panel, event, _, cx| {
@@ -1312,7 +1461,39 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
             };
             clip_block(clip, look, viewport)
         }))
-        .children(ghost)
+        .children(ghosts)
+}
+
+fn ghosts_on(
+    index: usize,
+    track: &Track,
+    preview: Option<DropPreview>,
+    selection: &BTreeSet<ClipId>,
+) -> Vec<DropPreview> {
+    let Some(preview) = preview else {
+        return Vec::new();
+    };
+    let Some(shift) = preview.group_shift else {
+        return (preview.track == index)
+            .then_some(preview)
+            .into_iter()
+            .collect();
+    };
+    track
+        .clips()
+        .iter()
+        .filter(|clip| selection.contains(&clip.id))
+        .map(|clip| {
+            let range = TimeRange::new(clip.start + shift, clip.source.duration);
+            let dragged = index == preview.track && range == preview.range;
+            DropPreview {
+                track: index,
+                range,
+                reason: preview.reason.filter(|_| dragged),
+                ..preview
+            }
+        })
+        .collect()
 }
 
 fn visible_clips(track: &Track, visible: Option<TimeRange>) -> &[Clip] {
@@ -1362,6 +1543,7 @@ fn placement(
         reason: (!fits).then_some(OVERLAP_REASON),
         mode,
         snapped_to: None,
+        group_shift: None,
     };
     Some(preview.snapped(snap))
 }
@@ -2489,6 +2671,91 @@ mod tests {
 
         assert_eq!(track_of(&panel, cx, 0).name, "");
         assert!(cx.read(|cx| panel.read(cx).renaming.is_none()));
+    }
+
+    fn sweep(cx: &mut VisualTestContext, from: Point<Pixels>, to: &[Point<Pixels>], shift: bool) {
+        let modifiers = Modifiers {
+            shift,
+            ..Modifiers::none()
+        };
+        cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
+        for &point in to {
+            cx.simulate_mouse_move(point, MouseButton::Left, modifiers);
+        }
+        let end = to.last().copied().unwrap_or(from);
+        cx.simulate_mouse_up(end, MouseButton::Left, modifiers);
+    }
+
+    #[gpui::test]
+    fn sweeping_empty_lane_space_selects_the_clips_it_touches(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (V2, 4), (0, 10)]);
+        let (v1_early, v2, v1_late) = (clips[0], clips[1], clips[2]);
+        let none = Modifiers::none();
+
+        cx.simulate_mouse_down(point(at(0.5), row_y(0)), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(at(2.), px(V1)), MouseButton::Left, none);
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([v1_early]));
+        assert!(cx.read(|cx| panel.read(cx).marquee.is_some()));
+
+        cx.simulate_mouse_move(point(at(5.), px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_up(point(at(5.), px(V1)), MouseButton::Left, none);
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([v1_early, v2]));
+        assert!(cx.read(|cx| panel.read(cx).marquee.is_none()));
+
+        sweep(
+            cx,
+            point(at(0.5), row_y(0)),
+            &[point(at(0.8), px(V1))],
+            false,
+        );
+
+        assert_eq!(selected(&panel, cx), BTreeSet::new());
+
+        cx.simulate_click(point(at(12.), px(V1)), none);
+        sweep(cx, point(at(0.5), row_y(0)), &[point(at(2.), px(V1))], true);
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([v1_early, v1_late]));
+    }
+
+    #[test]
+    fn a_group_move_shows_a_ghost_for_every_selected_clip() {
+        let mut project = Project::new("ghosts");
+        let info = MediaInfo {
+            duration: Some(Time::from_seconds(2)),
+            streams: vec![Stream::Video(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                width: NonZero::new(64).unwrap(),
+                height: NonZero::new(64).unwrap(),
+                frame_rate: None,
+            })],
+        };
+        let asset = project.add_asset("a.mkv".into(), info);
+        let first = project.place_clip(asset, 0, Time::ZERO).unwrap();
+        let second = project.place_clip(asset, 0, Time::from_seconds(4)).unwrap();
+        project.place_clip(asset, 0, Time::from_seconds(8)).unwrap();
+        let selection = BTreeSet::from([first.id, second.id]);
+        let preview = DropPreview {
+            track: 0,
+            range: TimeRange::new(Time::from_seconds(1), Time::from_seconds(2)),
+            fits: false,
+            reason: Some(OVERLAP_REASON),
+            mode: DropMode::Place,
+            snapped_to: None,
+            group_shift: Some(Time::from_seconds(1)),
+        };
+        let track = &project.timeline.tracks[0];
+
+        let ghosts = ghosts_on(0, track, Some(preview), &selection);
+
+        let starts: Vec<Time> = ghosts.iter().map(|ghost| ghost.range.start).collect();
+        let reasons: Vec<_> = ghosts.iter().map(|ghost| ghost.reason).collect();
+        assert_eq!(starts, seconds(&[1, 5]));
+        assert_eq!(reasons, [Some(OVERLAP_REASON), None]);
+        assert!(ghosts.iter().all(|ghost| !ghost.fits));
+        assert!(ghosts_on(1, track, Some(preview), &BTreeSet::new()).is_empty());
     }
 
     const MARKER_Y: f32 = RULER_HEIGHT - MARKER_HEIGHT / 2.;

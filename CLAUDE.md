@@ -274,11 +274,14 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   places the clip at the previewed, frame-snapped start. Clips on the timeline work the same way.
   The selection is a set of clips. Pressing a lane selects the clip under the pointer (keeping the
   selection when that clip is already in it, so a group can be dragged) or clears the selection,
-  and with Shift held toggles the clip in the selection instead. Ctrl+A selects every clip. It
+  and with Shift held toggles the clip in the selection instead. Pressing empty lane space starts a
+  marquee (`Marquee`, kept in time and content-y so it holds while the view scrolls) that selects
+  every clip it touches on the rows it spans, added to the selection when Shift was held. Ctrl+A selects every clip. It
   records where the clip was grabbed. The panel drops clips that no longer exist from the
   selection whenever the project changes, and pulls the view back when the timeline shrinks under
   it. Dragging a selected clip's body moves the whole selection by the same time (`move_clips`),
-  previewed as the dragged clip's ghost, red when any selected clip would collide. A trim keeps the offset at which its
+  previewed as a ghost for every selected clip (`DropPreview::group_shift`, `ghosts_on`), all red
+  when any selected clip would collide. A trim keeps the offset at which its
   handle was grabbed and commits wherever the pointer is released, since only the clip's own lane
   previews it. Dropping an asset with Ctrl held inserts it and with Alt held overwrites
   (`DropMode`, carried on the `DropPreview`); a red ghost says why it was refused. A start that

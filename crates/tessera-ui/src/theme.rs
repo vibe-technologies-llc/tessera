@@ -83,3 +83,7 @@ pub fn safe_area() -> Rgba {
 pub fn backdrop() -> Rgba {
     rgba(0x00000099)
 }
+
+pub fn marquee() -> Rgba {
+    rgba(0xf2f3f51a)
+}
