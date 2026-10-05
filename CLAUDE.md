@@ -147,9 +147,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   discards up to the target.
 - **`tessera-audio`** plays the timeline's sound through PipeWire (`pipewire`, the only crate
   allowed to touch it). `Mixer::render` fills a block of interleaved stereo `f32` samples starting
-  at a timeline sample index: every clip on every audio track that overlaps the block (`clips_overlapping`) is read
+  at a timeline sample index: every clip on every audible audio track (not muted, and when any audio track is soloed only the
+  soloed ones) that overlaps the block (`clips_overlapping`) is read
   from an `AudioDecoder` (one per media path, at the project's sample rate) and summed into its
-  part of the block. A clip reads from its source start plus its offset into the clip, so blocks
+  part of the block; the sum then goes through a soft limiter that leaves samples up to ±0.9 alone
+  and eases the rest toward ±1.0. A clip reads from its source start plus its offset into the clip, so blocks
   that follow each other continue in the source without seeking. Media that fails to open or
   decode is warned about once and stays silent. `Output` runs a PipeWire playback stream on its
   own thread, whose process callback copies whole frames out of a shared queue (silence on

@@ -47,8 +47,7 @@
 - Keep one PipeWire connection for the session instead of connecting on every play, blocking the UI
   thread on it, and joining the stream thread on every pause
 - Play the sound of video clips, through linked audio clips or their own stream
-- Mix the audio tracks, with per-clip gain and per-track volume, mute and solo
-- Limit the summed mix, which exceeds ±1.0 wherever clips overlap
+- Mix the audio tracks, with per-clip gain and per-track volume
 - Flush the queued audio when the project changes while playing, instead of playing up to 200 ms of
   the old timeline
 - Give each clip its own read position, so two clips of one file overlapping in time don't seek on

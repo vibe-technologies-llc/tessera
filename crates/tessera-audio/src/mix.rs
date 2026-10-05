@@ -82,17 +82,38 @@ impl Mixer {
                 }
             }
         }
+        for sample in out.iter_mut() {
+            *sample = limited(*sample);
+        }
+    }
+}
+
+const LIMITER_KNEE: f32 = 0.9;
+
+fn limited(sample: f32) -> f32 {
+    let magnitude = sample.abs();
+    if magnitude <= LIMITER_KNEE {
+        sample
+    } else {
+        let headroom = 1.0 - LIMITER_KNEE;
+        let eased = LIMITER_KNEE + headroom * ((magnitude - LIMITER_KNEE) / headroom).tanh();
+        eased.copysign(sample)
     }
 }
 
 fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) -> Vec<Span<'_>> {
     let end = first + frames as i64;
     let block = time_touching_samples(first..end, sample_rate);
-    project
-        .timeline
-        .tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::Audio)
+    let audio = || {
+        project
+            .timeline
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Audio)
+    };
+    let any_solo = audio().any(|track| track.solo);
+    audio()
+        .filter(|track| !track.muted && (track.solo || !any_solo))
         .flat_map(|track| track.clips_overlapping(block))
         .filter_map(|clip| {
             let path = &project.asset(clip.asset)?.path;
@@ -248,5 +269,41 @@ mod tests {
         mixer.failed.insert(TONE.into());
         mixer.set_project(project);
         assert_eq!(mixer.failed, HashSet::from([PathBuf::from(TONE)]));
+    }
+
+    #[test]
+    fn muted_tracks_stay_silent_and_solo_silences_the_others() {
+        let (mut project, asset, track) = project_with_tone();
+        let second = project.timeline.add_track(TrackKind::Audio);
+        let third = project.timeline.add_track(TrackKind::Audio);
+        for track in [track, second, third] {
+            project.place_clip(asset, track, Time::ZERO).unwrap();
+        }
+
+        project.timeline.tracks[second].muted = true;
+
+        assert_eq!(spans(&project, RATE, 0, 1024).len(), 2);
+
+        project.timeline.tracks[third].solo = true;
+
+        assert_eq!(spans(&project, RATE, 0, 1024).len(), 1);
+
+        project.timeline.tracks[second].solo = true;
+        project.timeline.tracks[second].muted = false;
+
+        assert_eq!(spans(&project, RATE, 0, 1024).len(), 2);
+    }
+
+    #[test]
+    fn the_limiter_leaves_quiet_samples_alone_and_never_exceeds_full_scale() {
+        for sample in [0.0, 0.5, -0.5, LIMITER_KNEE, -LIMITER_KNEE] {
+            assert_eq!(limited(sample), sample);
+        }
+        for sample in [0.95, 1.0, 1.7, 40.0, f32::MAX] {
+            let limited_up = limited(sample);
+            assert!(limited_up > LIMITER_KNEE && limited_up <= 1.0, "{sample}");
+            assert_eq!(limited(-sample), -limited_up);
+        }
+        assert!(limited(0.95) < limited(1.7));
     }
 }
