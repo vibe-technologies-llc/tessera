@@ -156,7 +156,14 @@ struct DropPreview {
     reason: Option<&'static str>,
     mode: DropMode,
     snapped_to: Option<Time>,
-    group_shift: Option<Time>,
+    group: Option<GroupShift>,
+    partner: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GroupShift {
+    shift: Time,
+    from: usize,
 }
 
 impl DropPreview {
@@ -686,12 +693,23 @@ impl TimelinePanel {
             selected
         };
         let split = self.editor.apply(Command::SplitClips, cx, |project| {
-            targets
-                .into_iter()
-                .try_for_each(|id| project.split_clip(id, time).map(drop))
+            project.split_clips(&targets, time).map(drop)
         });
         if let Err(error) = split {
             tracing::warn!(%error, "could not split the clips");
+        }
+    }
+
+    pub fn unlink_selection(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<ClipId> = self.selection.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let unlinked = self.editor.apply(Command::UnlinkClips, cx, |project| {
+            project.unlink_clips(&ids)
+        });
+        if let Err(error) = unlinked {
+            tracing::warn!(%error, "could not unlink the clips");
         }
     }
 
@@ -887,15 +905,21 @@ impl TimelinePanel {
             self.grab = offset - self.viewport.x_at(clip.start);
         }
         let before = self.selection.clone();
+        let group = |clip: Clip| self.project.read(cx).with_partners(&[clip.id]);
         match pressed {
             Some(clip) if extend => {
-                if !self.selection.remove(&clip.id) {
-                    self.selection.insert(clip.id);
+                let group = group(clip);
+                if self.selection.contains(&clip.id) {
+                    for id in group {
+                        self.selection.remove(&id);
+                    }
+                } else {
+                    self.selection.extend(group);
                 }
             }
             Some(clip) => {
                 if !self.selection.contains(&clip.id) {
-                    self.selection = BTreeSet::from([clip.id]);
+                    self.selection = group(clip).into_iter().collect();
                 }
             }
             None => {
@@ -931,7 +955,9 @@ impl TimelinePanel {
             return;
         }
         marquee.reach = reach;
-        self.selection = marquee.enclosed(&self.project.read(cx).timeline);
+        let project = self.project.read(cx);
+        let enclosed: Vec<ClipId> = marquee.enclosed(&project.timeline).into_iter().collect();
+        self.selection = project.with_partners(&enclosed).into_iter().collect();
         cx.notify();
     }
 
@@ -988,11 +1014,8 @@ impl TimelinePanel {
                             DropMode::Place,
                         );
                     }
-                    if clip_track != track {
-                        return None;
-                    }
-                    let moved =
-                        project.moved_clips(&group_moves(project, &group, start - clip.start));
+                    let moves = group_moves(project, &group, start - clip.start, clip_track, track);
+                    let moved = project.moved_clips(&moves);
                     let fits = match moved {
                         Ok(_) => true,
                         Err(EditError::Overlapping(_)) => false,
@@ -1005,7 +1028,11 @@ impl TimelinePanel {
                         reason: (!fits).then_some(OVERLAP_REASON),
                         mode: DropMode::Place,
                         snapped_to: None,
-                        group_shift: Some(start - clip.start),
+                        group: Some(GroupShift {
+                            shift: start - clip.start,
+                            from: clip_track,
+                        }),
+                        partner: None,
                     };
                     Some(preview.snapped(snap))
                 });
@@ -1027,12 +1054,14 @@ impl TimelinePanel {
                 let snap = self.snap(&[to], &[id], cx);
                 let to = to + snap.map_or(Time::ZERO, |snap| snap.shift);
                 let project = self.project.read(cx);
+                let partner = project.partners(id).first().map(|(partner, _)| *partner);
                 let preview = placement(
                     track,
                     project.trimmed_clip(id, edge, to),
                     snap,
                     DropMode::Place,
-                );
+                )
+                .map(|preview| DropPreview { partner, ..preview });
                 self.show_preview(preview, cx);
             }
         }
@@ -1078,11 +1107,14 @@ impl TimelinePanel {
             |project, preview| {
                 let start = preview.range.start;
                 match preview.mode {
-                    DropMode::Place => project.place_clip(asset, preview.track, start),
-                    DropMode::Insert => project.insert_asset(asset, preview.track, start),
-                    DropMode::Overwrite => project.overwrite_asset(asset, preview.track, start),
+                    DropMode::Place => project.place_linked(asset, preview.track, start),
+                    DropMode::Insert => project
+                        .insert_asset(asset, preview.track, start)
+                        .map(|clip| vec![clip]),
+                    DropMode::Overwrite => project
+                        .overwrite_asset(asset, preview.track, start)
+                        .map(|clip| vec![clip]),
                 }
-                .map(|clip| vec![clip])
             },
         );
     }
@@ -1121,9 +1153,9 @@ impl TimelinePanel {
             cx,
             |project, preview| {
                 if grouped {
-                    let start = project.find_clip(id).map(|(_, clip)| clip.start);
-                    let delta = preview.range.start - start.ok_or(EditError::UnknownClip(id))?;
-                    project.move_clips(&group_moves(project, &group, delta))
+                    let (from, clip) = project.find_clip(id).ok_or(EditError::UnknownClip(id))?;
+                    let delta = preview.range.start - clip.start;
+                    project.move_clips(&group_moves(project, &group, delta, from, track))
                 } else {
                     project
                         .move_clip(id, preview.track, preview.range.start)
@@ -1149,7 +1181,15 @@ impl TimelinePanel {
                 .editor
                 .apply(command, cx, |project| edit(project, preview))
             {
-                Ok(clips) => self.selection = clips.iter().map(|clip| clip.id).collect(),
+                Ok(clips) => {
+                    let ids: Vec<ClipId> = clips.iter().map(|clip| clip.id).collect();
+                    self.selection = self
+                        .project
+                        .read(cx)
+                        .with_partners(&ids)
+                        .into_iter()
+                        .collect();
+                }
                 Err(error) => tracing::warn!(%error, "could not edit the timeline"),
             }
         }
@@ -1426,7 +1466,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
         TrackKind::Video => theme::video_clip(),
         TrackKind::Audio => theme::audio_clip(),
     };
-    let ghosts = ghosts_on(index, track, drop_preview, selection)
+    let ghosts = ghosts_on(index, &project.timeline.tracks, drop_preview, selection)
         .into_iter()
         .map(|preview| drop_ghost(preview, viewport));
     div()
@@ -1466,18 +1506,33 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
 
 fn ghosts_on(
     index: usize,
-    track: &Track,
+    tracks: &[Track],
     preview: Option<DropPreview>,
     selection: &BTreeSet<ClipId>,
 ) -> Vec<DropPreview> {
     let Some(preview) = preview else {
         return Vec::new();
     };
-    let Some(shift) = preview.group_shift else {
-        return (preview.track == index)
-            .then_some(preview)
+    let Some(GroupShift { shift, from }) = preview.group else {
+        let on_lane = preview.track == index || preview.partner == Some(index);
+        return on_lane
+            .then(|| DropPreview {
+                track: index,
+                reason: preview.reason.filter(|_| preview.track == index),
+                ..preview
+            })
             .into_iter()
             .collect();
+    };
+    let source = if index == preview.track {
+        from
+    } else if index == from {
+        return Vec::new();
+    } else {
+        index
+    };
+    let Some(track) = tracks.get(source) else {
+        return Vec::new();
     };
     track
         .clips()
@@ -1517,11 +1572,20 @@ fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
         .rounded_sm()
 }
 
-fn group_moves(project: &Project, group: &[ClipId], delta: Time) -> Vec<(ClipId, usize, Time)> {
+fn group_moves(
+    project: &Project,
+    group: &[ClipId],
+    delta: Time,
+    from: usize,
+    to: usize,
+) -> Vec<(ClipId, usize, Time)> {
     group
         .iter()
         .filter_map(|id| project.find_clip(*id))
-        .map(|(track, clip)| (clip.id, track, clip.start + delta))
+        .map(|(track, clip)| {
+            let track = if track == from { to } else { track };
+            (clip.id, track, clip.start + delta)
+        })
         .collect()
 }
 
@@ -1543,7 +1607,8 @@ fn placement(
         reason: (!fits).then_some(OVERLAP_REASON),
         mode,
         snapped_to: None,
-        group_shift: None,
+        group: None,
+        partner: None,
     };
     Some(preview.snapped(snap))
 }
@@ -1556,9 +1621,27 @@ fn asset_drop_preview(
     snap: Option<Snap>,
     mode: DropMode,
 ) -> Option<DropPreview> {
-    let preview = placement(track, project.clip_for(asset, track, start), snap, mode)?;
+    if mode != DropMode::Place {
+        let preview = placement(track, project.clip_for(asset, track, start), snap, mode)?;
+        return Some(DropPreview {
+            reason: preview.reason.map(|_| ASSET_OVERLAP_REASON),
+            ..preview
+        });
+    }
+    let linked = project.linked_clips_for(asset, track, start);
+    let partner = match &linked {
+        Ok(clips) => clips.get(1).map(|(partner, _)| *partner),
+        Err(_) => project.partner_track(track).filter(|&partner| {
+            project
+                .asset(asset)
+                .is_some_and(|asset| asset.has_stream(project.timeline.tracks[partner].kind))
+        }),
+    };
+    let primary = linked.map(|clips| clips[0].1);
+    let preview = placement(track, primary, snap, mode)?;
     Some(DropPreview {
         reason: preview.reason.map(|_| ASSET_OVERLAP_REASON),
+        partner,
         ..preview
     })
 }
@@ -2530,6 +2613,7 @@ mod tests {
                     asset: AssetId(0),
                     source: TimeRange::new(Time::ZERO, Time::from_seconds(5)),
                     start: Time::from_seconds(start),
+                    link: None,
                 })
                 .unwrap();
         }
@@ -2744,18 +2828,128 @@ mod tests {
             reason: Some(OVERLAP_REASON),
             mode: DropMode::Place,
             snapped_to: None,
-            group_shift: Some(Time::from_seconds(1)),
+            group: Some(GroupShift {
+                shift: Time::from_seconds(1),
+                from: 0,
+            }),
+            partner: None,
         };
-        let track = &project.timeline.tracks[0];
+        let tracks = &project.timeline.tracks;
 
-        let ghosts = ghosts_on(0, track, Some(preview), &selection);
+        let ghosts = ghosts_on(0, tracks, Some(preview), &selection);
 
         let starts: Vec<Time> = ghosts.iter().map(|ghost| ghost.range.start).collect();
         let reasons: Vec<_> = ghosts.iter().map(|ghost| ghost.reason).collect();
         assert_eq!(starts, seconds(&[1, 5]));
         assert_eq!(reasons, [Some(OVERLAP_REASON), None]);
         assert!(ghosts.iter().all(|ghost| !ghost.fits));
-        assert!(ghosts_on(1, track, Some(preview), &BTreeSet::new()).is_empty());
+        assert!(ghosts_on(1, tracks, Some(preview), &BTreeSet::new()).is_empty());
+    }
+
+    fn with_sound(info: MediaInfo) -> MediaInfo {
+        let mut streams = info.streams;
+        streams.push(Stream::Audio(tessera_timeline::AudioStream {
+            index: 1,
+            codec: "aac".into(),
+            sample_rate: NonZero::new(48_000).unwrap(),
+            channels: NonZero::new(2).unwrap(),
+        }));
+        MediaInfo { streams, ..info }
+    }
+
+    fn timeline_with_a_linked_pair(
+        cx: &mut TestAppContext,
+    ) -> (Entity<TimelinePanel>, &mut VisualTestContext, Clip, Clip) {
+        let mut project = Project::new("linked");
+        project.timeline.add_track(TrackKind::Video);
+        let info = with_sound(MediaInfo {
+            duration: Some(Time::from_seconds(8)),
+            streams: vec![Stream::Video(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                width: NonZero::new(1920).unwrap(),
+                height: NonZero::new(1080).unwrap(),
+                frame_rate: None,
+            })],
+        });
+        let asset = project.add_asset("a.mkv".into(), info);
+        let pair = project
+            .place_linked(asset, 0, Time::from_seconds(1))
+            .unwrap();
+        let project = cx.new(|_| project);
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
+            TimelinePanel::new(ProjectEditor::new(project, cx), playhead, cx)
+        });
+        (panel, cx, pair[0], pair[1])
+    }
+
+    const A1_ROW: usize = 2;
+
+    #[gpui::test]
+    fn pressing_a_linked_clip_selects_its_partner_and_dragging_moves_both(cx: &mut TestAppContext) {
+        let (panel, cx, picture, sound) = timeline_with_a_linked_pair(cx);
+
+        cx.simulate_click(point(at(4.), row_y(A1_ROW)), Modifiers::none());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([picture.id, sound.id]));
+
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::shift());
+
+        assert!(selected(&panel, cx).is_empty());
+
+        drag(cx, at(4.), at(6.));
+
+        assert_eq!(clip_of(&panel, cx, picture.id).start, Time::from_seconds(3));
+        assert_eq!(clip_of(&panel, cx, sound.id).start, Time::from_seconds(3));
+    }
+
+    #[gpui::test]
+    fn splitting_and_unlinking_a_linked_pair(cx: &mut TestAppContext) {
+        let (panel, cx, picture, sound) = timeline_with_a_linked_pair(cx);
+        seek(&panel, cx, 4);
+        cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
+
+        panel.update(cx, TimelinePanel::split_at_playhead);
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 4]));
+        assert_eq!(starts_on(&panel, cx, 2), seconds(&[1, 4]));
+
+        panel.update(cx, TimelinePanel::unlink_selection);
+        cx.simulate_click(point(at(12.), px(V1)), Modifiers::none());
+        cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([picture.id]));
+        assert_eq!(clip_of(&panel, cx, sound.id).link, None);
+    }
+
+    #[test]
+    fn dropping_media_with_sound_previews_its_partner_on_an_audio_track() {
+        let mut project = Project::new("drop");
+        let info = with_sound(MediaInfo {
+            duration: Some(Time::from_seconds(2)),
+            streams: vec![Stream::Video(VideoStream {
+                index: 0,
+                codec: "h264".into(),
+                width: NonZero::new(64).unwrap(),
+                height: NonZero::new(64).unwrap(),
+                frame_rate: None,
+            })],
+        });
+        let asset = project.add_asset("a.mkv".into(), info);
+
+        let preview =
+            asset_drop_preview(&project, asset, 0, Time::ZERO, None, DropMode::Place).unwrap();
+        let ghosts = ghosts_on(1, &project.timeline.tracks, Some(preview), &BTreeSet::new());
+
+        assert_eq!(preview.partner, Some(1));
+        assert_eq!(ghosts.len(), 1);
+        assert_eq!(ghosts[0].reason, None);
+
+        let inserting =
+            asset_drop_preview(&project, asset, 0, Time::ZERO, None, DropMode::Insert).unwrap();
+
+        assert_eq!(inserting.partner, None);
     }
 
     const MARKER_Y: f32 = RULER_HEIGHT - MARKER_HEIGHT / 2.;

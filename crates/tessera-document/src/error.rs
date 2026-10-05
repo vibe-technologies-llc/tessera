@@ -1,7 +1,9 @@
 use std::{io, path::PathBuf};
 
 use serde_json::Value;
-use tessera_timeline::{AssetId, ClipId, InvalidClip, MarkerId, OverlappingClip, TrackKind};
+use tessera_timeline::{
+    AssetId, ClipId, InvalidClip, LinkId, MarkerId, OverlappingClip, TrackKind,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -131,4 +133,16 @@ pub enum ValidationError {
     InOutPoints,
     #[error("the timeline has no {0:?} track")]
     NoTrack(TrackKind),
+    #[error("clip {} is linked by {}, which is not below the next link id {}", .clip.0, .link.0, .next.0)]
+    UnissuedLink {
+        clip: ClipId,
+        link: LinkId,
+        next: LinkId,
+    },
+    #[error("link {} holds a single clip", .0.0)]
+    LoneLink(LinkId),
+    #[error("link {} holds two clips on track {track}", .link.0)]
+    LinkedOnOneTrack { link: LinkId, track: usize },
+    #[error("the clips of link {} do not share their asset, start and source range", .0.0)]
+    LinkOutOfStep(LinkId),
 }

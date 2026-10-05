@@ -255,8 +255,9 @@ mod tests {
                 ],
             },
         );
-        project.place_clip(asset, 0, Time::from_seconds(1)).unwrap();
-        project.place_clip(asset, 1, Time::from_seconds(1)).unwrap();
+        project
+            .place_linked(asset, 0, Time::from_seconds(1))
+            .unwrap();
         project.add_marker(Time::from_seconds(4), "Cut here");
         project.set_in_point(Time::from_seconds(1)).unwrap();
         project.set_out_point(Time::from_seconds(8)).unwrap();

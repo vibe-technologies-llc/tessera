@@ -69,7 +69,20 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   moves the later clips with it, `roll_clips` moves the cut between two touching clips, `slip_clip`
   moves a clip's source window and `slide_clip` moves a clip while its touching neighbours give or
   take the time. These live in `project/edits.rs`, and every one that spans several clips restores
-  the timeline and the id counters when it fails. A `Track` carries a `name`
+  the timeline and the id counters when it fails. A clip may carry a `LinkId` (from `NextIds`,
+  never reused) shared with its partners, the clips of one asset that play together; linked clips
+  always share their asset, start and source range (`project/links.rs`). `place_linked` (previewed
+  by `linked_clips_for`) places an asset's clip and, when the asset has the other kind of stream
+  and the `partner_track` (the other kind's track of the same ordinal, else its first) accepts it,
+  a linked partner there, refusing the whole placement when either overlaps. `move_clips` (and so
+  `move_clip`) moves partners by the same time on their own tracks, `trim_clip` trims them to the
+  same edge as far as every one of them can go, `split_clips` (and `split_clip`) splits them all
+  and links the tails under a new id, and `delete_clips` and `ripple_delete_clips` (and their
+  single-clip forms) take the partners too, so a ripple pulls every partner's track.
+  `paste_clips` links the copies of partners pasted together under a new id. `unlink_clips`
+  unlinks the groups of the given clips; any other edit that leaves partners out of step (an
+  insert or overwrite that shifts or cuts one, a ripple trim, roll, slip or slide) drops their
+  link (`settle_links`). A `Track` carries a `name`
   (empty shows the default label), `locked`, `muted`, `solo` and a `TrackHeight`; a locked track
   refuses every edit of its clips and every placement onto it (`TrackLocked`), through
   `located_clip` and `track_accepting`. A muted video track is left out of the composite
@@ -107,8 +120,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   Rebuilding the `Project` validates rather than trusts: clips go through `Clip::check` and
   `Track::insert`, and ids (unique, and each below the stored next id), assets, stream kinds, clip
   ranges, rates, sizes and channel counts (none zero), asset durations (positive), stream indices
-  (unique within an asset) and one track of each kind are checked, each failure a distinct
-  `ValidationError`.
+  (unique within an asset), one track of each kind and the links (each issued, held by at least two
+  clips on different tracks, in step) are checked, each failure a distinct `ValidationError`.
   `to_string` and `from_str` are pure and leave media paths as they are. `save` and `open` make them
   portable: a media path under the project file's directory (the directory of the file a symlink
   points at) is stored relative to it, any other path is stored absolute (a path relative to the
@@ -279,9 +292,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   every clip it touches on the rows it spans, added to the selection when Shift was held. Ctrl+A selects every clip. It
   records where the clip was grabbed. The panel drops clips that no longer exist from the
   selection whenever the project changes, and pulls the view back when the timeline shrinks under
-  it. Dragging a selected clip's body moves the whole selection by the same time (`move_clips`),
-  previewed as a ghost for every selected clip (`DropPreview::group_shift`, `ghosts_on`), all red
-  when any selected clip would collide. A trim keeps the offset at which its
+  it. Pressing, Shift-toggling and sweeping select a linked clip together with its partners (Ctrl+L
+  unlinks the selection). Dragging a selected clip's body moves the whole selection by the same
+  time (`move_clips`), carrying the clips on the dragged clip's track to the lane it is dropped on
+  and leaving the others on their tracks, previewed as a ghost for every selected clip
+  (`DropPreview::group`, `ghosts_on`), all red when any selected clip would collide. A plain drop
+  of an asset places it linked with its sound or picture (`place_linked`), and the preview draws
+  the partner's ghost on its lane (`DropPreview::partner`), as a trim of a linked clip does. A trim keeps the offset at which its
   handle was grabbed and commits wherever the pointer is released, since only the clip's own lane
   previews it. Dropping an asset with Ctrl held inserts it and with Alt held overwrites
   (`DropMode`, carried on the `DropPreview`); a red ghost says why it was refused. A start that

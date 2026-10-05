@@ -3,6 +3,7 @@ use std::{num::NonZeroU32, path::PathBuf, sync::Arc};
 use thiserror::Error;
 
 mod edits;
+mod links;
 mod markers;
 
 use crate::{
@@ -82,11 +83,15 @@ pub struct ClipId(pub u64);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MarkerId(pub u64);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LinkId(pub u64);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NextIds {
     pub asset: AssetId,
     pub clip: ClipId,
     pub marker: MarkerId,
+    pub link: LinkId,
 }
 
 impl NextIds {
@@ -102,11 +107,16 @@ impl NextIds {
         id < self.marker
     }
 
+    pub fn has_issued_link(&self, id: LinkId) -> bool {
+        id < self.link
+    }
+
     pub fn covering(self, other: Self) -> Self {
         Self {
             asset: self.asset.max(other.asset),
             clip: self.clip.max(other.clip),
             marker: self.marker.max(other.marker),
+            link: self.link.max(other.link),
         }
     }
 
@@ -127,6 +137,12 @@ impl NextIds {
         self.marker = MarkerId(id.0 + 1);
         id
     }
+
+    fn take_link(&mut self) -> LinkId {
+        let id = self.link;
+        self.link = LinkId(id.0 + 1);
+        id
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -141,6 +157,7 @@ pub struct Clip {
     pub asset: AssetId,
     pub source: TimeRange,
     pub start: Time,
+    pub link: Option<LinkId>,
 }
 
 impl Clip {
@@ -615,6 +632,7 @@ impl Project {
             asset: asset.id,
             source: TimeRange::new(Time::ZERO, duration),
             start: start.max(Time::ZERO),
+            link: None,
         })
     }
 
@@ -647,6 +665,7 @@ impl Project {
         Ok(Clip {
             id: self.next_ids.clip,
             start: start.max(Time::ZERO),
+            link: None,
             ..*clip
         })
     }
@@ -673,25 +692,35 @@ impl Project {
     }
 
     pub fn moved_clip(&self, id: ClipId, track: usize, start: Time) -> Result<Clip, EditError> {
-        let (_, clip) = self.located_clip(id)?;
-        let asset = self
-            .asset(clip.asset)
-            .ok_or(EditError::UnknownAsset(clip.asset))?;
-        let moved = Clip {
-            start: start.max(Time::ZERO),
-            ..clip
-        };
-        self.track_accepting(asset, track)?
-            .check_insert_moving(&moved, Some(id))?;
-        Ok(moved)
+        self.clone().move_clip(id, track, start)
     }
 
     pub fn move_clip(&mut self, id: ClipId, track: usize, start: Time) -> Result<Clip, EditError> {
-        let moved = self.moved_clip(id, track, start)?;
-        self.replace_clip(moved, track)
+        let moved = self.move_clips(&[(id, track, start)])?;
+        moved
+            .into_iter()
+            .find(|clip| clip.id == id)
+            .ok_or(EditError::UnknownClip(id))
     }
 
     pub fn trimmed_clip(&self, id: ClipId, edge: ClipEdge, to: Time) -> Result<Clip, EditError> {
+        let (_, clip) = self.located_clip(id)?;
+        let edge_of = |clip: &Clip| match edge {
+            ClipEdge::Start => clip.start,
+            ClipEdge::End => clip.timeline_range().end(),
+        };
+        let current = edge_of(&clip);
+        let mut reached = edge_of(&self.trimmed_alone(id, edge, to)?);
+        for (_, partner) in self.partners(id) {
+            let allowed = edge_of(&self.trimmed_alone(partner.id, edge, to)?);
+            if (allowed - current).flicks().abs() < (reached - current).flicks().abs() {
+                reached = allowed;
+            }
+        }
+        self.trimmed_alone(id, edge, reached)
+    }
+
+    fn trimmed_alone(&self, id: ClipId, edge: ClipEdge, to: Time) -> Result<Clip, EditError> {
         let (track, clip) = self.located_clip(id)?;
         let track = &self.timeline.tracks[track];
         let range = clip.timeline_range();
@@ -736,11 +765,36 @@ impl Project {
 
     pub fn trim_clip(&mut self, id: ClipId, edge: ClipEdge, to: Time) -> Result<Clip, EditError> {
         let trimmed = self.trimmed_clip(id, edge, to)?;
-        let (track, _) = self.located_clip(id)?;
-        self.replace_clip(trimmed, track)
+        let reached = match edge {
+            ClipEdge::Start => trimmed.start,
+            ClipEdge::End => trimmed.timeline_range().end(),
+        };
+        let partners = self.partners(id);
+        self.atomically(|project| {
+            let (track, _) = project.located_clip(id)?;
+            project.replace_clip(trimmed, track)?;
+            for (track, partner) in partners {
+                let trimmed = project.trimmed_alone(partner.id, edge, reached)?;
+                project.replace_clip(trimmed, track)?;
+            }
+            Ok(trimmed)
+        })
     }
 
     pub fn split_clip(&mut self, id: ClipId, at: Time) -> Result<(Clip, Clip), EditError> {
+        let split = self.split_clips(&[id], at)?;
+        split
+            .into_iter()
+            .find(|(head, _)| head.id == id)
+            .ok_or(EditError::UnknownClip(id))
+    }
+
+    fn split_alone(
+        &mut self,
+        id: ClipId,
+        at: Time,
+        tail_link: Option<LinkId>,
+    ) -> Result<(Clip, Clip), EditError> {
         let (track, clip) = self.located_clip(id)?;
         if !clip.is_cut_by(at) {
             return Err(EditError::OutsideClip { clip: id, time: at });
@@ -757,6 +811,7 @@ impl Project {
                 clip.source.start + head_duration,
                 clip.source.duration - head_duration,
             ),
+            link: tail_link,
             ..clip
         };
         let track = &mut self.timeline.tracks[track];
@@ -767,23 +822,19 @@ impl Project {
     }
 
     pub fn delete_clip(&mut self, id: ClipId) -> Result<Clip, EditError> {
-        let (track, _) = self.located_clip(id)?;
-        self.timeline.tracks[track]
-            .remove(id)
+        let deleted = self.delete_clips(&[id])?;
+        deleted
+            .into_iter()
+            .find(|clip| clip.id == id)
             .ok_or(EditError::UnknownClip(id))
     }
 
     pub fn ripple_delete_clip(&mut self, id: ClipId) -> Result<Clip, EditError> {
-        let (track, _) = self.located_clip(id)?;
-        let track = &mut self.timeline.tracks[track];
-        let deleted = track.remove(id).ok_or(EditError::UnknownClip(id))?;
-        let first_later = track
-            .clips
-            .partition_point(|clip| clip.start < deleted.timeline_range().end());
-        for later in &mut track.clips_mut()[first_later..] {
-            later.start = later.start - deleted.source.duration;
-        }
-        Ok(deleted)
+        let deleted = self.ripple_delete_clips(&[id])?;
+        deleted
+            .into_iter()
+            .find(|clip| clip.id == id)
+            .ok_or(EditError::UnknownClip(id))
     }
 
     fn replace_clip(&mut self, clip: Clip, track: usize) -> Result<Clip, EditError> {
@@ -812,6 +863,7 @@ mod tests {
             asset: AssetId(0),
             source: TimeRange::new(Time::from_seconds(10), Time::from_seconds(duration)),
             start: Time::from_seconds(start),
+            link: None,
         }
     }
 

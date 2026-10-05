@@ -59,6 +59,7 @@ mod tests {
                     asset: AssetId(0),
                     source: TimeRange::new(Time::ZERO, seconds(3)),
                     start: seconds(start),
+                    link: None,
                 })
                 .unwrap();
         }

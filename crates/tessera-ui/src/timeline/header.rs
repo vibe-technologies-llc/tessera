@@ -448,6 +448,7 @@ mod tests {
                     tessera_timeline::Time::from_seconds(1),
                 ),
                 start: tessera_timeline::Time::ZERO,
+                link: None,
             })
             .unwrap();
         timeline.tracks[1] = clip_track;

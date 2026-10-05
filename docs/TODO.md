@@ -1,7 +1,6 @@
 ## Model
 
-- Link the video and audio clips placed from one asset, so one drop places both and move, trim,
-  split, delete and ripple delete keep them in sync (`ripple_delete_clip` shifts only its own track)
+- Link the clips an insert or overwrite drop places, and link clips again after Ctrl+L unlinked them
 - Carry rotation, sample aspect ratio, pixel format, stream disposition and per-stream start time in
   `MediaInfo`, and let a clip choose which of several audio streams it plays
 
@@ -18,7 +17,6 @@
 
 - Keep one PipeWire connection for the session instead of connecting on every play, blocking the UI
   thread on it, and joining the stream thread on every pause
-- Play the sound of video clips, through linked audio clips or their own stream
 - Mix the audio tracks, with per-clip gain and per-track volume
 - Play sound at shuttle speeds, in reverse and while scrubbing or stepping
 - Retry media that failed during playback, and open decoders ahead of clip starts with reused mix

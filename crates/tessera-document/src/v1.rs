@@ -1,13 +1,13 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     num::{NonZeroU16, NonZeroU32},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
-    self as model, AssetId, ClipId, FrameRate, InsertError, MarkerId, MediaInfo, NextIds, Time,
-    TimeRange, Timeline,
+    self as model, AssetId, ClipId, FrameRate, InsertError, LinkId, MarkerId, MediaInfo, NextIds,
+    Time, TimeRange, Timeline,
 };
 
 use crate::{FormatError, ValidationError};
@@ -20,6 +20,7 @@ pub struct Project {
     next_asset_id: u64,
     next_clip_id: u64,
     next_marker_id: u64,
+    next_link_id: u64,
     assets: Vec<Asset>,
     tracks: Vec<Track>,
     markers: Vec<Marker>,
@@ -113,6 +114,7 @@ struct Clip {
     start_flicks: i64,
     source_start_flicks: i64,
     source_duration_flicks: i64,
+    link: Option<u64>,
 }
 
 impl TryFrom<&model::Project> for Project {
@@ -155,6 +157,7 @@ impl Project {
             next_asset_id: project.next_ids.asset.0,
             next_clip_id: project.next_ids.clip.0,
             next_marker_id: project.next_ids.marker.0,
+            next_link_id: project.next_ids.link.0,
             assets: project
                 .assets
                 .iter()
@@ -304,6 +307,7 @@ impl From<&model::Clip> for Clip {
             start_flicks: clip.start.flicks(),
             source_start_flicks: clip.source.start.flicks(),
             source_duration_flicks: clip.source.duration.flicks(),
+            link: clip.link.map(|link| link.0),
         }
     }
 }
@@ -324,6 +328,7 @@ impl TryFrom<Project> for model::Project {
                 asset: AssetId(project.next_asset_id),
                 clip: ClipId(project.next_clip_id),
                 marker: MarkerId(project.next_marker_id),
+                link: LinkId(project.next_link_id),
             },
         };
         for asset in project.assets {
@@ -357,6 +362,7 @@ impl TryFrom<Project> for model::Project {
             }
             rebuilt.timeline.tracks.push(track);
         }
+        check_links(&rebuilt)?;
         let mut marker_ids = HashSet::new();
         for marker in project.markers {
             let id = MarkerId(marker.id);
@@ -407,6 +413,52 @@ impl TryFrom<Project> for model::Project {
         }
         Ok(rebuilt)
     }
+}
+
+fn check_links(project: &model::Project) -> Result<(), ValidationError> {
+    let mut groups: BTreeMap<LinkId, Vec<(usize, model::Clip)>> = BTreeMap::new();
+    for (track, clip) in project
+        .timeline
+        .tracks
+        .iter()
+        .enumerate()
+        .flat_map(|(index, track)| track.clips().iter().map(move |clip| (index, *clip)))
+    {
+        if let Some(link) = clip.link {
+            if !project.next_ids.has_issued_link(link) {
+                return Err(ValidationError::UnissuedLink {
+                    clip: clip.id,
+                    link,
+                    next: project.next_ids.link,
+                });
+            }
+            groups.entry(link).or_default().push((track, clip));
+        }
+    }
+    for (link, members) in groups {
+        let [(first_track, first), rest @ ..] = members.as_slice() else {
+            continue;
+        };
+        if rest.is_empty() {
+            return Err(ValidationError::LoneLink(link));
+        }
+        let mut tracks = HashSet::from([*first_track]);
+        for (track, member) in rest {
+            if !tracks.insert(*track) {
+                return Err(ValidationError::LinkedOnOneTrack {
+                    link,
+                    track: *track,
+                });
+            }
+            let in_step = member.asset == first.asset
+                && member.start == first.start
+                && member.source == first.source;
+            if !in_step {
+                return Err(ValidationError::LinkOutOfStep(link));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl TryFrom<SequenceSettings> for model::SequenceSettings {
@@ -583,6 +635,7 @@ impl Clip {
                 Time::from_flicks(self.source_duration_flicks),
             ),
             start: Time::from_flicks(self.start_flicks),
+            link: self.link.map(LinkId),
         };
         let asset = project
             .asset(clip.asset)
@@ -631,6 +684,7 @@ mod tests {
             "start_flicks": start * SECOND,
             "source_start_flicks": source_start * SECOND,
             "source_duration_flicks": duration * SECOND,
+            "link": null,
         })
     }
 
@@ -658,6 +712,7 @@ mod tests {
             "next_asset_id": 8,
             "next_clip_id": 3,
             "next_marker_id": 5,
+            "next_link_id": 2,
             "markers": [
                 { "id": 4, "time_flicks": 6 * SECOND, "name": "later" },
                 { "id": 1, "time_flicks": 2 * SECOND, "name": "earlier" },
@@ -724,7 +779,8 @@ mod tests {
             NextIds {
                 asset: AssetId(8),
                 clip: ClipId(3),
-                marker: MarkerId(5)
+                marker: MarkerId(5),
+                link: LinkId(2),
             }
         );
         let ids: Vec<Vec<ClipId>> = project
@@ -907,6 +963,42 @@ mod tests {
         assert_eq!(
             refused(|document| document["tracks"][0]["clips"][1]["id"] = json!(0)),
             ValidationError::DuplicateClip(ClipId(0))
+        );
+    }
+
+    #[test]
+    fn linked_clips_must_be_issued_paired_on_separate_tracks_and_in_step() {
+        let link = |track: usize, clip: usize, link: u64| {
+            move |document: &mut Value| {
+                document["tracks"][track]["clips"][clip]["link"] = json!(link);
+            }
+        };
+
+        assert_eq!(
+            refused(link(0, 0, 2)),
+            ValidationError::UnissuedLink {
+                clip: ClipId(0),
+                link: LinkId(2),
+                next: LinkId(2)
+            }
+        );
+        assert_eq!(refused(link(0, 0, 1)), ValidationError::LoneLink(LinkId(1)));
+        assert_eq!(
+            refused(|document| {
+                link(0, 0, 1)(document);
+                link(0, 1, 1)(document);
+            }),
+            ValidationError::LinkedOnOneTrack {
+                link: LinkId(1),
+                track: 0
+            }
+        );
+        assert_eq!(
+            refused(|document| {
+                link(0, 0, 0)(document);
+                link(1, 0, 0)(document);
+            }),
+            ValidationError::LinkOutOfStep(LinkId(0))
         );
     }
 

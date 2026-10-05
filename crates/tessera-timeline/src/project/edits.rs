@@ -1,6 +1,9 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
-use super::{Clip, ClipEdge, ClipId, EditError, Project, TimeRange};
+use super::{Clip, ClipEdge, ClipId, EditError, LinkId, Project, TimeRange};
 use crate::time::Time;
 
 impl Project {
@@ -20,7 +23,7 @@ impl Project {
             .collect()
     }
 
-    fn atomically<T>(
+    pub(super) fn atomically<T>(
         &mut self,
         edit: impl FnOnce(&mut Self) -> Result<T, EditError>,
     ) -> Result<T, EditError> {
@@ -32,6 +35,10 @@ impl Project {
             self.next_ids = next_ids;
         }
         edited
+    }
+
+    fn link_of(&self, id: ClipId) -> Option<LinkId> {
+        self.find_clip(id).and_then(|(_, clip)| clip.link)
     }
 
     fn set_clip(&mut self, track: usize, clip: Clip) {
@@ -68,7 +75,7 @@ impl Project {
     }
 
     pub fn delete_clips(&mut self, ids: &[ClipId]) -> Result<Vec<Clip>, EditError> {
-        let ids = self.known_clips(ids)?;
+        let ids = self.known_clips(&self.with_partners(ids))?;
         let mut deleted = Vec::new();
         for track in &mut self.timeline.tracks {
             let (gone, kept) = Arc::unwrap_or_clone(std::mem::take(&mut track.clips))
@@ -81,7 +88,7 @@ impl Project {
     }
 
     pub fn ripple_delete_clips(&mut self, ids: &[ClipId]) -> Result<Vec<Clip>, EditError> {
-        let ids = self.known_clips(ids)?;
+        let ids = self.known_clips(&self.with_partners(ids))?;
         let mut deleted = Vec::new();
         for track in &mut self.timeline.tracks {
             let mut pulled = Time::ZERO;
@@ -104,10 +111,37 @@ impl Project {
 
     pub fn paste_clips(&mut self, pastes: &[(Clip, usize, Time)]) -> Result<Vec<Clip>, EditError> {
         self.atomically(|project| {
-            pastes
-                .iter()
-                .map(|(clip, track, start)| project.paste_clip(clip, *track, *start))
-                .collect()
+            let mut copies_of: BTreeMap<LinkId, usize> = BTreeMap::new();
+            for link in pastes.iter().filter_map(|(clip, ..)| clip.link) {
+                *copies_of.entry(link).or_default() += 1;
+            }
+            let mut relinked: BTreeMap<LinkId, LinkId> = BTreeMap::new();
+            let mut pasted = Vec::new();
+            for (clip, track, start) in pastes {
+                let link = clip
+                    .link
+                    .filter(|link| copies_of.get(link).is_some_and(|&copies| copies > 1))
+                    .map(|link| {
+                        *relinked
+                            .entry(link)
+                            .or_insert_with(|| project.next_ids.take_link())
+                    });
+                let copy = Clip {
+                    link,
+                    ..project.paste_clip(clip, *track, *start)?
+                };
+                project.set_clip(*track, copy);
+                pasted.push(copy);
+            }
+            project.settle_links();
+            Ok(pasted
+                .into_iter()
+                .map(|clip| {
+                    project
+                        .find_clip(clip.id)
+                        .map_or(clip, |(_, settled)| *settled)
+                })
+                .collect())
         })
     }
 
@@ -120,9 +154,22 @@ impl Project {
         if let Some(&(id, ..)) = moves.iter().find(|(id, ..)| !named.insert(*id)) {
             return Err(EditError::RepeatedClip(id));
         }
+        let mut moves = moves.to_vec();
+        for &(id, _, start) in moves.clone().iter() {
+            let Some((_, clip)) = self.find_clip(id) else {
+                continue;
+            };
+            let delta = start.max(Time::ZERO) - clip.start;
+            for (track, partner) in self.partners(id) {
+                if !named.contains(&partner.id) {
+                    named.insert(partner.id);
+                    moves.push((partner.id, track, partner.start + delta));
+                }
+            }
+        }
         self.atomically(|project| {
             let mut planned = Vec::new();
-            for &(id, track, start) in moves {
+            for &(id, track, start) in &moves {
                 let (_, clip) = project.located_clip(id)?;
                 let asset = project
                     .asset(clip.asset)
@@ -204,6 +251,7 @@ impl Project {
             }
             project.shift_clips_from(track, placed.start, placed.source.duration, placed.id)?;
             project.timeline.tracks[track].insert(placed)?;
+            project.settle_links();
             Ok(placed)
         })
     }
@@ -217,6 +265,7 @@ impl Project {
             };
             project.clear_range(track, placed.timeline_range())?;
             project.timeline.tracks[track].insert(placed)?;
+            project.settle_links();
             Ok(placed)
         })
     }
@@ -288,6 +337,7 @@ impl Project {
         self.atomically(|project| {
             project.shift_clips_from(track, clip.timeline_range().end(), delta, id)?;
             project.set_clip(track, trimmed);
+            project.settle_links();
             Ok(trimmed)
         })
     }
@@ -323,7 +373,17 @@ impl Project {
         };
         self.set_clip(left_track, rolled_left);
         self.set_clip(right_track, rolled_right);
-        Ok((rolled_left, rolled_right))
+        self.settle_links();
+        Ok((
+            Clip {
+                link: self.link_of(left),
+                ..rolled_left
+            },
+            Clip {
+                link: self.link_of(right),
+                ..rolled_right
+            },
+        ))
     }
 
     pub fn slip_clip(&mut self, id: ClipId, by: Time) -> Result<Clip, EditError> {
@@ -339,7 +399,11 @@ impl Project {
             ..clip
         };
         self.set_clip(track, slipped);
-        Ok(slipped)
+        self.settle_links();
+        Ok(Clip {
+            link: self.link_of(id),
+            ..slipped
+        })
     }
 
     pub fn slide_clip(&mut self, id: ClipId, to: Time) -> Result<Vec<Clip>, EditError> {
@@ -395,7 +459,14 @@ impl Project {
         for clip in &changed {
             self.set_clip(track, *clip);
         }
-        Ok(changed)
+        self.settle_links();
+        Ok(changed
+            .into_iter()
+            .map(|clip| Clip {
+                link: self.link_of(clip.id),
+                ..clip
+            })
+            .collect())
     }
 }
 
@@ -449,6 +520,7 @@ mod tests {
             asset,
             start: seconds(start),
             source: TimeRange::new(seconds(source_start), seconds(duration)),
+            link: None,
         };
         project.timeline.tracks[0].insert(clip).unwrap();
         id
@@ -598,6 +670,7 @@ mod tests {
                 asset,
                 start: Time::MAX - seconds(5),
                 source: TimeRange::new(Time::ZERO, seconds(4)),
+                link: None,
             })
             .unwrap();
 
@@ -634,6 +707,7 @@ mod tests {
             asset,
             start: Time::ZERO,
             source: TimeRange::new(seconds(2), seconds(3)),
+            link: None,
         };
 
         project.overwrite_clip(&copy, 0, seconds(3)).unwrap();
