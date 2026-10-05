@@ -2,12 +2,8 @@
 
 - Link the video and audio clips placed from one asset, so one drop places both and move, trim,
   split, delete and ripple delete keep them in sync (`ripple_delete_clip` shifts only its own track)
-- Give still images and other assets without a duration a default clip length, instead of
-  `clip_for` refusing them with `NoDuration`
 - Carry rotation, sample aspect ratio, pixel format, stream disposition and per-stream start time in
   `MediaInfo`, and let a clip choose which of several audio streams it plays
-- Share unchanged assets and tracks between undo snapshots instead of deep-cloning the whole project
-  up to `HISTORY_DEPTH` times, and skip the clone and compare for edits that fail
 
 ## Project files
 

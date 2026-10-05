@@ -479,7 +479,7 @@ mod tests {
     fn a_media_path_that_is_not_unicode_cannot_be_saved() {
         let mut project = golden_project();
         let path = PathBuf::from(OsStr::from_bytes(b"/media/\xff.mkv"));
-        project.assets[0].path = path.clone();
+        std::sync::Arc::make_mut(&mut project.assets)[0].path = path.clone();
         assert!(matches!(
             to_string(&project),
             Err(FormatError::NonUnicodePath(refused)) if refused == path

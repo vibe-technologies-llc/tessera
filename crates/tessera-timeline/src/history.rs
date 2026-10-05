@@ -454,7 +454,7 @@ mod tests {
 
         history.undo(&mut project);
 
-        assert_eq!(project.assets, removed);
+        assert_eq!(*project.assets, removed);
 
         let refused = history.apply(Command::RemoveAsset, &mut project, |project| {
             project.place_clip(removed[0].id, 0, Time::ZERO)?;
@@ -462,7 +462,7 @@ mod tests {
         });
 
         assert_eq!(refused, Err(EditError::AssetInUse(removed[0].id)));
-        assert_eq!(project.assets, removed);
+        assert_eq!(*project.assets, removed);
         assert!(project.timeline.tracks[0].clips().is_empty());
     }
 
@@ -498,5 +498,33 @@ mod tests {
         history.redo(&mut project);
 
         assert_eq!(project.settings, changed);
+    }
+
+    #[test]
+    fn snapshots_share_the_assets_and_tracks_an_edit_leaves_alone() {
+        let mut history = History::default();
+        let mut project = clip_project();
+        let asset = project.assets[0].id;
+        let upper = project.timeline.add_track(TrackKind::Video);
+        let lower_clip = project.place_clip(asset, 0, Time::ZERO).unwrap().id;
+        project.place_clip(asset, upper, Time::ZERO).unwrap();
+
+        history
+            .apply(Command::MoveClip, &mut project, |project| {
+                project.move_clip(lower_clip, 0, Time::from_seconds(10))
+            })
+            .unwrap();
+
+        let snapshot = &history.undo.back().unwrap().project;
+        assert!(std::sync::Arc::ptr_eq(&snapshot.assets, &project.assets));
+        assert_eq!(
+            snapshot.timeline.tracks[upper].clips().as_ptr(),
+            project.timeline.tracks[upper].clips().as_ptr()
+        );
+        assert_ne!(
+            snapshot.timeline.tracks[0].clips().as_ptr(),
+            project.timeline.tracks[0].clips().as_ptr()
+        );
+        assert_eq!(snapshot.timeline.tracks[0].clips()[0].start, Time::ZERO);
     }
 }

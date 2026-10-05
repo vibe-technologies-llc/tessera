@@ -139,7 +139,7 @@ impl Project {
     pub fn decode(self, directory: Option<&Path>) -> Result<model::Project, ValidationError> {
         let mut project = model::Project::try_from(self)?;
         if let Some(directory) = directory {
-            for asset in &mut project.assets {
+            for asset in std::sync::Arc::make_mut(&mut project.assets) {
                 if asset.path.is_relative() {
                     asset.path = directory.join(&asset.path);
                 }
@@ -315,7 +315,7 @@ impl TryFrom<Project> for model::Project {
         let mut rebuilt = Self {
             name: project.name,
             settings: project.settings.try_into()?,
-            assets: Vec::with_capacity(project.assets.len()),
+            assets: Default::default(),
             timeline: Timeline::default(),
             markers: Vec::with_capacity(project.markers.len()),
             in_point: project.in_point_flicks.map(Time::from_flicks),
@@ -337,7 +337,7 @@ impl TryFrom<Project> for model::Project {
                     next: rebuilt.next_ids.asset,
                 });
             }
-            rebuilt.assets.push(asset);
+            std::sync::Arc::make_mut(&mut rebuilt.assets).push(asset);
         }
         let mut clip_ids = HashSet::new();
         for track in project.tracks {

@@ -677,7 +677,9 @@ impl TimelinePanel {
         let mode = DropMode::of(event.event.modifiers);
         self.hover_lane(track, event, cx, |panel, offset, cx| {
             let project = panel.project.read(cx);
-            let duration = project.asset(asset).and_then(|asset| asset.info.duration);
+            let duration = project
+                .asset(asset)
+                .and_then(|asset| asset.default_clip_duration());
             let (start, snap) = panel.snapped_start(panel.frame_at(offset, cx), duration, &[], cx);
             asset_drop_preview(project, asset, track, start, snap, mode)
         });

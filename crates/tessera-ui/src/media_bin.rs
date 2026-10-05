@@ -207,7 +207,7 @@ impl MediaBin {
             .filter(gone)
             .collect();
         let mut wanted = Vec::new();
-        for asset in &project.assets {
+        for asset in project.assets.iter() {
             let has_video = asset.info.video().next().is_some();
             let thumbnail_stale =
                 has_video && self.thumbnail_requested.get(&asset.id) != Some(&asset.path);

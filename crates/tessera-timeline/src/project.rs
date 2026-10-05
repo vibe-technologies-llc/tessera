@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
 
@@ -21,6 +21,19 @@ pub struct Asset {
 }
 
 impl Asset {
+    pub const STILL_DURATION: Time = Time::from_seconds(5);
+
+    pub fn is_still(&self) -> bool {
+        self.info.duration.is_none() && self.info.video().next().is_some()
+    }
+
+    pub fn default_clip_duration(&self) -> Option<Time> {
+        self.info
+            .duration
+            .filter(|duration| *duration > Time::ZERO)
+            .or_else(|| self.is_still().then_some(Self::STILL_DURATION))
+    }
+
     pub fn has_stream(&self, kind: TrackKind) -> bool {
         match kind {
             TrackKind::Video => self.info.video().next().is_some(),
@@ -250,7 +263,7 @@ pub struct Track {
     pub muted: bool,
     pub solo: bool,
     pub height: TrackHeight,
-    clips: Vec<Clip>,
+    clips: Arc<Vec<Clip>>,
 }
 
 impl Track {
@@ -262,12 +275,16 @@ impl Track {
             muted: false,
             solo: false,
             height: TrackHeight::default(),
-            clips: Vec::new(),
+            clips: Arc::default(),
         }
     }
 
     pub fn clips(&self) -> &[Clip] {
         &self.clips
+    }
+
+    fn clips_mut(&mut self) -> &mut Vec<Clip> {
+        Arc::make_mut(&mut self.clips)
     }
 
     pub fn check_insert(&self, clip: &Clip) -> Result<(), InsertError> {
@@ -291,7 +308,7 @@ impl Track {
     pub fn insert(&mut self, clip: Clip) -> Result<(), InsertError> {
         self.check_insert(&clip)?;
         let index = self.clips.partition_point(|other| other.start < clip.start);
-        self.clips.insert(index, clip);
+        self.clips_mut().insert(index, clip);
         Ok(())
     }
 
@@ -309,7 +326,7 @@ impl Track {
 
     fn remove(&mut self, id: ClipId) -> Option<Clip> {
         let index = self.clips.iter().position(|clip| clip.id == id)?;
-        Some(self.clips.remove(index))
+        Some(self.clips_mut().remove(index))
     }
 
     fn end_before(&self, time: Time) -> Time {
@@ -462,7 +479,7 @@ pub struct Marker {
 pub struct Project {
     pub name: String,
     pub settings: SequenceSettings,
-    pub assets: Vec<Asset>,
+    pub assets: Arc<Vec<Asset>>,
     pub timeline: Timeline,
     pub markers: Vec<Marker>,
     pub in_point: Option<Time>,
@@ -475,7 +492,7 @@ impl Project {
         Self {
             name: name.into(),
             settings: SequenceSettings::default(),
-            assets: Vec::new(),
+            assets: Arc::default(),
             timeline: Timeline {
                 tracks: vec![Track::new(TrackKind::Video), Track::new(TrackKind::Audio)],
             },
@@ -496,7 +513,7 @@ impl Project {
 
     pub fn add_asset(&mut self, path: PathBuf, info: MediaInfo) -> AssetId {
         let id = self.next_ids.take_asset();
-        self.assets.push(Asset { id, path, info });
+        Arc::make_mut(&mut self.assets).push(Asset { id, path, info });
         id
     }
 
@@ -509,7 +526,7 @@ impl Project {
         if self.is_asset_used(id) {
             return Err(EditError::AssetInUse(id));
         }
-        Ok(self.assets.remove(index))
+        Ok(Arc::make_mut(&mut self.assets).remove(index))
     }
 
     pub fn relink_asset(
@@ -533,8 +550,7 @@ impl Project {
                 }
             }
         }
-        let slot = self
-            .assets
+        let slot = Arc::make_mut(&mut self.assets)
             .iter_mut()
             .find(|asset| asset.id == id)
             .ok_or(EditError::UnknownAsset(id))?;
@@ -543,10 +559,10 @@ impl Project {
     }
 
     pub fn prune_assets(&mut self) -> Vec<Asset> {
-        let (used, unused) = std::mem::take(&mut self.assets)
+        let (used, unused) = Arc::unwrap_or_clone(std::mem::take(&mut self.assets))
             .into_iter()
             .partition(|asset| self.is_asset_used(asset.id));
-        self.assets = used;
+        self.assets = Arc::new(used);
         unused
     }
 
@@ -593,11 +609,7 @@ impl Project {
     fn whole_clip(&self, asset: AssetId, track: usize, start: Time) -> Result<Clip, EditError> {
         let asset = self.asset(asset).ok_or(EditError::UnknownAsset(asset))?;
         self.track_accepting(asset, track)?;
-        let duration = asset
-            .info
-            .duration
-            .filter(|duration| *duration > Time::ZERO)
-            .ok_or(EditError::NoDuration)?;
+        let duration = asset.default_clip_duration().ok_or(EditError::NoDuration)?;
         Ok(Clip {
             id: self.next_ids.clip,
             asset: asset.id,
@@ -701,12 +713,13 @@ impl Project {
                 })
             }
             ClipEdge::End => {
-                let media_end = self
-                    .asset(clip.asset)
-                    .and_then(|asset| asset.info.duration)
-                    .map_or(range.end(), |duration| {
+                let media_end = match self.asset(clip.asset) {
+                    Some(asset) if asset.is_still() => Time::MAX,
+                    Some(asset) => asset.info.duration.map_or(range.end(), |duration| {
                         clip.start + (duration - clip.source.start)
-                    });
+                    }),
+                    None => range.end(),
+                };
                 let earliest = (clip.start + shortest).min(range.end());
                 let latest = track
                     .start_after(clip.start)
@@ -767,7 +780,7 @@ impl Project {
         let first_later = track
             .clips
             .partition_point(|clip| clip.start < deleted.timeline_range().end());
-        for later in &mut track.clips[first_later..] {
+        for later in &mut track.clips_mut()[first_later..] {
             later.start = later.start - deleted.source.duration;
         }
         Ok(deleted)
@@ -1033,10 +1046,10 @@ mod tests {
         let mut project = Project::new("test");
         let asset = project.add_asset("a.mkv".into(), video_info(3));
         let untimed = project.add_asset(
-            "b.mkv".into(),
+            "b.opus".into(),
             MediaInfo {
                 duration: None,
-                ..video_info(0)
+                ..audio_info(0)
             },
         );
         assert_eq!(
@@ -1048,9 +1061,43 @@ mod tests {
             Err(EditError::UnknownTrack(7))
         );
         assert_eq!(
-            project.place_clip(untimed, 0, Time::ZERO),
+            project.place_clip(untimed, 1, Time::ZERO),
             Err(EditError::NoDuration)
         );
+    }
+
+    #[test]
+    fn a_still_gets_a_default_length_that_can_be_stretched() {
+        let mut project = Project::new("test");
+        let still = project.add_asset(
+            "poster.png".into(),
+            MediaInfo {
+                duration: None,
+                ..video_info(0)
+            },
+        );
+        let after = project.add_asset("a.mkv".into(), video_info(3));
+
+        let placed = project.place_clip(still, 0, Time::ZERO).unwrap();
+
+        assert_eq!(placed.source.duration, Asset::STILL_DURATION);
+        assert!(project.asset(still).unwrap().is_still());
+        assert!(!project.asset(after).unwrap().is_still());
+
+        project
+            .place_clip(after, 0, Time::from_seconds(60))
+            .unwrap();
+        let stretched = project
+            .trim_clip(placed.id, ClipEdge::End, Time::from_seconds(40))
+            .unwrap();
+
+        assert_eq!(stretched.timeline_range().end(), Time::from_seconds(40));
+
+        let capped = project
+            .trim_clip(placed.id, ClipEdge::End, Time::from_seconds(90))
+            .unwrap();
+
+        assert_eq!(capped.timeline_range().end(), Time::from_seconds(60));
     }
 
     #[test]

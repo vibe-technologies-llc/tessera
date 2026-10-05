@@ -1,15 +1,17 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use super::{Clip, ClipEdge, ClipId, EditError, Project, TimeRange};
 use crate::time::Time;
 
 impl Project {
     fn source_limit(&self, clip: &Clip) -> Time {
-        self.asset(clip.asset)
-            .and_then(|asset| asset.info.duration)
-            .map_or(clip.source.end(), |duration| {
+        match self.asset(clip.asset) {
+            Some(asset) if asset.is_still() => Time::MAX,
+            Some(asset) => asset.info.duration.map_or(clip.source.end(), |duration| {
                 duration.max(clip.source.end())
-            })
+            }),
+            None => clip.source.end(),
+        }
     }
 
     fn known_clips(&self, ids: &[ClipId]) -> Result<BTreeSet<ClipId>, EditError> {
@@ -34,7 +36,7 @@ impl Project {
 
     fn set_clip(&mut self, track: usize, clip: Clip) {
         let slot = self.timeline.tracks[track]
-            .clips
+            .clips_mut()
             .iter_mut()
             .find(|other| other.id == clip.id);
         if let Some(slot) = slot {
@@ -49,7 +51,7 @@ impl Project {
         delta: Time,
         except: ClipId,
     ) -> Result<(), EditError> {
-        for later in &mut self.timeline.tracks[track].clips {
+        for later in self.timeline.tracks[track].clips_mut() {
             if later.start >= from && later.id != except {
                 let shifted = Clip {
                     start: later
@@ -69,10 +71,10 @@ impl Project {
         let ids = self.known_clips(ids)?;
         let mut deleted = Vec::new();
         for track in &mut self.timeline.tracks {
-            let (gone, kept) = std::mem::take(&mut track.clips)
+            let (gone, kept) = Arc::unwrap_or_clone(std::mem::take(&mut track.clips))
                 .into_iter()
                 .partition(|clip| ids.contains(&clip.id));
-            track.clips = kept;
+            track.clips = Arc::new(kept);
             deleted.extend(gone);
         }
         Ok(deleted)
@@ -84,7 +86,7 @@ impl Project {
         for track in &mut self.timeline.tracks {
             let mut pulled = Time::ZERO;
             let mut kept = Vec::new();
-            for clip in std::mem::take(&mut track.clips) {
+            for clip in Arc::unwrap_or_clone(std::mem::take(&mut track.clips)) {
                 if ids.contains(&clip.id) {
                     pulled = pulled + clip.source.duration;
                     deleted.push(clip);
@@ -95,7 +97,7 @@ impl Project {
                     });
                 }
             }
-            track.clips = kept;
+            track.clips = Arc::new(kept);
         }
         Ok(deleted)
     }

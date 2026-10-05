@@ -82,7 +82,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   empty track that isn't the last of its kind, and `swap_tracks` only swaps tracks of the same kind.
   Later video tracks sit on top of earlier ones, so `Timeline::video_clips_at` lists the video clips
   under a time from the bottom track up, the order they composite in, and `top_video_clip_at` is its
-  last. `History` is the undo stack: `History::apply` runs one edit as a `Command`, keeps a snapshot
+  last. `Project::assets` and each `Track`'s clips are
+  `Arc`s that are copied on write, so the snapshots `History` keeps share whatever an edit leaves
+  alone, and comparing a snapshot with the project is a pointer check for those parts. An asset
+  with a video stream and no duration is a still (`Asset::is_still`): `clip_for` gives it
+  `Asset::STILL_DURATION`, and its clips can be trimmed out to any length the neighbours allow. An
+  asset with no duration and no video still refuses with `NoDuration`. `History` is the undo stack: `History::apply` runs one edit as a `Command`, keeps a snapshot
   of the project from before it when the edit succeeds and changes something, and rolls the project
   back when the edit fails. `undo` and `redo` swap those snapshots in, carrying the newer `NextIds`
   over so an undone clip or asset never gives its id out again. The stack keeps the last
