@@ -57,6 +57,7 @@ actions!(
         DeleteClip,
         RippleDeleteClip,
         ToggleSnapping,
+        ToggleSafeAreas,
         Undo,
         Redo
     ]
@@ -101,6 +102,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-delete", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("shift-backspace", RippleDeleteClip, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("n", ToggleSnapping, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("'", ToggleSafeAreas, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("ctrl-z", Undo, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("ctrl-shift-z", Redo, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("ctrl-y", Redo, Some(WORKSPACE_CONTEXT)),

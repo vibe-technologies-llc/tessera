@@ -13,7 +13,8 @@ use crate::{
     NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, PasteClips, Pause, PlayPause,
     PreviousEdit, PreviousMarker, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll,
     SetInPoint, SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward,
-    StepForward, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    StepForward, ToggleSafeAreas, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
+    ZoomToFit,
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
@@ -481,6 +482,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &RippleDeleteClip, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::ripple_delete_selection);
+            }))
+            .on_action(cx.listener(|workspace, _: &ToggleSafeAreas, _, cx| {
+                workspace.viewer.update(cx, Viewer::toggle_safe_areas);
             }))
             .on_action(cx.listener(|workspace, _: &ToggleSnapping, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::toggle_snapping);
@@ -1207,5 +1211,25 @@ mod tests {
         cx.simulate_mouse_up(at(30.), MouseButton::Left, none);
 
         assert_eq!(starts(&workspace, cx), seconds_of(&[1, 10]));
+    }
+
+    #[gpui::test]
+    fn the_apostrophe_key_toggles_the_viewer_safe_areas(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let shown = |cx: &mut VisualTestContext| {
+            cx.read(|cx| workspace.read(cx).viewer.read(cx).safe_areas())
+        };
+
+        assert!(!shown(cx));
+
+        cx.simulate_keystrokes("'");
+
+        assert!(shown(cx));
+
+        cx.simulate_keystrokes("'");
+
+        assert!(!shown(cx));
     }
 }

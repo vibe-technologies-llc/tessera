@@ -43,7 +43,7 @@
 - Read the composited frame back without waiting on the GPU in the same job
 - Keep cache hits out of the render latency average
 - Release replaced frames from the atlas when they are replaced, not on the next paint
-- Zoom, a 100 % view and safe-area overlays
+- Zoom and a 100 % view
 
 ## Timeline editing
 

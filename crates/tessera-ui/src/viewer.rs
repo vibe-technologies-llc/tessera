@@ -10,7 +10,7 @@ use std::{
 
 use gpui::{
     AnyElement, AppContext, Context, Entity, IntoElement, ObjectFit, ParentElement, Pixels, Render,
-    RenderImage, SharedString, Size, Styled, StyledImage, Window, canvas, div, img,
+    RenderImage, SharedString, Size, Styled, StyledImage, Window, canvas, div, img, relative,
 };
 use tessera_media::{VideoDecoder, VideoFrame};
 use tessera_render::{Compositor, Frame, Layer};
@@ -34,6 +34,7 @@ type FailedMedia = HashMap<DecoderKey, SharedString>;
 
 const LATENCY_SMOOTHING: u32 = 4;
 const SIZE_STEPS: f32 = 8.;
+const SAFE_AREAS: [f32; 2] = [0.9, 0.8];
 const COMPOSITOR_STRIKES: u32 = 3;
 const RENDERER_PANICKED: &str = "The renderer stopped unexpectedly";
 const NO_VIDEO: &str = "No video clip is under the playhead";
@@ -177,6 +178,7 @@ pub struct Viewer {
     idle_renderer: Option<Renderer>,
     latency: Duration,
     view: Option<(f32, f32)>,
+    safe_areas: bool,
     bounds: (u32, u32),
     wanted: Target,
     pending: Option<Rendered>,
@@ -208,6 +210,7 @@ impl Viewer {
             idle_renderer: Some(Renderer::new()),
             latency: Duration::ZERO,
             view: None,
+            safe_areas: false,
             bounds,
             wanted: Target::default(),
             pending: None,
@@ -217,6 +220,16 @@ impl Viewer {
         };
         viewer.refresh(cx);
         viewer
+    }
+
+    pub fn toggle_safe_areas(&mut self, cx: &mut Context<Self>) {
+        self.safe_areas = !self.safe_areas;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn safe_areas(&self) -> bool {
+        self.safe_areas
     }
 
     fn set_view(&mut self, size: Size<Pixels>, scale: f32, cx: &mut Context<Self>) {
@@ -412,6 +425,12 @@ impl Render for Viewer {
             .bg(theme::frame())
             .text_color(theme::text_muted())
             .child(self.picture(placeholder))
+            .children(
+                self.safe_areas
+                    .then(|| SAFE_AREAS.map(safe_area))
+                    .into_iter()
+                    .flatten(),
+            )
             .child(
                 canvas(
                     move |bounds, window, cx| {
@@ -449,6 +468,18 @@ impl Render for Viewer {
                     .children(speed.map(|speed| div().text_color(theme::playhead()).child(speed))),
             )
     }
+}
+
+fn safe_area(share: f32) -> gpui::Div {
+    let margin = (1. - share) / 2.;
+    div()
+        .absolute()
+        .left(relative(margin))
+        .top(relative(margin))
+        .w(relative(share))
+        .h(relative(share))
+        .border_1()
+        .border_color(theme::safe_area())
 }
 
 fn sequence_bounds(project: &Project) -> (u32, u32) {

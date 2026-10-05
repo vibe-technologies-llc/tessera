@@ -300,7 +300,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   if that fails it warns once and shows the top layer's decoded frame alone from then on, and
   after a compositing error it shows that frame, recreates the compositor and gives up after three
   errors in a row. A panic in a job is caught: the viewer shows a failure and starts a new
-  renderer. A gap in the timeline shows black (`Picture::Black`), and a clip that is deleted or
+  renderer. The apostrophe key toggles safe-area outlines at 90 % and 80 % of the frame. A gap in the timeline shows black (`Picture::Black`), and a clip that is deleted or
   moved off its track blacks the picture at once. A finished render is shown only while the
   playhead is still at it (when paused it must also still match the wanted frame). One job runs at a time, so while scrubbing only the newest request runs next, and the viewer
   releases each replaced frame from the GPUI atlas with `Window::drop_image`. While playing, it

@@ -75,3 +75,7 @@ pub fn in_out_range() -> Rgba {
 pub fn black() -> Rgba {
     rgb(0x000000)
 }
+
+pub fn safe_area() -> Rgba {
+    rgba(0xffffff88)
+}
