@@ -213,9 +213,15 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   around the pointer, and `=`, `-` and Shift+Z zoom in or out around the playhead or fit the
   timeline. The ruler steps down to single frames at deep zoom. Outside a scrub, the view pages
   to the playhead whenever it leaves the visible range.
-  `MediaBin` owns importing (dialog and drops) and probes each file and decodes its thumbnail on a
-  background task, reporting failures in the bin itself. Thumbnails are UI state kept in the bin by
-  `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
+  `MediaBin` owns importing (dialog and drops). Probes, folder scans and thumbnail decodes are jobs
+  on one queue, at most `MAX_RUNNING_JOBS` running on background tasks at once; replacing the project
+  clears the queue and bumps a generation so that jobs still running are ignored. A probed asset
+  joins the project at once, and the bin then queues its thumbnail (decoded in software at
+  thumbnail size) for every video asset that has none, so a thumbnail also returns after an undo
+  brings the asset back and is released from the atlas when the asset goes. A dropped folder is
+  scanned for files with a media extension. A path that is not valid UTF-8 is refused, since a
+  project could not save it. Failures show as one dismissible row. Thumbnails are UI state kept in
+  the bin by `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
   previews the drop as a ghost (red where it would overlap) through `on_drag_move`, and the drop
   places the clip at the previewed, frame-snapped start. Clips on the timeline work the same way.
   Pressing a lane selects the clip under the pointer, or clears the selection, and records where

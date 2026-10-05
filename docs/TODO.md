@@ -11,7 +11,6 @@
 
 ## Project files
 
-- Refuse non-UTF-8 media paths at import or store them losslessly; such a project can never be saved
 - Confirm the overwrite when `.tessera` is appended to a name the save dialog approved without it
 - Save As and recent projects
 - Relink media that has moved or gone missing, and mark missing media in the bin
@@ -31,7 +30,6 @@
   a terminal IO error from the packet iterator as a clean end of file
 - Skip attached-picture streams (cover art) and undecodable streams when probing instead of listing
   them as video or failing the import, and decode the probed stream index rather than `best()`
-- Decode thumbnails in software at thumbnail size rather than through a hardware decoder at full size
 - Stop seeking again on every request for a time before the stream's first frame
 - Keep a decoded run of frames for backward stepping and reverse shuttle, and budget frame caches
   across decoders instead of 256 MiB each
@@ -99,16 +97,10 @@
 
 ## Media bin and workspace
 
+- Filter unsupported files in the import dialog and for files dropped one by one
 - A sequence settings dialog and a New Project action; every project starts as a hardcoded
   1920×1080, 30 fps "Untitled"
-- Show an asset once it is probed and decode its thumbnail afterwards
-- Bound the number of probes and thumbnail decodes running at once, and cancel them when the project
-  is replaced
-- Expand dropped folders, filter unsupported files in the dialog and on drop, and collapse failures
-  into one dismissible row
 - Remove assets, sort and search them, show their metadata and mark unused ones
-- Release a thumbnail from the atlas when an import replaces it, and drop thumbnails of assets that
-  undo removed
 - Compare canonical paths when skipping duplicate imports
 - Menus, a shortcut reference and preferences
 
