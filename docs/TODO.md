@@ -17,18 +17,10 @@
 
 ## Media decode
 
-- Offset every stream by one container-wide start time instead of each stream's own `start_time`,
-  which puts sound and picture out of sync on TS files and MP4s with edit lists
 - Apply the display-matrix rotation and the sample aspect ratio, so phone footage isn't sideways and
   anamorphic DV and HDV aren't squashed
-- Seek when the stream index ends before the target, instead of decoding forward through the whole
-  gap in MPEG-TS and MKV without cues
-- Tell decode errors apart from `EAGAIN` in `receive_frame`, reopen in software when a hardware
-  decoder fails to open or mid-stream, and retry a device that failed to create
-- Re-anchor audio on packet timestamps after gaps and jumps, not only after a seek, and stop reading
-  a terminal IO error from the packet iterator as a clean end of file
+- Re-anchor audio on packet timestamps after gaps and jumps, not only after a seek
 - Decode the probed stream index rather than `best()`
-- Stop seeking again on every request for a time before the stream's first frame
 - Keep a decoded run of frames for backward stepping and reverse shuttle, and budget frame caches
   across decoders instead of 256 MiB each
 - Deinterlace interlaced sources, and interpolate chroma fully in the scaler
@@ -81,9 +73,8 @@
 
 - A CI workflow running the format check, clippy and the tests on every push, with the Vulkan tests
   on lavapipe or skipped without an adapter
-- Test fixtures of small generated media files for decode and export tests: B-frames, a non-zero
-  start time, 30000/1001 in a 1/1000 time base, stereo and planar audio, several audio streams,
-  stills and audio-only files
+- Test fixtures of small generated media files for decode and export tests: B-frames, 30000/1001 in
+  a 1/1000 time base, stereo and planar audio, several audio streams, stills and audio-only files
 - Tests for `Mixer::render`, the `Output` lifecycle, `PlaybackClock`, `ProjectEditor` undo and redo,
   the bin's import path and cross-track clip moves
 

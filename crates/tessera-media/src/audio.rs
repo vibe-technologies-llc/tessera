@@ -6,14 +6,17 @@ use std::{
 
 use ffmpeg_next::{
     ChannelLayout, Rescale, codec, decoder,
-    ffi::{AV_NOPTS_VALUE, swr_get_out_samples},
+    ffi::swr_get_out_samples,
     format::{self, sample},
     frame, media, rescale,
     software::resampling,
 };
 use tessera_timeline::{FLICKS_PER_SECOND, Time};
 
-use crate::{Error, decode::TimeBase};
+use crate::{
+    Error,
+    decode::{TimeBase, is_again, read_packet, stream_start},
+};
 
 const OUTPUT_FORMAT: format::Sample = format::Sample::F32(sample::Type::Packed);
 const FORWARD_DECODE_WINDOW: Time = Time::from_seconds(1);
@@ -86,10 +89,7 @@ impl AudioDecoder {
             .ok_or_else(|| Error::NoAudio { path: path.clone() })?;
         let stream_index = stream.index();
         let time_base = TimeBase::of(&stream, &path)?;
-        let start = match stream.start_time() {
-            AV_NOPTS_VALUE => 0,
-            start => start,
-        };
+        let start = stream_start(&input, &stream);
         let decoder = codec::Context::from_parameters(stream.parameters())
             .and_then(|context| {
                 let mut decoder = context.decoder();
@@ -177,10 +177,15 @@ impl AudioDecoder {
     fn decode_more(&mut self) -> Result<bool, Error> {
         let mut frame = frame::Audio::empty();
         loop {
-            if self.decoder.receive_frame(&mut frame).is_ok() {
-                specify_channel_layout(&mut frame);
-                self.resample(&frame)?;
-                return Ok(true);
+            match self.decoder.receive_frame(&mut frame) {
+                Ok(()) => {
+                    specify_channel_layout(&mut frame);
+                    self.resample(&frame)?;
+                    return Ok(true);
+                }
+                Err(ffmpeg_next::Error::Eof) => return self.flush_resampler(),
+                Err(source) if !is_again(&source) => return Err(Error::Decode { source }),
+                Err(_) => {}
             }
             if self.drained {
                 return self.flush_resampler();
@@ -222,20 +227,20 @@ impl AudioDecoder {
     }
 
     fn feed(&mut self) -> Result<(), Error> {
-        for (stream, packet) in self.input.packets() {
-            if stream.index() != self.stream_index {
-                continue;
-            }
-            return match self.decoder.send_packet(&packet) {
+        match read_packet(&mut self.input, self.stream_index) {
+            Ok(Some(packet)) => match self.decoder.send_packet(&packet) {
                 Ok(()) | Err(ffmpeg_next::Error::InvalidData) => Ok(()),
                 Err(source) => Err(Error::Decode { source }),
-            };
+            },
+            Ok(None) => {
+                self.decoder
+                    .send_eof()
+                    .map_err(|source| Error::Decode { source })?;
+                self.drained = true;
+                Ok(())
+            }
+            Err(source) => Err(Error::Decode { source }),
         }
-        self.decoder
-            .send_eof()
-            .map_err(|source| Error::Decode { source })?;
-        self.drained = true;
-        Ok(())
     }
 }
 
@@ -563,5 +568,21 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(error, Error::Open { .. }), "{error}");
+    }
+
+    #[test]
+    fn every_stream_is_offset_by_the_same_container_start() {
+        let fixture = Fixture::generate_starting_late("audio_container_start", 25, 1);
+        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let delay = fixture::audio_frame_start(1, OUTPUT_RATE) as usize;
+
+        let block = decoder.samples(Time::ZERO, delay + 500).unwrap();
+
+        let (silent, audible) = block.samples.split_at(delay * AudioBuffer::CHANNELS);
+        assert_silent(&silent[..(delay - 50) * AudioBuffer::CHANNELS]);
+        assert_level(
+            &audible[50 * AudioBuffer::CHANNELS..],
+            fixture::audio_level(0),
+        );
     }
 }

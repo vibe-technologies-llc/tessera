@@ -1,4 +1,8 @@
-use std::{iter, ptr, sync::Mutex};
+use std::{
+    iter, ptr,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use ffmpeg_next::{
     Codec, codec,
@@ -55,11 +59,26 @@ pub fn available_hw_accels() -> Vec<HwAccel> {
     .collect()
 }
 
+const DEVICE_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 struct SharedDevice(*mut AVBufferRef);
 
 unsafe impl Send for SharedDevice {}
 
-static DEVICES: Mutex<Vec<(HwAccel, Option<SharedDevice>)>> = Mutex::new(Vec::new());
+enum Device {
+    Ready(SharedDevice),
+    Failed(Instant),
+}
+
+static DEVICES: Mutex<Vec<(HwAccel, Device)>> = Mutex::new(Vec::new());
+
+fn retry_due(failed_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(failed_at) >= DEVICE_RETRY_AFTER
+}
+
+fn created_device(accel: HwAccel) -> Device {
+    create_device(accel).map_or_else(|| Device::Failed(Instant::now()), Device::Ready)
+}
 
 fn device_reference(accel: HwAccel) -> Option<*mut AVBufferRef> {
     let mut devices = DEVICES
@@ -68,11 +87,18 @@ fn device_reference(accel: HwAccel) -> Option<*mut AVBufferRef> {
     let index = match devices.iter().position(|(known, _)| *known == accel) {
         Some(index) => index,
         None => {
-            devices.push((accel, create_device(accel)));
+            devices.push((accel, created_device(accel)));
             devices.len() - 1
         }
     };
-    let SharedDevice(device) = devices[index].1.as_ref()?;
+    if let Device::Failed(failed_at) = devices[index].1
+        && retry_due(failed_at, Instant::now())
+    {
+        devices[index].1 = created_device(accel);
+    }
+    let Device::Ready(SharedDevice(device)) = &devices[index].1 else {
+        return None;
+    };
     let reference = unsafe { av_buffer_ref(*device) };
     (!reference.is_null()).then_some(reference)
 }
@@ -144,6 +170,16 @@ mod tests {
         let mut unique = accels.clone();
         unique.dedup();
         assert_eq!(accels, unique);
+    }
+
+    #[test]
+    fn a_failed_device_is_retried_only_after_a_while() {
+        let failed_at = Instant::now();
+
+        assert!(!retry_due(failed_at, failed_at));
+        assert!(!retry_due(failed_at, failed_at + DEVICE_RETRY_AFTER / 2));
+        assert!(retry_due(failed_at, failed_at + DEVICE_RETRY_AFTER));
+        assert!(!retry_due(failed_at + DEVICE_RETRY_AFTER, failed_at));
     }
 
     #[test]

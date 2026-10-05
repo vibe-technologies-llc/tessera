@@ -124,7 +124,15 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   context `!Send`, but an `SwsContext` has no thread affinity and each one is owned by a single
   decoder, so `Scaler` implements `Send` by hand. A requested time maps to the nearest stream
   tick (`TimeBase::to_ts`), so a 29.97 fps frame start in a 1/1000 time base finds its own frame
-  and not the one before. Decoders use frame and slice threads on every core; on a short file that
+  and not the one before. Every stream is offset by the container's start time
+  (`stream_start`, falling back to the stream's own), so sound and picture stay aligned when the
+  streams start apart. A request before the stream's first frame is answered from that frame
+  without seeking again, and a forward gap seeks when the stream index ends short of the target
+  (`forward_seek_needed`) instead of decoding through it. Packets are read with `read_packet`, so
+  a terminal IO error is reported as a decode error and not as the end of the file, and a
+  `receive_frame` error other than EAGAIN or end of stream is a decode error too. A hardware
+  decoder that fails to open, or fails mid-stream, is replaced by a software one (`hw_accel`
+  turns `None`), and a hardware device that failed to be created is tried again after 30 s. Decoders use frame and slice threads on every core; on a short file that
   reads the whole stream ahead and drains the decoder, which is why the seek-policy test opens one
   with a single thread. `VideoDecoder::open` decodes in hardware through the first of
   `PREFERRED_HW_ACCELS` (VAAPI, then Vulkan Video) that the codec has a device config for and whose

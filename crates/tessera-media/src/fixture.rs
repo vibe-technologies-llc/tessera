@@ -57,6 +57,8 @@ struct Recipe {
     streams: Streams,
     codec: VideoCodec,
     frame_rate: FrameRate,
+    start_frames: i64,
+    audio_delay_frames: i64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,21 @@ impl Fixture {
                 streams: Streams::VideoAndAudio,
                 codec: VideoCodec::Mpeg4,
                 frame_rate: FRAME_RATE,
+                start_frames: 0,
+                audio_delay_frames: 0,
+            },
+        )
+    }
+
+    pub fn generate_starting_late(name: &str, start_frames: i64, audio_delay_frames: i64) -> Self {
+        Self::generate_with(
+            name,
+            Recipe {
+                streams: Streams::VideoAndAudio,
+                codec: VideoCodec::Mpeg4,
+                frame_rate: FRAME_RATE,
+                start_frames,
+                audio_delay_frames,
             },
         )
     }
@@ -88,6 +105,8 @@ impl Fixture {
                 streams: Streams::VideoOnly,
                 codec: VideoCodec::Mpeg4,
                 frame_rate,
+                start_frames: 0,
+                audio_delay_frames: 0,
             },
         )
     }
@@ -101,6 +120,8 @@ impl Fixture {
                 streams: Streams::VideoOnly,
                 codec: VideoCodec::H264,
                 frame_rate: FRAME_RATE,
+                start_frames: 0,
+                audio_delay_frames: 0,
             },
         ))
     }
@@ -139,7 +160,9 @@ fn encode(path: &Path, recipe: Recipe) -> Result<(), ffmpeg_next::Error> {
     };
     output.write_header()?;
     for index in 0..FRAME_COUNT {
-        video.encoder.send_frame(&picture(index))?;
+        video
+            .encoder
+            .send_frame(&picture(index, recipe.start_frames))?;
         drain(
             &mut video.encoder,
             video.stream,
@@ -147,7 +170,10 @@ fn encode(path: &Path, recipe: Recipe) -> Result<(), ffmpeg_next::Error> {
             &mut output,
         )?;
         if let Some(audio) = &mut audio {
-            audio.encoder.send_frame(&audio_block(index))?;
+            audio.encoder.send_frame(&audio_block(
+                index,
+                recipe.start_frames + recipe.audio_delay_frames,
+            ))?;
             drain(
                 &mut audio.encoder,
                 audio.stream,
@@ -265,16 +291,16 @@ fn audio_layout() -> ChannelLayout {
     ChannelLayout::default(i32::from(AUDIO_CHANNELS))
 }
 
-fn picture(index: i64) -> frame::Video {
+fn picture(index: i64, start_frames: i64) -> frame::Video {
     let mut picture = frame::Video::new(format::Pixel::YUV420P, WIDTH, HEIGHT);
     picture.data_mut(0).fill(luma(index));
     picture.data_mut(1).fill(NEUTRAL_CHROMA);
     picture.data_mut(2).fill(NEUTRAL_CHROMA);
-    picture.set_pts(Some(index));
+    picture.set_pts(Some(start_frames + index));
     picture
 }
 
-fn audio_block(index: i64) -> frame::Audio {
+fn audio_block(index: i64, offset_frames: i64) -> frame::Audio {
     let start = audio_frame_start(index, AUDIO_SAMPLE_RATE);
     let end = audio_frame_start(index + 1, AUDIO_SAMPLE_RATE);
     let samples = usize::try_from(end - start).expect("fixture frames move forward");
@@ -282,6 +308,9 @@ fn audio_block(index: i64) -> frame::Audio {
     block.set_rate(AUDIO_SAMPLE_RATE.get());
     let level = (audio_level(index) * f32::from(i16::MAX)).round() as i16;
     block.plane_mut::<i16>(0).fill(level);
-    block.set_pts(Some(start));
+    block.set_pts(Some(audio_frame_start(
+        index + offset_frames,
+        AUDIO_SAMPLE_RATE,
+    )));
     block
 }

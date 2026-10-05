@@ -6,11 +6,11 @@ use std::{
 };
 
 use ffmpeg_next::{
-    Rational, Rescale, codec, color, decoder,
+    Packet, Rational, Rescale, codec, color, decoder,
     ffi::{
         AV_NOPTS_VALUE, AVColorSpace, AVSEEK_FLAG_BACKWARD, FF_THREAD_FRAME, FF_THREAD_SLICE,
-        SWS_CS_ITU601, SWS_CS_ITU709, avformat_index_get_entry_from_timestamp, sws_getCoefficients,
-        sws_setColorspaceDetails,
+        SWS_CS_ITU601, SWS_CS_ITU709, avformat_index_get_entries_count, avformat_index_get_entry,
+        avformat_index_get_entry_from_timestamp, sws_getCoefficients, sws_setColorspaceDetails,
     },
     format::{self, Pixel},
     frame, media, rescale,
@@ -51,11 +51,13 @@ pub struct VideoDecoder {
     time_base: TimeBase,
     start: i64,
     decoder: decoder::Video,
+    thread_count: c_int,
     hw_accel: Option<HwAccel>,
     converter: Converter,
     current: Option<frame::Video>,
     ahead: Option<frame::Video>,
     drained: bool,
+    seeks: usize,
     cache: FrameCache,
 }
 
@@ -106,26 +108,12 @@ impl VideoDecoder {
             .ok_or_else(|| Error::NoVideo { path: path.clone() })?;
         let stream_index = stream.index();
         let time_base = TimeBase::of(&stream, &path)?;
-        let start = match stream.start_time() {
-            AV_NOPTS_VALUE => 0,
-            start => start,
-        };
-        let stream_error = |source| Error::Stream {
-            index: stream_index,
-            source,
-        };
-        let mut context =
-            codec::Context::from_parameters(stream.parameters()).map_err(stream_error)?;
-        let codec = decoder::find(context.id())
-            .ok_or(ffmpeg_next::Error::DecoderNotFound)
-            .map_err(stream_error)?;
-        let hw_accel = hw::attach_device(&mut context, codec, hw_accels, HELD_FRAMES);
-        set_threads(&mut context, thread_count);
-        let decoder = context
-            .decoder()
-            .open_as(codec)
-            .and_then(|opened| opened.video())
-            .map_err(stream_error)?;
+        let start = stream_start(&input, &stream);
+        let (decoder, hw_accel) =
+            open_decoder(&stream, hw_accels, thread_count).map_err(|source| Error::Stream {
+                index: stream_index,
+                source,
+            })?;
         Ok(Self {
             path,
             input,
@@ -133,6 +121,7 @@ impl VideoDecoder {
             time_base,
             start,
             decoder,
+            thread_count,
             hw_accel,
             converter: Converter {
                 bounds: None,
@@ -141,6 +130,7 @@ impl VideoDecoder {
             current: None,
             ahead: None,
             drained: false,
+            seeks: 0,
             cache: FrameCache::new(DEFAULT_CACHE_BYTES),
         })
     }
@@ -171,7 +161,7 @@ impl VideoDecoder {
         if self.needs_seek(target) {
             self.seek(target)?;
         }
-        self.decode_until(target)?;
+        self.decode_with_fallback(target)?;
         let pts = |frame: &frame::Video| frame.timestamp();
         let (frame, span) = match (&self.current, &self.ahead) {
             (Some(current), Some(ahead)) => (current, pts(current).zip(pts(ahead))),
@@ -200,20 +190,61 @@ impl VideoDecoder {
         self.start + self.time_base.to_ts(time)
     }
 
+    fn decode_with_fallback(&mut self, target: i64) -> Result<(), Error> {
+        match self.decode_until(target) {
+            Err(Error::Decode { source }) if self.hw_accel.is_some() => {
+                tracing::warn!(path = %self.path.display(), %source, "hardware decode failed, continuing in software");
+                self.fall_back_to_software()?;
+                self.seek(target)?;
+                self.decode_until(target)
+            }
+            decoded => decoded,
+        }
+    }
+
+    fn fall_back_to_software(&mut self) -> Result<(), Error> {
+        let stream_error = |source| Error::Stream {
+            index: self.stream_index,
+            source,
+        };
+        let stream = self
+            .input
+            .stream(self.stream_index)
+            .ok_or_else(|| stream_error(ffmpeg_next::Error::StreamNotFound))?;
+        let (decoder, hw_accel) =
+            open_decoder(&stream, &[], self.thread_count).map_err(stream_error)?;
+        self.decoder = decoder;
+        self.hw_accel = hw_accel;
+        Ok(())
+    }
+
     fn needs_seek(&self, target: i64) -> bool {
-        let Some(position) = self.current.as_ref().and_then(|frame| frame.timestamp()) else {
+        let timestamp = |frame: &Option<frame::Video>| frame.as_ref().and_then(|f| f.timestamp());
+        let (current, ahead) = (timestamp(&self.current), timestamp(&self.ahead));
+        let Some(position) = current.or(ahead) else {
             return true;
         };
         if target < position {
-            return true;
+            return current.is_some();
         }
         if self.drained {
             return false;
         }
-        match self.keyframe_at_or_before(target) {
-            Some(keyframe) => keyframe > position,
-            None => target - position > self.time_base.to_ts(UNINDEXED_FORWARD_WINDOW),
-        }
+        forward_seek_needed(
+            position,
+            target,
+            self.keyframe_at_or_before(target),
+            self.index_end(),
+            self.time_base.to_ts(UNINDEXED_FORWARD_WINDOW),
+        )
+    }
+
+    fn index_end(&self) -> Option<i64> {
+        let stream = self.input.stream(self.stream_index)?;
+        let entries = unsafe { avformat_index_get_entries_count(stream.as_ptr()) };
+        let last = entries.checked_sub(1).filter(|last| *last >= 0)?;
+        let entry = unsafe { avformat_index_get_entry(stream.as_ptr().cast_mut(), last).as_ref() };
+        entry.map(|entry| entry.timestamp)
     }
 
     fn keyframe_at_or_before(&self, target: i64) -> Option<i64> {
@@ -241,7 +272,13 @@ impl VideoDecoder {
         self.current = None;
         self.ahead = None;
         self.drained = false;
+        self.seeks += 1;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn seeks(&self) -> usize {
+        self.seeks
     }
 
     fn decode_until(&mut self, target: i64) -> Result<(), Error> {
@@ -267,11 +304,16 @@ impl VideoDecoder {
         }
         let mut frame = frame::Video::empty();
         loop {
-            if self.decoder.receive_frame(&mut frame).is_ok() {
-                if !hw::is_hardware_frame(&frame) {
-                    self.hw_accel = None;
+            match self.decoder.receive_frame(&mut frame) {
+                Ok(()) => {
+                    if !hw::is_hardware_frame(&frame) {
+                        self.hw_accel = None;
+                    }
+                    return Ok(Some(frame));
                 }
-                return Ok(Some(frame));
+                Err(ffmpeg_next::Error::Eof) => return Ok(None),
+                Err(source) if !is_again(&source) => return Err(Error::Decode { source }),
+                Err(_) => {}
             }
             if self.drained {
                 return Ok(None);
@@ -281,20 +323,92 @@ impl VideoDecoder {
     }
 
     fn feed(&mut self) -> Result<(), Error> {
-        for (stream, packet) in self.input.packets() {
-            if stream.index() != self.stream_index {
-                continue;
-            }
-            return match self.decoder.send_packet(&packet) {
+        match read_packet(&mut self.input, self.stream_index) {
+            Ok(Some(packet)) => match self.decoder.send_packet(&packet) {
                 Ok(()) | Err(ffmpeg_next::Error::InvalidData) => Ok(()),
                 Err(source) => Err(Error::Decode { source }),
-            };
+            },
+            Ok(None) => {
+                self.decoder
+                    .send_eof()
+                    .map_err(|source| Error::Decode { source })?;
+                self.drained = true;
+                Ok(())
+            }
+            Err(source) => Err(Error::Decode { source }),
         }
-        self.decoder
-            .send_eof()
-            .map_err(|source| Error::Decode { source })?;
-        self.drained = true;
-        Ok(())
+    }
+}
+
+pub(crate) fn read_packet(
+    input: &mut format::context::Input,
+    stream_index: usize,
+) -> Result<Option<Packet>, ffmpeg_next::Error> {
+    loop {
+        let mut packet = Packet::empty();
+        match packet.read(input) {
+            Ok(()) if packet.stream() == stream_index => return Ok(Some(packet)),
+            Ok(()) | Err(ffmpeg_next::Error::InvalidData) => {}
+            Err(ffmpeg_next::Error::Eof) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub(crate) fn is_again(error: &ffmpeg_next::Error) -> bool {
+    *error
+        == ffmpeg_next::Error::Other {
+            errno: ffmpeg_next::error::EAGAIN,
+        }
+}
+
+pub(crate) fn stream_start(input: &format::context::Input, stream: &format::stream::Stream) -> i64 {
+    let container = unsafe { (*input.as_ptr()).start_time };
+    if container != AV_NOPTS_VALUE {
+        container.rescale(rescale::TIME_BASE, stream.time_base())
+    } else if stream.start_time() != AV_NOPTS_VALUE {
+        stream.start_time()
+    } else {
+        0
+    }
+}
+
+fn open_decoder(
+    stream: &format::stream::Stream,
+    hw_accels: &[HwAccel],
+    thread_count: c_int,
+) -> Result<(decoder::Video, Option<HwAccel>), ffmpeg_next::Error> {
+    let attempt = |accels: &[HwAccel]| {
+        let mut context = codec::Context::from_parameters(stream.parameters())?;
+        let codec = decoder::find(context.id()).ok_or(ffmpeg_next::Error::DecoderNotFound)?;
+        let hw_accel = hw::attach_device(&mut context, codec, accels, HELD_FRAMES);
+        set_threads(&mut context, thread_count);
+        let opened = context
+            .decoder()
+            .open_as(codec)
+            .and_then(|opened| opened.video())?;
+        Ok((opened, hw_accel))
+    };
+    match attempt(hw_accels) {
+        Err(error) if !hw_accels.is_empty() => {
+            tracing::warn!(%error, "cannot open the hardware decoder, using software");
+            attempt(&[])
+        }
+        opened => opened,
+    }
+}
+
+fn forward_seek_needed(
+    position: i64,
+    target: i64,
+    keyframe: Option<i64>,
+    index_end: Option<i64>,
+    window: i64,
+) -> bool {
+    match keyframe {
+        Some(keyframe) if keyframe > position => true,
+        Some(_) if index_end.is_none_or(|end| end >= target) => false,
+        _ => target - position > window,
     }
 }
 
@@ -843,5 +957,57 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(error, Error::Open { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_stream_that_starts_late_still_begins_at_time_zero() {
+        let fixture = Fixture::generate_starting_late("video_starting_late", 25, 0);
+        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+
+        for index in [0, 9, 4] {
+            let frame = decoder
+                .frame_at(middle_of_frame(fixture::FRAME_RATE, index))
+                .unwrap();
+
+            assert_shows(&frame, index);
+        }
+    }
+
+    #[test]
+    fn asking_for_a_time_before_the_first_frame_seeks_only_once() {
+        let fixture = Fixture::generate("video_before_the_start");
+        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let before = Time::from_seconds(-1);
+
+        let first = decoder.frame_at(before).unwrap();
+        let second = decoder.frame_at(before - Time::from_seconds(1)).unwrap();
+
+        assert_shows(&first, 0);
+        assert_shows(&second, 0);
+        assert_eq!(decoder.seeks(), 1);
+    }
+
+    #[test]
+    fn a_forward_gap_seeks_when_the_index_stops_short_of_the_target() {
+        let window = 100;
+
+        assert!(forward_seek_needed(0, 500, Some(0), Some(200), window));
+        assert!(!forward_seek_needed(450, 500, Some(0), Some(200), window));
+        assert!(!forward_seek_needed(0, 500, Some(0), Some(900), window));
+        assert!(forward_seek_needed(0, 500, Some(300), Some(900), window));
+        assert!(forward_seek_needed(0, 500, None, None, window));
+        assert!(!forward_seek_needed(450, 500, None, None, window));
+        assert!(!forward_seek_needed(0, 50, Some(0), Some(10), window));
+    }
+
+    #[test]
+    fn again_is_told_apart_from_real_decode_errors() {
+        let again = ffmpeg_next::Error::Other {
+            errno: ffmpeg_next::error::EAGAIN,
+        };
+
+        assert!(is_again(&again));
+        assert!(!is_again(&ffmpeg_next::Error::InvalidData));
+        assert!(!is_again(&ffmpeg_next::Error::Eof));
     }
 }
