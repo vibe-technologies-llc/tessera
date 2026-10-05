@@ -6,14 +6,14 @@ use std::collections::BTreeSet;
 
 use gpui::{
     App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity, Hitbox,
-    HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Render, Rgba, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, prelude::FluentBuilder,
-    px, size,
+    HitboxBehavior, InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Rgba, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, fill, point,
+    prelude::FluentBuilder, px, size,
 };
 use tessera_timeline::{
-    Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Project, Time, TimeRange, Timecode,
-    Timeline, Track, TrackKind,
+    AssetId, Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Project, Time, TimeRange,
+    Timecode, Timeline, Track, TrackKind,
 };
 
 use self::{
@@ -106,11 +106,44 @@ const RULER_STEPS: [RulerStep; 17] = [
     COARSEST_RULER_STEP,
 ];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DropMode {
+    #[default]
+    Place,
+    Insert,
+    Overwrite,
+}
+
+impl DropMode {
+    fn of(modifiers: Modifiers) -> Self {
+        if modifiers.control {
+            Self::Insert
+        } else if modifiers.alt {
+            Self::Overwrite
+        } else {
+            Self::Place
+        }
+    }
+
+    fn command(self) -> Command {
+        match self {
+            Self::Place => Command::PlaceClip,
+            Self::Insert => Command::InsertClip,
+            Self::Overwrite => Command::OverwriteClip,
+        }
+    }
+}
+
+const OVERLAP_REASON: &str = "Overlaps another clip";
+const ASSET_OVERLAP_REASON: &str = "Overlaps a clip: Ctrl inserts, Alt overwrites";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DropPreview {
     track: usize,
     range: TimeRange,
     fits: bool,
+    reason: Option<&'static str>,
+    mode: DropMode,
     snapped_to: Option<Time>,
 }
 
@@ -421,11 +454,12 @@ impl TimelinePanel {
         cx: &mut Context<Self>,
     ) {
         let asset = event.drag(cx).id;
+        let mode = DropMode::of(event.event.modifiers);
         self.hover_lane(track, event, cx, |panel, offset, cx| {
             let project = panel.project.read(cx);
             let duration = project.asset(asset).and_then(|asset| asset.info.duration);
             let (start, snap) = panel.snapped_start(panel.frame_at(offset, cx), duration, &[], cx);
-            placement(track, project.clip_for(asset, track, start), snap)
+            asset_drop_preview(project, asset, track, start, snap, mode)
         });
     }
 
@@ -451,7 +485,12 @@ impl TimelinePanel {
                     let (start, snap) =
                         panel.snapped_start(start, Some(clip.source.duration), &group, cx);
                     if group.len() == 1 {
-                        return placement(track, project.moved_clip(id, track, start), snap);
+                        return placement(
+                            track,
+                            project.moved_clip(id, track, start),
+                            snap,
+                            DropMode::Place,
+                        );
                     }
                     if clip_track != track {
                         return None;
@@ -467,6 +506,8 @@ impl TimelinePanel {
                         track,
                         range: TimeRange::new(start, clip.source.duration),
                         fits,
+                        reason: (!fits).then_some(OVERLAP_REASON),
+                        mode: DropMode::Place,
                         snapped_to: None,
                     };
                     Some(preview.snapped(snap))
@@ -474,17 +515,28 @@ impl TimelinePanel {
             }
             Grip::Edge(edge) => {
                 let offset = event.event.position.x - event.bounds.left();
-                let to = self.frame_at(offset, cx);
+                let project = self.project.read(cx);
+                let Some((clip_track, clip)) = project.find_clip(id) else {
+                    return;
+                };
+                if clip_track != track {
+                    return;
+                }
+                let anchor = match edge {
+                    ClipEdge::Start => self.grab,
+                    ClipEdge::End => self.grab - self.viewport.width_of(clip.source.duration),
+                };
+                let to = self.frame_at(offset - anchor, cx);
                 let snap = self.snap(&[to], &[id], cx);
                 let to = to + snap.map_or(Time::ZERO, |snap| snap.shift);
                 let project = self.project.read(cx);
-                let Some((clip_track, _)) = project.find_clip(id) else {
-                    return;
-                };
-                if clip_track == track {
-                    let preview = placement(track, project.trimmed_clip(id, edge, to), snap);
-                    self.show_preview(preview, cx);
-                }
+                let preview = placement(
+                    track,
+                    project.trimmed_clip(id, edge, to),
+                    snap,
+                    DropMode::Place,
+                );
+                self.show_preview(preview, cx);
             }
         }
     }
@@ -519,46 +571,66 @@ impl TimelinePanel {
 
     fn drop_asset_on_lane(&mut self, track: usize, dragged: &DraggedAsset, cx: &mut Context<Self>) {
         let asset = dragged.id;
+        let mode = self
+            .drop_preview
+            .map_or(DropMode::Place, |preview| preview.mode);
         self.commit_preview(
-            Command::PlaceClip,
+            mode.command(),
             |preview| preview.track == track,
             cx,
             |project, preview| {
-                project
-                    .place_clip(asset, preview.track, preview.range.start)
-                    .map(|clip| vec![clip])
+                let start = preview.range.start;
+                match preview.mode {
+                    DropMode::Place => project.place_clip(asset, preview.track, start),
+                    DropMode::Insert => project.insert_asset(asset, preview.track, start),
+                    DropMode::Overwrite => project.overwrite_asset(asset, preview.track, start),
+                }
+                .map(|clip| vec![clip])
+            },
+        );
+    }
+
+    fn drop_clip_edge(&mut self, dragged: &DraggedClip, cx: &mut Context<Self>) {
+        let DraggedClip { id, grip } = *dragged;
+        let Grip::Edge(edge) = grip else {
+            return;
+        };
+        let trimmed_track = self.project.read(cx).find_clip(id).map(|(track, _)| track);
+        self.commit_preview(
+            Command::TrimClip,
+            |preview| Some(preview.track) == trimmed_track,
+            cx,
+            |project, preview| {
+                let to = match edge {
+                    ClipEdge::Start => preview.range.start,
+                    ClipEdge::End => preview.range.end(),
+                };
+                project.trim_clip(id, edge, to).map(|clip| vec![clip])
             },
         );
     }
 
     fn drop_clip_on_lane(&mut self, track: usize, dragged: &DraggedClip, cx: &mut Context<Self>) {
         let DraggedClip { id, grip } = *dragged;
-        let command = match grip {
-            Grip::Body => Command::MoveClip,
-            Grip::Edge(_) => Command::TrimClip,
-        };
-        let grouped =
-            grip == Grip::Body && self.selection.len() > 1 && self.selection.contains(&id);
+        if grip != Grip::Body {
+            self.drop_clip_edge(dragged, cx);
+            return;
+        }
+        let grouped = self.selection.len() > 1 && self.selection.contains(&id);
         let group: Vec<ClipId> = self.selection.iter().copied().collect();
         self.commit_preview(
-            command,
-            |preview| grip != Grip::Body || preview.track == track,
+            Command::MoveClip,
+            |preview| preview.track == track,
             cx,
-            |project, preview| match grip {
-                Grip::Body if grouped => {
+            |project, preview| {
+                if grouped {
                     let start = project.find_clip(id).map(|(_, clip)| clip.start);
                     let delta = preview.range.start - start.ok_or(EditError::UnknownClip(id))?;
                     project.move_clips(&group_moves(project, &group, delta))
-                }
-                Grip::Body => project
-                    .move_clip(id, preview.track, preview.range.start)
-                    .map(|clip| vec![clip]),
-                Grip::Edge(edge) => {
-                    let to = match edge {
-                        ClipEdge::Start => preview.range.start,
-                        ClipEdge::End => preview.range.end(),
-                    };
-                    project.trim_clip(id, edge, to).map(|clip| vec![clip])
+                } else {
+                    project
+                        .move_clip(id, preview.track, preview.range.start)
+                        .map(|clip| vec![clip])
                 }
             },
         );
@@ -599,7 +671,20 @@ impl TimelinePanel {
             .flatten()
             .collect();
         let snap = self.snap(&edges, moving, cx);
-        (start + snap.map_or(Time::ZERO, |snap| snap.shift), snap)
+        let snapped = start + snap.map_or(Time::ZERO, |snap| snap.shift);
+        let end_snapped = snap
+            .zip(duration)
+            .is_some_and(|(snap, duration)| snap.target == snapped + duration);
+        let start = if end_snapped {
+            self.project
+                .read(cx)
+                .settings
+                .frame_rate
+                .frame_start(snapped)
+        } else {
+            snapped
+        };
+        (start, snap)
     }
 
     fn snap(&self, edges: &[Time], moving: &[ClipId], cx: &App) -> Option<Snap> {
@@ -635,6 +720,12 @@ impl Render for TimelinePanel {
             .map(|time| snap_line(self.viewport.x_at(time)));
         let viewport = self.viewport;
         let selection = &self.selection;
+        let visible = (self.lanes.size.width > px(0.)).then(|| {
+            TimeRange::new(
+                viewport.start(),
+                viewport.duration_of(self.lanes.size.width),
+            )
+        });
         let playhead = self.playhead.read(cx).time();
         let project = self.project.read(cx);
         let frame_rate = project.settings.frame_rate;
@@ -649,6 +740,7 @@ impl Render for TimelinePanel {
                 viewport,
                 drop_preview,
                 selection,
+                visible,
             };
             track_lane(lane, project, cx)
         });
@@ -662,6 +754,9 @@ impl Render for TimelinePanel {
             .size_full()
             .flex()
             .bg(theme::panel())
+            .on_drop(cx.listener(|panel, dragged: &DraggedClip, _, cx| {
+                panel.drop_clip_edge(dragged, cx);
+            }))
             .on_scroll_wheel(cx.listener(|panel, event, window, cx| {
                 panel.scroll_wheel(event, window, cx);
             }))
@@ -733,6 +828,7 @@ struct Lane<'a> {
     viewport: Viewport,
     drop_preview: Option<DropPreview>,
     selection: &'a BTreeSet<ClipId>,
+    visible: Option<TimeRange>,
 }
 
 fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> impl IntoElement {
@@ -742,6 +838,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
         viewport,
         drop_preview,
         selection,
+        visible,
     } = lane;
     let color = match track.kind {
         TrackKind::Video => theme::video_clip(),
@@ -775,7 +872,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
         .on_drop(cx.listener(move |panel, dragged, _, cx| {
             panel.drop_clip_on_lane(index, dragged, cx);
         }))
-        .children(track.clips().iter().map(|clip| {
+        .children(visible_clips(track, visible).iter().map(|clip| {
             let look = ClipLook {
                 label: clip_label(project, clip),
                 color,
@@ -784,6 +881,10 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
             clip_block(clip, look, viewport)
         }))
         .children(ghost)
+}
+
+fn visible_clips(track: &Track, visible: Option<TimeRange>) -> &[Clip] {
+    visible.map_or(track.clips(), |range| track.clips_overlapping(range))
 }
 
 fn clip_label(project: &Project, clip: &Clip) -> SharedString {
@@ -815,19 +916,37 @@ fn placement(
     track: usize,
     placed: Result<Clip, EditError>,
     snap: Option<Snap>,
+    mode: DropMode,
 ) -> Option<DropPreview> {
     let (range, fits) = match placed {
         Ok(clip) => (clip.timeline_range(), true),
-        Err(EditError::Overlapping(overlap)) => (overlap.inserted, false),
+        Err(EditError::Overlapping(overlap)) => (overlap.inserted, mode != DropMode::Place),
         Err(_) => return None,
     };
     let preview = DropPreview {
         track,
         range,
         fits,
+        reason: (!fits).then_some(OVERLAP_REASON),
+        mode,
         snapped_to: None,
     };
     Some(preview.snapped(snap))
+}
+
+fn asset_drop_preview(
+    project: &Project,
+    asset: AssetId,
+    track: usize,
+    start: Time,
+    snap: Option<Snap>,
+    mode: DropMode,
+) -> Option<DropPreview> {
+    let preview = placement(track, project.clip_for(asset, track, start), snap, mode)?;
+    Some(DropPreview {
+        reason: preview.reason.map(|_| ASSET_OVERLAP_REASON),
+        ..preview
+    })
 }
 
 fn drop_ghost(preview: DropPreview, viewport: Viewport) -> impl IntoElement {
@@ -836,7 +955,13 @@ fn drop_ghost(preview: DropPreview, viewport: Viewport) -> impl IntoElement {
     } else {
         theme::drop_ghost_blocked()
     };
-    clip_frame(preview.range, viewport).bg(color)
+    clip_frame(preview.range, viewport)
+        .bg(color)
+        .overflow_hidden()
+        .px_1()
+        .text_xs()
+        .text_color(theme::text())
+        .children(preview.reason.map(|reason| div().truncate().child(reason)))
 }
 
 struct ClipLook {
@@ -850,6 +975,7 @@ fn clip_block(clip: &Clip, look: ClipLook, viewport: Viewport) -> impl IntoEleme
         id: clip.id,
         grip: Grip::Body,
     };
+    let handle = trim_handle_width(viewport.width_of(clip.source.duration));
     clip_frame(clip.timeline_range(), viewport)
         .id(("clip", clip.id.0))
         .overflow_hidden()
@@ -862,11 +988,15 @@ fn clip_block(clip: &Clip, look: ClipLook, viewport: Viewport) -> impl IntoEleme
         })
         .on_drag(body, |dragged, _, _, cx| cx.new(|_| *dragged))
         .child(div().truncate().child(look.label))
-        .child(trim_handle(clip.id, ClipEdge::Start))
-        .child(trim_handle(clip.id, ClipEdge::End))
+        .child(trim_handle(clip.id, ClipEdge::Start, handle))
+        .child(trim_handle(clip.id, ClipEdge::End, handle))
 }
 
-fn trim_handle(id: ClipId, edge: ClipEdge) -> impl IntoElement {
+fn trim_handle_width(clip_width: Pixels) -> Pixels {
+    px(TRIM_HANDLE_WIDTH).min(clip_width / 3.)
+}
+
+fn trim_handle(id: ClipId, edge: ClipEdge, width: Pixels) -> impl IntoElement {
     let dragged = DraggedClip {
         id,
         grip: Grip::Edge(edge),
@@ -879,7 +1009,7 @@ fn trim_handle(id: ClipId, edge: ClipEdge) -> impl IntoElement {
         .absolute()
         .top_0()
         .bottom_0()
-        .w(px(TRIM_HANDLE_WIDTH))
+        .w(width)
         .cursor(CursorStyle::ResizeLeftRight)
         .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| *dragged))
 }
@@ -1045,7 +1175,7 @@ fn ruler_step(pixels_per_second: f32, frame_rate: FrameRate) -> RulerStep {
 mod tests {
     use std::num::{NonZero, NonZeroI64};
 
-    use gpui::{Modifiers, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext};
+    use gpui::{Modifiers, Point, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext};
     use tessera_timeline::{MediaInfo, Stream, VideoStream};
 
     use super::{header::*, *};
@@ -1208,10 +1338,10 @@ mod tests {
     #[gpui::test]
     fn dragging_the_edges_trims_the_clip(cx: &mut TestAppContext) {
         let (panel, cx, clip) = timeline_with_a_clip(cx);
-        drag(cx, at(9.) - px(2.), at(6.));
+        drag(cx, at(9.) - px(2.), at(6.) - px(2.));
         let trimmed = clip_of(&panel, cx, clip);
         assert_eq!(trimmed.timeline_range().end(), Time::from_seconds(6));
-        drag(cx, at(1.) + px(2.), at(3.));
+        drag(cx, at(1.) + px(2.), at(3.) + px(2.));
         let trimmed = clip_of(&panel, cx, clip);
         assert_eq!(trimmed.start, Time::from_seconds(3));
         assert_eq!(
@@ -1519,5 +1649,198 @@ mod tests {
         });
 
         assert_eq!(cx.read(|cx| panel.read(cx).viewport.start()), Time::ZERO);
+    }
+
+    fn drag_to(cx: &mut VisualTestContext, from: Pixels, to: Point<Pixels>) {
+        let none = Modifiers::none();
+        cx.simulate_mouse_down(point(from, px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(from + px(4.), px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_move(to, MouseButton::Left, none);
+        cx.simulate_mouse_up(to, MouseButton::Left, none);
+    }
+
+    #[gpui::test]
+    fn a_trim_released_over_another_lane_or_the_ruler_still_commits(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+
+        drag_to(cx, at(9.) - px(2.), point(at(7.) - px(2.), row_y(0)));
+
+        assert_eq!(
+            clip_of(&panel, cx, clip).timeline_range().end(),
+            Time::from_seconds(7)
+        );
+
+        drag_to(cx, at(7.) - px(2.), point(at(5.) - px(2.), px(4.)));
+
+        assert_eq!(
+            clip_of(&panel, cx, clip).timeline_range().end(),
+            Time::from_seconds(5)
+        );
+    }
+
+    #[gpui::test]
+    fn grabbing_a_trim_handle_off_the_edge_does_not_jump_the_edge(cx: &mut TestAppContext) {
+        let (panel, cx, clip) = timeline_with_a_clip(cx);
+
+        drag(cx, at(9.) - px(3.), at(9.) - px(3.) - px(ONE_SECOND));
+
+        assert_eq!(
+            clip_of(&panel, cx, clip).timeline_range().end(),
+            Time::from_seconds(8)
+        );
+    }
+
+    #[test]
+    fn narrow_clips_keep_room_for_their_body() {
+        assert_eq!(trim_handle_width(px(300.)), px(TRIM_HANDLE_WIDTH));
+        assert_eq!(trim_handle_width(px(9.)), px(3.));
+        assert_eq!(trim_handle_width(px(0.)), px(0.));
+    }
+
+    #[gpui::test]
+    fn snapping_an_end_leaves_the_start_on_the_frame_grid(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 12)]);
+        let duration = Time::from_rational(351, NonZeroI64::new(100).unwrap());
+
+        let (start, snap) = cx.read(|cx| {
+            panel.read(cx).snapped_start(
+                Time::from_rational(850, NonZeroI64::new(100).unwrap()),
+                Some(duration),
+                &[],
+                cx,
+            )
+        });
+
+        let frame_rate = FrameRate::FPS_30;
+        assert!(snap.is_some());
+        assert_eq!(start, frame_rate.frame_start(start));
+        assert!(start + duration <= Time::from_seconds(12));
+    }
+
+    fn overlapped_project() -> (Project, AssetId) {
+        let (mut project, asset) = {
+            let mut project = Project::new("test");
+            let info = MediaInfo {
+                duration: Some(Time::from_seconds(8)),
+                streams: vec![Stream::Video(VideoStream {
+                    index: 0,
+                    codec: "h264".into(),
+                    width: NonZero::new(1920).unwrap(),
+                    height: NonZero::new(1080).unwrap(),
+                    frame_rate: None,
+                })],
+            };
+            let asset = project.add_asset("a.mkv".into(), info);
+            (project, asset)
+        };
+        project.place_clip(asset, 0, Time::ZERO).unwrap();
+        (project, asset)
+    }
+
+    #[test]
+    fn an_overlapping_drop_is_red_with_a_reason_unless_inserting_or_overwriting() {
+        let (project, asset) = overlapped_project();
+        let at_four = Time::from_seconds(4);
+
+        let place = asset_drop_preview(&project, asset, 0, at_four, None, DropMode::Place).unwrap();
+        let insert =
+            asset_drop_preview(&project, asset, 0, at_four, None, DropMode::Insert).unwrap();
+        let overwrite =
+            asset_drop_preview(&project, asset, 0, at_four, None, DropMode::Overwrite).unwrap();
+
+        assert!(!place.fits);
+        assert_eq!(place.reason, Some(ASSET_OVERLAP_REASON));
+        assert!(insert.fits && insert.reason.is_none());
+        assert!(overwrite.fits && overwrite.reason.is_none());
+        assert_eq!(insert.range.start, at_four);
+        assert_eq!(
+            asset_drop_preview(&project, asset, 1, at_four, None, DropMode::Insert),
+            None
+        );
+    }
+
+    #[test]
+    fn modifier_keys_pick_the_drop_mode() {
+        assert_eq!(DropMode::of(Modifiers::none()), DropMode::Place);
+        assert_eq!(DropMode::of(Modifiers::control()), DropMode::Insert);
+        assert_eq!(DropMode::of(Modifiers::alt()), DropMode::Overwrite);
+    }
+
+    #[gpui::test]
+    fn dropping_an_asset_in_insert_mode_pushes_the_clips_after_it_right(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1)]);
+        let asset = cx.read(|cx| panel.read(cx).project.read(cx).assets[0].clone());
+        let (preview, dragged) = cx.read(|cx| {
+            let project = panel.read(cx).project.read(cx);
+            let preview = asset_drop_preview(
+                project,
+                asset.id,
+                0,
+                Time::from_seconds(4),
+                None,
+                DropMode::Insert,
+            )
+            .unwrap();
+            (preview, DraggedAsset::of(&asset))
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.drop_preview = Some(preview);
+            panel.drop_asset_on_lane(0, &dragged, cx);
+        });
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 4, 12]));
+    }
+
+    #[gpui::test]
+    fn dropping_an_asset_in_overwrite_mode_trims_what_it_covers(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1)]);
+        let asset = cx.read(|cx| panel.read(cx).project.read(cx).assets[0].clone());
+        let (preview, dragged) = cx.read(|cx| {
+            let project = panel.read(cx).project.read(cx);
+            let preview = asset_drop_preview(
+                project,
+                asset.id,
+                0,
+                Time::from_seconds(4),
+                None,
+                DropMode::Overwrite,
+            )
+            .unwrap();
+            (preview, DraggedAsset::of(&asset))
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.drop_preview = Some(preview);
+            panel.drop_asset_on_lane(0, &dragged, cx);
+        });
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 4]));
+    }
+
+    #[test]
+    fn only_the_clips_in_view_are_laid_out() {
+        let mut track = Track::new(TrackKind::Video);
+        for (id, start) in [(0, 0), (1, 10), (2, 20), (3, 30)] {
+            track
+                .insert(Clip {
+                    id: ClipId(id),
+                    asset: AssetId(0),
+                    source: TimeRange::new(Time::ZERO, Time::from_seconds(5)),
+                    start: Time::from_seconds(start),
+                })
+                .unwrap();
+        }
+        let view = TimeRange::new(Time::from_seconds(12), Time::from_seconds(10));
+
+        let ids = |visible| -> Vec<ClipId> {
+            visible_clips(&track, visible)
+                .iter()
+                .map(|clip| clip.id)
+                .collect()
+        };
+
+        assert_eq!(ids(Some(view)), [ClipId(1), ClipId(2)]);
+        assert_eq!(ids(None), [ClipId(0), ClipId(1), ClipId(2), ClipId(3)]);
     }
 }

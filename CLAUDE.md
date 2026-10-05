@@ -230,7 +230,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   records where the clip was grabbed. The panel drops clips that no longer exist from the
   selection whenever the project changes, and pulls the view back when the timeline shrinks under
   it. Dragging a selected clip's body moves the whole selection by the same time (`move_clips`),
-  previewed as the dragged clip's ghost, red when any selected clip would collide. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
+  previewed as the dragged clip's ghost, red when any selected clip would collide. A trim keeps the offset at which its
+  handle was grabbed and commits wherever the pointer is released, since only the clip's own lane
+  previews it. Dropping an asset with Ctrl held inserts it and with Alt held overwrites
+  (`DropMode`, carried on the `DropPreview`); a red ghost says why it was refused. A start that
+  snapped by its end is floored to the frame grid. Each lane lays out only the clips overlapping
+  the visible time range, and trim handles are at most a third of the clip's width. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
   drag that the lanes preview and commit as a move or a trim. While snapping is on (N toggles it),
   a dropped asset's edges, a moved clip's edges and a trimmed edge pull onto the nearest clip edge,
   the playhead or zero within a few pixels (`timeline::snap`), and the lanes draw a line where the

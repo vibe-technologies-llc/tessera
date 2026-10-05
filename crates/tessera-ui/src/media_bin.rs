@@ -34,6 +34,15 @@ pub struct DraggedAsset {
     name: SharedString,
 }
 
+impl DraggedAsset {
+    pub(crate) fn of(asset: &Asset) -> Self {
+        Self {
+            id: asset.id,
+            name: file_name(&asset.path),
+        }
+    }
+}
+
 impl Render for DraggedAsset {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -457,10 +466,7 @@ fn asset_row(asset: &Asset, thumbnail: Option<&Arc<RenderImage>>) -> impl IntoEl
         .info
         .duration
         .map_or_else(|| UNKNOWN_DURATION.to_owned(), duration_label);
-    let dragged = DraggedAsset {
-        id: asset.id,
-        name: file_name(&asset.path),
-    };
+    let dragged = DraggedAsset::of(asset);
     div()
         .id(("asset", asset.id.0))
         .px_3()

@@ -77,21 +77,13 @@
 
 ## Timeline editing
 
-- Commit a trim only on the lane that previewed it, keeping the grab offset: releasing over another
-  track commits the stale preview, over the ruler discards it, and the edge jumps on the first move
-- Keep snapped starts on the frame grid; clip ends come from probed durations, so snapping an end
-  leaves the start between frames
-- Lay out only the clips in view, instead of building every clip with its handles and label on each
-  playhead tick
 - Select several clips with a marquee, and show a ghost for every clip of a group move
 - Scroll while dragging near an edge, add scrollbars, and keep the grab point when the view scrolls
   mid-drag
-- Insert and overwrite on drop, and say why a red drop was refused
 - Copy, paste, cut and duplicate clips
 - Go to the next and previous edit, set in and out points and markers, and cancel a drag with Escape
 - Track headers with names, lock, mute, solo and a height, and an explanation on the disabled remove
   button
-- Keep trim handles narrower than the clip, so narrow clips can still be dragged by the body
 
 ## Media bin and workspace
 
