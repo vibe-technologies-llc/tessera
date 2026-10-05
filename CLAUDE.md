@@ -251,7 +251,15 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   neighbour or remove it (the disabled remove button's tooltip says why), toggles for lock, mute
   (hide on a video track) and solo (audio only) and a button that cycles the row height between
   compact, normal and tall (`header::row_height`), and a row below the tracks adds video or audio
-  tracks. Split and delete skip the clips of locked tracks. Renaming a track has no UI yet. Shift+wheel scrolls the track rows vertically, under a fixed
+  tracks. Split and delete skip the clips of locked tracks. Renaming a track has no UI yet. Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+D copy, cut, paste
+  and duplicate the selection: the panel keeps a clipboard of clips with their tracks, a paste
+  lands at the playhead (a duplicate right after the selection) keeping the clips' relative
+  offsets and tracks, as one `paste_clips` command that is refused whole when anything overlaps or
+  a track is locked. M adds a marker at the playhead and Shift+M removes the one there, I and O set
+  the in and out points and Alt+X clears them; markers draw as flags on the ruler and the in and
+  out points as a shaded range. Down and Up jump the playhead to the next and previous edit
+  (`Timeline::next_edit_after`, the starts and ends of all clips), Ctrl+Right and Ctrl+Left to the
+  next and previous marker, and Escape cancels a drag in progress. Shift+wheel scrolls the track rows vertically, under a fixed
   ruler. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` requests every video clip under the

@@ -9,9 +9,11 @@ use tessera_document::EXTENSION;
 use tessera_timeline::{Project, Time};
 
 use crate::{
-    DeleteClip, Import, NEW_PROJECT_NAME, NewProject, Open, Pause, PlayPause, Redo,
-    RippleDeleteClip, Save, SaveAs, SelectAll, ShuttleBackward, ShuttleForward, SplitAtPlayhead,
-    StepBackward, StepForward, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    AddMarker, Cancel, ClearInOut, CopyClips, CutClips, DeleteClip, DuplicateClips, Import,
+    NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, PasteClips, Pause, PlayPause,
+    PreviousEdit, PreviousMarker, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll,
+    SetInPoint, SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward,
+    StepForward, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
@@ -431,6 +433,49 @@ impl Render for Workspace {
             .on_action(cx.listener(|workspace, _: &SelectAll, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::select_all);
             }))
+            .on_action(cx.listener(|workspace, _: &CopyClips, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::copy_selection);
+            }))
+            .on_action(cx.listener(|workspace, _: &CutClips, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::cut_selection);
+            }))
+            .on_action(cx.listener(|workspace, _: &PasteClips, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::paste);
+            }))
+            .on_action(cx.listener(|workspace, _: &DuplicateClips, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::duplicate_selection);
+            }))
+            .on_action(cx.listener(|workspace, _: &AddMarker, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::add_marker_at_playhead);
+            }))
+            .on_action(cx.listener(|workspace, _: &RemoveMarker, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::remove_marker_at_playhead);
+            }))
+            .on_action(cx.listener(|workspace, _: &SetInPoint, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::set_in_point_at_playhead);
+            }))
+            .on_action(cx.listener(|workspace, _: &SetOutPoint, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::set_out_point_at_playhead);
+            }))
+            .on_action(cx.listener(|workspace, _: &ClearInOut, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::clear_in_out);
+            }))
+            .on_action(cx.listener(|workspace, _: &NextEdit, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::go_to_next_edit);
+            }))
+            .on_action(cx.listener(|workspace, _: &PreviousEdit, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::go_to_previous_edit);
+            }))
+            .on_action(cx.listener(|workspace, _: &NextMarker, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::go_to_next_marker);
+            }))
+            .on_action(cx.listener(|workspace, _: &PreviousMarker, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::go_to_previous_marker);
+            }))
+            .on_action(cx.listener(|workspace, _: &Cancel, window, cx| {
+                cx.stop_active_drag(window);
+                workspace.on_timeline(cx, TimelinePanel::drag_cancelled);
+            }))
             .on_action(cx.listener(|workspace, _: &DeleteClip, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::delete_selection);
             }))
@@ -498,7 +543,7 @@ fn with_project_extension(path: PathBuf) -> PathBuf {
 mod tests {
     use std::num::NonZero;
 
-    use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
+    use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext, point};
     use tessera_timeline::{MediaInfo, Stream, Time, VideoStream};
 
     use super::*;
@@ -1003,5 +1048,164 @@ mod tests {
 
         assert!(second.exists());
         assert_eq!(cx.read(|cx| workspace.read(cx).file.clone()), Some(second));
+    }
+
+    fn seek_to(workspace: &Entity<Workspace>, seconds: i64, cx: &mut VisualTestContext) {
+        let playhead = cx.read(|cx| workspace.read(cx).playhead.clone());
+        playhead.update(cx, |playhead, cx| {
+            playhead.seek(Time::from_seconds(seconds), cx);
+        });
+    }
+
+    fn playhead_time(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> Time {
+        cx.read(|cx| workspace.read(cx).playhead.read(cx).time())
+    }
+
+    fn seconds_of(values: &[i64]) -> Vec<Time> {
+        values.iter().copied().map(Time::from_seconds).collect()
+    }
+
+    #[gpui::test]
+    fn copy_cut_paste_and_duplicate_move_clips_around_the_playhead(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        click_v1(cx, 2.);
+        cx.simulate_keystrokes("ctrl-c");
+        seek_to(&workspace, 30, cx);
+        cx.simulate_keystrokes("ctrl-v");
+
+        assert_eq!(starts(&workspace, cx), seconds_of(&[1, 10, 30]));
+
+        cx.simulate_keystrokes("ctrl-v");
+
+        assert_eq!(starts(&workspace, cx), seconds_of(&[1, 10, 30]));
+
+        click_v1(cx, 11.);
+        cx.simulate_keystrokes("ctrl-d");
+
+        assert_eq!(starts(&workspace, cx), seconds_of(&[1, 10, 18, 30]));
+
+        click_v1(cx, 11.);
+        cx.simulate_keystrokes("ctrl-x");
+
+        assert_eq!(starts(&workspace, cx), seconds_of(&[1, 18, 30]));
+
+        seek_to(&workspace, 50, cx);
+        cx.simulate_keystrokes("ctrl-v");
+
+        assert_eq!(starts(&workspace, cx), seconds_of(&[1, 18, 30, 50]));
+
+        cx.simulate_keystrokes("ctrl-z");
+        cx.simulate_keystrokes("ctrl-z");
+
+        assert_eq!(starts(&workspace, cx), seconds_of(&[1, 10, 18, 30]));
+    }
+
+    #[gpui::test]
+    fn markers_and_in_out_points_follow_the_playhead_keys(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let marker_times = |cx: &mut VisualTestContext| -> Vec<Time> {
+            cx.read(|cx| {
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .markers
+                    .iter()
+                    .map(|marker| marker.time)
+                    .collect()
+            })
+        };
+
+        for second in [4, 7] {
+            seek_to(&workspace, second, cx);
+            cx.simulate_keystrokes("m");
+        }
+
+        assert_eq!(marker_times(cx), seconds_of(&[4, 7]));
+
+        seek_to(&workspace, 0, cx);
+        cx.simulate_keystrokes("ctrl-right");
+
+        assert_eq!(playhead_time(&workspace, cx), Time::from_seconds(4));
+
+        cx.simulate_keystrokes("ctrl-right ctrl-right");
+
+        assert_eq!(playhead_time(&workspace, cx), Time::from_seconds(7));
+
+        cx.simulate_keystrokes("ctrl-left");
+
+        assert_eq!(playhead_time(&workspace, cx), Time::from_seconds(4));
+
+        cx.simulate_keystrokes("shift-m");
+
+        assert_eq!(marker_times(cx), seconds_of(&[7]));
+
+        seek_to(&workspace, 2, cx);
+        cx.simulate_keystrokes("i");
+        seek_to(&workspace, 6, cx);
+        cx.simulate_keystrokes("o");
+
+        let in_out = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let project = workspace.read(cx).project().read(cx);
+                (project.in_point, project.out_point)
+            })
+        };
+
+        assert_eq!(
+            in_out(cx),
+            (Some(Time::from_seconds(2)), Some(Time::from_seconds(6)))
+        );
+
+        seek_to(&workspace, 1, cx);
+        cx.simulate_keystrokes("o");
+
+        assert_eq!(
+            in_out(cx),
+            (Some(Time::from_seconds(2)), Some(Time::from_seconds(6)))
+        );
+
+        cx.simulate_keystrokes("alt-x");
+
+        assert_eq!(in_out(cx), (None, None));
+    }
+
+    #[gpui::test]
+    fn up_and_down_jump_between_edits(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        let mut visited = Vec::new();
+        for key in ["down", "down", "down", "down", "down", "up", "up"] {
+            cx.simulate_keystrokes(key);
+            visited.push(playhead_time(&workspace, cx));
+        }
+
+        assert_eq!(visited, seconds_of(&[1, 9, 10, 18, 18, 10, 9]));
+    }
+
+    #[gpui::test]
+    fn escape_cancels_a_clip_drag(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let height = cx.update(|window, _| window.viewport_size().height);
+        let y = height - px(TIMELINE_HEIGHT) + px(V1_BELOW_TIMELINE_TOP);
+        let at = |seconds: f32| point(px(LANES_LEFT + seconds * ONE_SECOND), y);
+        let none = Modifiers::none();
+
+        cx.simulate_mouse_down(at(2.), MouseButton::Left, none);
+        cx.simulate_mouse_move(at(2.1), MouseButton::Left, none);
+        cx.simulate_mouse_move(at(30.), MouseButton::Left, none);
+        cx.simulate_keystrokes("escape");
+        cx.simulate_mouse_up(at(30.), MouseButton::Left, none);
+
+        assert_eq!(starts(&workspace, cx), seconds_of(&[1, 10]));
     }
 }

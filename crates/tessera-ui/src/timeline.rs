@@ -47,6 +47,9 @@ const CLIP_INSET: f32 = 4.;
 const TRIM_HANDLE_WIDTH: f32 = 6.;
 const SNAP_DISTANCE: f32 = 8.;
 const SNAP_LINE_WIDTH: f32 = 1.;
+const MARKER_WIDTH: f32 = 9.;
+const MARKER_HEIGHT: f32 = 10.;
+const IN_OUT_EDGE_WIDTH: f32 = 2.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RulerSpan {
@@ -196,6 +199,7 @@ pub struct TimelinePanel {
     track_scroll: Pixels,
     tracks_view: Bounds<Pixels>,
     snapping: bool,
+    clipboard: Vec<(Clip, usize)>,
 }
 
 impl TimelinePanel {
@@ -221,6 +225,7 @@ impl TimelinePanel {
             track_scroll: px(0.),
             tracks_view: Bounds::default(),
             snapping: true,
+            clipboard: Vec::new(),
         }
     }
 
@@ -244,9 +249,163 @@ impl TimelinePanel {
         cx.notify();
     }
 
+    pub fn drag_cancelled(&mut self, cx: &mut Context<Self>) {
+        self.drop_preview = None;
+        cx.notify();
+    }
+
+    fn selected_clips(&self, cx: &App) -> Vec<(Clip, usize)> {
+        let project = self.project.read(cx);
+        let mut clips: Vec<(Clip, usize)> = self
+            .selection
+            .iter()
+            .filter_map(|id| project.find_clip(*id))
+            .map(|(track, clip)| (*clip, track))
+            .collect();
+        clips.sort_by_key(|(clip, track)| (clip.start, *track));
+        clips
+    }
+
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let copied = self.selected_clips(cx);
+        if !copied.is_empty() {
+            self.clipboard = copied;
+        }
+    }
+
+    pub fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+        self.delete_selection(cx);
+    }
+
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        let at = self.playhead.read(cx).time();
+        self.paste_clips(self.clipboard.clone(), at, cx);
+    }
+
+    pub fn duplicate_selection(&mut self, cx: &mut Context<Self>) {
+        let clips = self.selected_clips(cx);
+        let end = clips
+            .iter()
+            .map(|(clip, _)| clip.timeline_range().end())
+            .max();
+        if let Some(end) = end {
+            self.paste_clips(clips, end, cx);
+        }
+    }
+
+    fn paste_clips(&mut self, clips: Vec<(Clip, usize)>, at: Time, cx: &mut Context<Self>) {
+        let Some(anchor) = clips.iter().map(|(clip, _)| clip.start).min() else {
+            return;
+        };
+        let pastes: Vec<(Clip, usize, Time)> = clips
+            .iter()
+            .map(|(clip, track)| (*clip, *track, at + (clip.start - anchor)))
+            .collect();
+        match self.editor.apply(Command::PasteClip, cx, |project| {
+            project.paste_clips(&pastes)
+        }) {
+            Ok(pasted) => self.selection = pasted.iter().map(|clip| clip.id).collect(),
+            Err(error) => tracing::warn!(%error, "could not paste the clips"),
+        }
+        cx.notify();
+    }
+
+    pub fn add_marker_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let time = self.playhead.read(cx).time();
+        self.editor.perform(Command::AddMarker, cx, |project| {
+            project.add_marker(time, "");
+        });
+    }
+
+    pub fn remove_marker_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let time = self.playhead.read(cx).time();
+        let frame_rate = self.project.read(cx).settings.frame_rate;
+        let marker = self
+            .project
+            .read(cx)
+            .markers
+            .iter()
+            .find(|marker| frame_rate.frame_start(marker.time) == time)
+            .map(|marker| marker.id);
+        if let Some(marker) = marker {
+            let removed = self.editor.apply(Command::RemoveMarker, cx, |project| {
+                project.remove_marker(marker)
+            });
+            if let Err(error) = removed {
+                tracing::warn!(%error, "could not remove the marker");
+            }
+        }
+    }
+
+    pub fn set_in_point_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let time = self.playhead.read(cx).time();
+        let set = self.editor.apply(Command::SetInPoint, cx, |project| {
+            project.set_in_point(time)
+        });
+        if let Err(error) = set {
+            tracing::warn!(%error, "could not set the in point");
+        }
+    }
+
+    pub fn set_out_point_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let time = self.playhead.read(cx).time();
+        let set = self.editor.apply(Command::SetOutPoint, cx, |project| {
+            project.set_out_point(time)
+        });
+        if let Err(error) = set {
+            tracing::warn!(%error, "could not set the out point");
+        }
+    }
+
+    pub fn clear_in_out(&mut self, cx: &mut Context<Self>) {
+        self.editor
+            .perform(Command::ClearInOut, cx, Project::clear_in_out);
+    }
+
+    fn seek_to(&mut self, time: Option<Time>, cx: &mut Context<Self>) {
+        if let Some(time) = time {
+            self.playhead
+                .update(cx, |playhead, cx| playhead.seek(time, cx));
+        }
+    }
+
+    pub fn go_to_next_edit(&mut self, cx: &mut Context<Self>) {
+        let at = self.playhead.read(cx).time();
+        let next = self.project.read(cx).timeline.next_edit_after(at);
+        self.seek_to(next, cx);
+    }
+
+    pub fn go_to_previous_edit(&mut self, cx: &mut Context<Self>) {
+        let at = self.playhead.read(cx).time();
+        let previous = self.project.read(cx).timeline.previous_edit_before(at);
+        self.seek_to(previous, cx);
+    }
+
+    pub fn go_to_next_marker(&mut self, cx: &mut Context<Self>) {
+        let at = self.playhead.read(cx).time();
+        let next = self
+            .project
+            .read(cx)
+            .next_marker_after(at)
+            .map(|marker| marker.time);
+        self.seek_to(next, cx);
+    }
+
+    pub fn go_to_previous_marker(&mut self, cx: &mut Context<Self>) {
+        let at = self.playhead.read(cx).time();
+        let previous = self
+            .project
+            .read(cx)
+            .previous_marker_before(at)
+            .map(|marker| marker.time);
+        self.seek_to(previous, cx);
+    }
+
     pub fn project_replaced(&mut self, cx: &mut Context<Self>) {
         self.selection.clear();
         self.drop_preview = None;
+        self.clipboard.clear();
         self.viewport = Viewport::default();
         self.track_scroll = px(0.);
         cx.notify();
@@ -842,6 +1001,13 @@ impl Render for TimelinePanel {
                     .flex_col()
                     .child(ruler(panel, viewport, frame_rate))
                     .child(lanes)
+                    .children(in_out_range(viewport, project.in_point, project.out_point))
+                    .children(
+                        project
+                            .markers
+                            .iter()
+                            .map(|marker| marker_flag(viewport.x_at(marker.time))),
+                    )
                     .children(snap_line)
                     .child(playhead_marker(viewport.x_at(playhead))),
             )
@@ -1189,6 +1355,46 @@ fn listen_for_scrub(
             panel.update(cx, |panel, _| panel.scrubbing = false);
         }
     });
+}
+
+fn marker_flag(x: Pixels) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(RULER_HEIGHT - MARKER_HEIGHT))
+        .left(x - px(MARKER_WIDTH / 2.))
+        .w(px(MARKER_WIDTH))
+        .h(px(MARKER_HEIGHT))
+        .rounded_t_sm()
+        .bg(theme::marker())
+}
+
+fn in_out_range(
+    viewport: Viewport,
+    in_point: Option<Time>,
+    out_point: Option<Time>,
+) -> Vec<gpui::Div> {
+    let edge = |time: Time| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(viewport.x_at(time) - px(IN_OUT_EDGE_WIDTH / 2.))
+            .w(px(IN_OUT_EDGE_WIDTH))
+            .bg(theme::marker())
+    };
+    let mut elements: Vec<gpui::Div> = in_point.into_iter().chain(out_point).map(edge).collect();
+    if let Some((start, end)) = in_point.zip(out_point) {
+        elements.push(
+            div()
+                .absolute()
+                .top(px(RULER_HEIGHT))
+                .bottom_0()
+                .left(viewport.x_at(start))
+                .w(viewport.width_of(end - start))
+                .bg(theme::in_out_range()),
+        );
+    }
+    elements
 }
 
 fn snap_line(x: Pixels) -> impl IntoElement {

@@ -100,6 +100,15 @@ impl Project {
         Ok(deleted)
     }
 
+    pub fn paste_clips(&mut self, pastes: &[(Clip, usize, Time)]) -> Result<Vec<Clip>, EditError> {
+        self.atomically(|project| {
+            pastes
+                .iter()
+                .map(|(clip, track, start)| project.paste_clip(clip, *track, *start))
+                .collect()
+        })
+    }
+
     pub fn moved_clips(&self, moves: &[(ClipId, usize, Time)]) -> Result<Vec<Clip>, EditError> {
         self.clone().move_clips(moves)
     }
@@ -808,5 +817,31 @@ mod tests {
         assert_eq!(slid_to(0), seconds(4));
         assert_eq!(slid_to(99), seconds(23));
         assert_eq!(slid_to(12), seconds(12));
+    }
+
+    #[test]
+    fn pasting_several_clips_places_them_all_or_none() {
+        let (mut project, asset) = project_with_asset();
+        let first = place(&mut project, asset, 0);
+        let second = place(&mut project, asset, 10);
+        let copies: Vec<Clip> = [first, second]
+            .iter()
+            .map(|id| project.find_clip(*id).map(|(_, clip)| *clip).unwrap())
+            .collect();
+
+        let pasted = project
+            .paste_clips(&[(copies[0], 0, seconds(20)), (copies[1], 0, seconds(30))])
+            .unwrap();
+
+        assert_eq!(pasted.len(), 2);
+        assert_eq!(layout(&project).len(), 4);
+
+        let before = project.clone();
+
+        assert!(matches!(
+            project.paste_clips(&[(copies[0], 0, seconds(40)), (copies[1], 0, seconds(45))]),
+            Err(EditError::Overlapping(_))
+        ));
+        assert_eq!(project, before);
     }
 }

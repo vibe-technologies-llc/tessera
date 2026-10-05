@@ -421,6 +421,21 @@ impl Timeline {
         self.video_clips_at(time).next_back()
     }
 
+    pub fn next_edit_after(&self, time: Time) -> Option<Time> {
+        self.edit_points().filter(|point| *point > time).min()
+    }
+
+    pub fn previous_edit_before(&self, time: Time) -> Option<Time> {
+        self.edit_points().filter(|point| *point < time).max()
+    }
+
+    fn edit_points(&self) -> impl Iterator<Item = Time> {
+        self.tracks
+            .iter()
+            .flat_map(|track| track.clips())
+            .flat_map(|clip| [clip.start, clip.timeline_range().end()])
+    }
+
     pub fn clips_cut_by(&self, time: Time) -> impl Iterator<Item = &Clip> {
         self.tracks
             .iter()
@@ -1634,5 +1649,28 @@ mod tests {
         timeline.tracks[0].muted = true;
 
         assert_eq!(timeline.top_video_clip_at(Time::from_seconds(1)), None);
+    }
+
+    #[test]
+    fn edit_points_are_the_starts_and_ends_of_clips_on_any_track() {
+        let (mut project, asset, _, _) = two_clip_project();
+        let upper = project.timeline.add_track(TrackKind::Video);
+        project
+            .place_clip(asset, upper, Time::from_seconds(12))
+            .unwrap();
+        let timeline = &project.timeline;
+        let next = |seconds| timeline.next_edit_after(Time::from_seconds(seconds));
+        let previous = |seconds| timeline.previous_edit_before(Time::from_seconds(seconds));
+
+        assert_eq!(next(-1), Some(Time::ZERO));
+        assert_eq!(next(0), Some(Time::from_seconds(10)));
+        assert_eq!(next(10), Some(Time::from_seconds(12)));
+        assert_eq!(next(12), Some(Time::from_seconds(20)));
+        assert_eq!(next(22), Some(Time::from_seconds(30)));
+        assert_eq!(next(30), None);
+        assert_eq!(previous(0), None);
+        assert_eq!(previous(10), Some(Time::ZERO));
+        assert_eq!(previous(30), Some(Time::from_seconds(22)));
+        assert_eq!(previous(99), Some(Time::from_seconds(30)));
     }
 }
