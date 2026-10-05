@@ -9,8 +9,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, IntoElement, ObjectFit, ParentElement, Pixels, Render,
-    RenderImage, SharedString, Size, Styled, StyledImage, Window, canvas, div, img, relative,
+    AnyElement, AnyWindowHandle, AppContext, Context, Entity, IntoElement, ObjectFit,
+    ParentElement, Pixels, Render, RenderImage, SharedString, Size, Styled, StyledImage, Window,
+    canvas, div, img, relative,
 };
 use tessera_media::{VideoDecoder, VideoFrame};
 use tessera_render::{Compositor, Frame, Layer};
@@ -206,13 +207,14 @@ pub struct Viewer {
     pending: Option<Rendered>,
     shown: Option<FrameRequest>,
     picture: Picture,
-    retired: Vec<Arc<RenderImage>>,
+    window: AnyWindowHandle,
 }
 
 impl Viewer {
     pub fn new(
         project: Entity<Project>,
         playhead: Entity<Playhead>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&project, |viewer, _, cx| {
@@ -238,7 +240,7 @@ impl Viewer {
             pending: None,
             shown: None,
             picture: Picture::Empty,
-            retired: Vec::new(),
+            window: window.window_handle(),
         };
         viewer.refresh(cx);
         viewer
@@ -401,10 +403,20 @@ impl Viewer {
 
     fn show(&mut self, shown: Option<FrameRequest>, picture: Picture, cx: &mut Context<Self>) {
         if let Picture::Frame(replaced) = mem::replace(&mut self.picture, picture) {
-            self.retired.push(replaced);
+            self.release(replaced, cx);
         }
         self.shown = shown;
         cx.notify();
+    }
+
+    fn release(&self, image: Arc<RenderImage>, cx: &mut Context<Self>) {
+        let window = self.window;
+        cx.defer(move |cx| {
+            let released = window.update(cx, |_, window, _| window.drop_image(image));
+            if let Ok(Err(error)) = released {
+                tracing::warn!(%error, "failed to release a viewer frame");
+            }
+        });
     }
 
     fn picture(&self, placeholder: String) -> AnyElement {
@@ -425,12 +437,7 @@ impl Viewer {
 }
 
 impl Render for Viewer {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        for image in self.retired.drain(..) {
-            if let Err(error) = window.drop_image(image) {
-                tracing::warn!(%error, "failed to release a viewer frame");
-            }
-        }
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.project.read(cx).settings;
         let playhead = self.playhead.read(cx);
         let timecode = Timecode::new(playhead.time(), settings.frame_rate);
@@ -1044,8 +1051,9 @@ mod tests {
     fn the_viewer_asks_for_every_video_layer_under_the_playhead(cx: &mut TestAppContext) {
         let project = cx.new(|_| stacked_project());
         let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
-        let (viewer, cx) =
-            cx.add_window_view(|_, cx| Viewer::new(project.clone(), playhead.clone(), cx));
+        let (viewer, cx) = cx.add_window_view(|window, cx| {
+            Viewer::new(project.clone(), playhead.clone(), window, cx)
+        });
         cx.run_until_parked();
         assert_eq!(
             wanted_paths(&viewer, cx),
@@ -1080,9 +1088,9 @@ mod tests {
     #[gpui::test]
     fn a_replaced_project_asks_for_frames_of_its_own_media(cx: &mut TestAppContext) {
         let project = cx.new(|_| project_showing("/missing/first.mkv"));
-        let (viewer, cx) = cx.add_window_view(|_, cx| {
+        let (viewer, cx) = cx.add_window_view(|window, cx| {
             let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
-            Viewer::new(project.clone(), playhead, cx)
+            Viewer::new(project.clone(), playhead, window, cx)
         });
         cx.run_until_parked();
         assert_eq!(
@@ -1252,9 +1260,9 @@ mod tests {
     #[gpui::test]
     fn a_deleted_clip_leaves_black_at_once(cx: &mut TestAppContext) {
         let project = cx.new(|_| project_showing("/missing/only.mkv"));
-        let (viewer, cx) = cx.add_window_view(|_, cx| {
+        let (viewer, cx) = cx.add_window_view(|window, cx| {
             let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
-            Viewer::new(project.clone(), playhead, cx)
+            Viewer::new(project.clone(), playhead, window, cx)
         });
         cx.run_until_parked();
 

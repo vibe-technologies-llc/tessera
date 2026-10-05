@@ -33,7 +33,6 @@
 ## Viewer
 
 - Read the composited frame back without waiting on the GPU in the same job
-- Release replaced frames from the atlas when they are replaced, not on the next paint
 - Zoom and a 100 % view
 
 ## Timeline editing

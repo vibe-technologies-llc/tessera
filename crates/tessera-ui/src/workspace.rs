@@ -83,7 +83,7 @@ impl Workspace {
                 bin.return_focus_to(bin_focus_return);
                 bin
             }),
-            viewer: cx.new(|cx| Viewer::new(project, playhead.clone(), cx)),
+            viewer: cx.new(|cx| Viewer::new(project, playhead.clone(), window, cx)),
             timeline: cx.new(|cx| {
                 let mut timeline = TimelinePanel::new(editor.clone(), playhead.clone(), cx);
                 timeline.return_focus_to(timeline_focus_return);

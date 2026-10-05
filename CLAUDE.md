@@ -330,7 +330,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   renderer. The apostrophe key toggles safe-area outlines at 90 % and 80 % of the frame. A gap in the timeline shows black (`Picture::Black`), and a clip that is deleted or
   moved off its track blacks the picture at once. A finished render is shown only while the
   playhead is still at it (when paused it must also still match the wanted frame). One job runs at a time, so while scrubbing only the newest request runs next, and the viewer
-  releases each replaced frame from the GPUI atlas with `Window::drop_image`. While playing, it
+  releases each replaced frame from the GPUI atlas with `Window::drop_image` as soon as it is
+  replaced, deferred out of the current update through the window handle the viewer keeps. While playing, it
   asks for the frame at the time it will reach the screen instead of the playhead's: the playhead
   plus the render latency (a smoothed average of recent jobs that decoded something: a job whose
   layers all came from the decoders' caches or from remembered failures is left out) times the
