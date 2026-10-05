@@ -3,6 +3,7 @@ use std::{num::NonZeroU32, path::PathBuf};
 use thiserror::Error;
 
 mod edits;
+mod markers;
 
 use crate::{
     media::MediaInfo,
@@ -65,10 +66,14 @@ pub enum TrackKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClipId(pub u64);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MarkerId(pub u64);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NextIds {
     pub asset: AssetId,
     pub clip: ClipId,
+    pub marker: MarkerId,
 }
 
 impl NextIds {
@@ -80,10 +85,15 @@ impl NextIds {
         id < self.clip
     }
 
+    pub fn has_issued_marker(&self, id: MarkerId) -> bool {
+        id < self.marker
+    }
+
     pub fn covering(self, other: Self) -> Self {
         Self {
             asset: self.asset.max(other.asset),
             clip: self.clip.max(other.clip),
+            marker: self.marker.max(other.marker),
         }
     }
 
@@ -96,6 +106,12 @@ impl NextIds {
     fn take_clip(&mut self) -> ClipId {
         let id = self.clip;
         self.clip = ClipId(id.0 + 1);
+        id
+    }
+
+    fn take_marker(&mut self) -> MarkerId {
+        let id = self.marker;
+        self.marker = MarkerId(id.0 + 1);
         id
     }
 }
@@ -187,6 +203,12 @@ pub enum EditError {
     LastTrack(TrackKind),
     #[error("cannot swap a {first:?} track with a {second:?} track")]
     MixedTrackKinds { first: TrackKind, second: TrackKind },
+    #[error("there is no marker {0:?}")]
+    UnknownMarker(MarkerId),
+    #[error("the in point must come before the out point")]
+    InvalidInOut,
+    #[error("track {0} is locked")]
+    TrackLocked(usize),
     #[error("clip {0:?} is named more than once")]
     RepeatedClip(ClipId),
     #[error("clips {left:?} and {right:?} do not meet on one track")]
@@ -210,9 +232,22 @@ impl From<InsertError> for EditError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TrackHeight {
+    Compact,
+    #[default]
+    Normal,
+    Tall,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Track {
     pub kind: TrackKind,
+    pub name: String,
+    pub locked: bool,
+    pub muted: bool,
+    pub solo: bool,
+    pub height: TrackHeight,
     clips: Vec<Clip>,
 }
 
@@ -220,6 +255,11 @@ impl Track {
     pub fn new(kind: TrackKind) -> Self {
         Self {
             kind,
+            name: String::new(),
+            locked: false,
+            muted: false,
+            solo: false,
+            height: TrackHeight::default(),
             clips: Vec::new(),
         }
     }
@@ -389,12 +429,22 @@ impl Timeline {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Marker {
+    pub id: MarkerId,
+    pub time: Time,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Project {
     pub name: String,
     pub settings: SequenceSettings,
     pub assets: Vec<Asset>,
     pub timeline: Timeline,
+    pub markers: Vec<Marker>,
+    pub in_point: Option<Time>,
+    pub out_point: Option<Time>,
     pub next_ids: NextIds,
 }
 
@@ -407,6 +457,9 @@ impl Project {
             timeline: Timeline {
                 tracks: vec![Track::new(TrackKind::Video), Track::new(TrackKind::Audio)],
             },
+            markers: Vec::new(),
+            in_point: None,
+            out_point: None,
             next_ids: NextIds::default(),
         }
     }
@@ -467,7 +520,9 @@ impl Project {
             .tracks
             .get(track)
             .ok_or(EditError::UnknownTrack(track))?;
-        if asset.has_stream(track_ref.kind) {
+        if track_ref.locked {
+            Err(EditError::TrackLocked(track))
+        } else if asset.has_stream(track_ref.kind) {
             Ok(track_ref)
         } else {
             Err(EditError::MissingStream(track_ref.kind))
@@ -475,9 +530,12 @@ impl Project {
     }
 
     fn located_clip(&self, id: ClipId) -> Result<(usize, Clip), EditError> {
-        self.find_clip(id)
-            .map(|(track, clip)| (track, *clip))
-            .ok_or(EditError::UnknownClip(id))
+        let (track, clip) = self.find_clip(id).ok_or(EditError::UnknownClip(id))?;
+        if self.timeline.tracks[track].locked {
+            Err(EditError::TrackLocked(track))
+        } else {
+            Ok((track, *clip))
+        }
     }
 
     fn whole_clip(&self, asset: AssetId, track: usize, start: Time) -> Result<Clip, EditError> {
@@ -508,9 +566,10 @@ impl Project {
         track: usize,
         start: Time,
     ) -> Result<Clip, EditError> {
+        let previewed = self.clip_for(asset, track, start)?;
         let clip = Clip {
             id: self.next_ids.take_clip(),
-            ..self.clip_for(asset, track, start)?
+            ..previewed
         };
         self.timeline.tracks[track].insert(clip)?;
         Ok(clip)
@@ -1492,5 +1551,59 @@ mod tests {
             [used]
         );
         assert!(project.prune_assets().is_empty());
+    }
+
+    #[test]
+    fn a_locked_track_refuses_every_edit_of_its_clips() {
+        let (mut project, asset, first, _) = two_clip_project();
+        let other = project.timeline.add_track(TrackKind::Video);
+        let moved_in = project.place_clip(asset, other, Time::ZERO).unwrap().id;
+        project.timeline.tracks[0].locked = true;
+
+        let before = project.clone();
+
+        assert_eq!(
+            project.place_clip(asset, 0, Time::from_seconds(40)),
+            Err(EditError::TrackLocked(0))
+        );
+        assert_eq!(
+            project.move_clip(first, other, Time::from_seconds(50)),
+            Err(EditError::TrackLocked(0))
+        );
+        assert_eq!(
+            project.move_clip(moved_in, 0, Time::from_seconds(50)),
+            Err(EditError::TrackLocked(0))
+        );
+        assert_eq!(
+            project.trim_clip(first, ClipEdge::End, Time::from_seconds(4)),
+            Err(EditError::TrackLocked(0))
+        );
+        assert_eq!(
+            project.split_clip(first, Time::from_seconds(4)),
+            Err(EditError::TrackLocked(0))
+        );
+        assert_eq!(project.delete_clip(first), Err(EditError::TrackLocked(0)));
+        assert_eq!(
+            project.ripple_delete_clip(first),
+            Err(EditError::TrackLocked(0))
+        );
+        assert_eq!(
+            project.delete_clips(&[first, moved_in]),
+            Err(EditError::TrackLocked(0))
+        );
+        assert_eq!(project, before);
+
+        project.timeline.tracks[0].locked = false;
+
+        assert!(project.delete_clip(first).is_ok());
+    }
+
+    #[test]
+    fn tracks_start_unnamed_unlocked_and_audible() {
+        let track = Track::new(TrackKind::Audio);
+
+        assert_eq!(track.name, "");
+        assert!(!track.locked && !track.muted && !track.solo);
+        assert_eq!(track.height, TrackHeight::Normal);
     }
 }

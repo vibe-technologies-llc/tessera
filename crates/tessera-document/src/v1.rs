@@ -6,8 +6,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
-    self as model, AssetId, ClipId, FrameRate, InsertError, MediaInfo, NextIds, Time, TimeRange,
-    Timeline,
+    self as model, AssetId, ClipId, FrameRate, InsertError, MarkerId, MediaInfo, NextIds, Time,
+    TimeRange, Timeline,
 };
 
 use crate::{FormatError, ValidationError};
@@ -19,8 +19,28 @@ pub struct Project {
     settings: SequenceSettings,
     next_asset_id: u64,
     next_clip_id: u64,
+    next_marker_id: u64,
     assets: Vec<Asset>,
     tracks: Vec<Track>,
+    markers: Vec<Marker>,
+    in_point_flicks: Option<i64>,
+    out_point_flicks: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Marker {
+    id: u64,
+    time_flicks: i64,
+    name: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TrackHeight {
+    Compact,
+    Normal,
+    Tall,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +97,11 @@ enum TrackKind {
 #[serde(deny_unknown_fields)]
 struct Track {
     kind: TrackKind,
+    name: String,
+    locked: bool,
+    muted: bool,
+    solo: bool,
+    height: TrackHeight,
     clips: Vec<Clip>,
 }
 
@@ -99,12 +124,16 @@ impl TryFrom<&model::Project> for Project {
             settings: project.settings.into(),
             next_asset_id: project.next_ids.asset.0,
             next_clip_id: project.next_ids.clip.0,
+            next_marker_id: project.next_ids.marker.0,
             assets: project
                 .assets
                 .iter()
                 .map(Asset::try_from)
                 .collect::<Result<_, _>>()?,
             tracks: project.timeline.tracks.iter().map(Track::from).collect(),
+            markers: project.markers.iter().map(Marker::from).collect(),
+            in_point_flicks: project.in_point.map(Time::flicks),
+            out_point_flicks: project.out_point.map(Time::flicks),
         })
     }
 }
@@ -184,10 +213,45 @@ impl From<TrackKind> for model::TrackKind {
     }
 }
 
+impl From<&model::Marker> for Marker {
+    fn from(marker: &model::Marker) -> Self {
+        Self {
+            id: marker.id.0,
+            time_flicks: marker.time.flicks(),
+            name: marker.name.clone(),
+        }
+    }
+}
+
+impl From<model::TrackHeight> for TrackHeight {
+    fn from(height: model::TrackHeight) -> Self {
+        match height {
+            model::TrackHeight::Compact => Self::Compact,
+            model::TrackHeight::Normal => Self::Normal,
+            model::TrackHeight::Tall => Self::Tall,
+        }
+    }
+}
+
+impl From<TrackHeight> for model::TrackHeight {
+    fn from(height: TrackHeight) -> Self {
+        match height {
+            TrackHeight::Compact => Self::Compact,
+            TrackHeight::Normal => Self::Normal,
+            TrackHeight::Tall => Self::Tall,
+        }
+    }
+}
+
 impl From<&model::Track> for Track {
     fn from(track: &model::Track) -> Self {
         Self {
             kind: track.kind.into(),
+            name: track.name.clone(),
+            locked: track.locked,
+            muted: track.muted,
+            solo: track.solo,
+            height: track.height.into(),
             clips: track.clips().iter().map(Clip::from).collect(),
         }
     }
@@ -214,9 +278,13 @@ impl TryFrom<Project> for model::Project {
             settings: project.settings.try_into()?,
             assets: Vec::with_capacity(project.assets.len()),
             timeline: Timeline::default(),
+            markers: Vec::with_capacity(project.markers.len()),
+            in_point: project.in_point_flicks.map(Time::from_flicks),
+            out_point: project.out_point_flicks.map(Time::from_flicks),
             next_ids: NextIds {
                 asset: AssetId(project.next_asset_id),
                 clip: ClipId(project.next_clip_id),
+                marker: MarkerId(project.next_marker_id),
             },
         };
         for asset in project.assets {
@@ -249,6 +317,44 @@ impl TryFrom<Project> for model::Project {
                 });
             }
             rebuilt.timeline.tracks.push(track);
+        }
+        let mut marker_ids = HashSet::new();
+        for marker in project.markers {
+            let id = MarkerId(marker.id);
+            if !marker_ids.insert(id) {
+                return Err(ValidationError::DuplicateMarker(id));
+            }
+            if !rebuilt.next_ids.has_issued_marker(id) {
+                return Err(ValidationError::UnissuedMarker {
+                    marker: id,
+                    next: rebuilt.next_ids.marker,
+                });
+            }
+            if marker.time_flicks < 0 {
+                return Err(ValidationError::NegativeMarker {
+                    marker: id,
+                    flicks: marker.time_flicks,
+                });
+            }
+            rebuilt.markers.push(model::Marker {
+                id,
+                time: Time::from_flicks(marker.time_flicks),
+                name: marker.name,
+            });
+        }
+        rebuilt
+            .markers
+            .sort_by_key(|marker| (marker.time, marker.id));
+        let in_out_valid = [rebuilt.in_point, rebuilt.out_point]
+            .into_iter()
+            .flatten()
+            .all(|point| point >= Time::ZERO)
+            && match (rebuilt.in_point, rebuilt.out_point) {
+                (Some(start), Some(end)) => start < end,
+                _ => true,
+            };
+        if !in_out_valid {
+            return Err(ValidationError::InOutPoints);
         }
         for kind in [model::TrackKind::Video, model::TrackKind::Audio] {
             if !rebuilt
@@ -405,6 +511,11 @@ impl Stream {
 impl Track {
     fn rebuilt(self, project: &model::Project) -> Result<model::Track, ValidationError> {
         let mut track = model::Track::new(self.kind.into());
+        track.name = self.name;
+        track.locked = self.locked;
+        track.muted = self.muted;
+        track.solo = self.solo;
+        track.height = self.height.into();
         for clip in self.clips {
             let clip = clip.rebuilt(project, track.kind)?;
             track.insert(clip).map_err(|refused| match refused {
@@ -484,6 +595,18 @@ mod tests {
         })
     }
 
+    fn track(kind: &str, name: &str, clips: Vec<Value>) -> Value {
+        json!({
+            "kind": kind,
+            "name": name,
+            "locked": false,
+            "muted": false,
+            "solo": false,
+            "height": "normal",
+            "clips": clips,
+        })
+    }
+
     fn valid() -> Value {
         json!({
             "name": "Checked",
@@ -495,6 +618,13 @@ mod tests {
             },
             "next_asset_id": 8,
             "next_clip_id": 3,
+            "next_marker_id": 5,
+            "markers": [
+                { "id": 4, "time_flicks": 6 * SECOND, "name": "later" },
+                { "id": 1, "time_flicks": 2 * SECOND, "name": "earlier" },
+            ],
+            "in_point_flicks": SECOND,
+            "out_point_flicks": 9 * SECOND,
             "assets": [
                 {
                     "id": 4,
@@ -527,8 +657,8 @@ mod tests {
                 },
             ],
             "tracks": [
-                { "kind": "video", "clips": [clip(0, 4, 0, 0, 4), clip(1, 4, 4, 4, 6)] },
-                { "kind": "audio", "clips": [clip(2, 7, 0, 0, 30)] },
+                track("video", "Main", vec![clip(0, 4, 0, 0, 4), clip(1, 4, 4, 4, 6)]),
+                track("audio", "", vec![clip(2, 7, 0, 0, 30)]),
             ],
         })
     }
@@ -554,7 +684,8 @@ mod tests {
             project.next_ids,
             NextIds {
                 asset: AssetId(8),
-                clip: ClipId(3)
+                clip: ClipId(3),
+                marker: MarkerId(5)
             }
         );
         let ids: Vec<Vec<ClipId>> = project
@@ -850,6 +981,71 @@ mod tests {
         assert_eq!(
             refused(|document| document["tracks"] = json!([])),
             ValidationError::NoTrack(Video)
+        );
+    }
+
+    #[test]
+    fn markers_and_in_out_points_are_rebuilt_in_order() {
+        let project = rebuilt(valid()).unwrap();
+
+        assert_eq!(
+            project
+                .markers
+                .iter()
+                .map(|marker| (marker.id, marker.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(MarkerId(1), "earlier"), (MarkerId(4), "later")]
+        );
+        assert_eq!(project.in_point, Some(Time::from_seconds(1)));
+        assert_eq!(project.out_point, Some(Time::from_seconds(9)));
+        assert_eq!(project.timeline.tracks[0].name, "Main");
+    }
+
+    #[test]
+    fn markers_need_unique_issued_ids_and_times_from_zero() {
+        assert_eq!(
+            refused(|document| document["markers"][1]["id"] = json!(4)),
+            ValidationError::DuplicateMarker(MarkerId(4))
+        );
+        assert_eq!(
+            refused(|document| document["next_marker_id"] = json!(4)),
+            ValidationError::UnissuedMarker {
+                marker: MarkerId(4),
+                next: MarkerId(4)
+            }
+        );
+        assert_eq!(
+            refused(|document| document["markers"][0]["time_flicks"] = json!(-1)),
+            ValidationError::NegativeMarker {
+                marker: MarkerId(4),
+                flicks: -1
+            }
+        );
+    }
+
+    #[test]
+    fn the_in_point_must_come_before_the_out_point_and_neither_before_zero() {
+        for (start, end) in [(9, 9), (9, 1)] {
+            assert_eq!(
+                refused(|document| {
+                    document["in_point_flicks"] = json!(start * SECOND);
+                    document["out_point_flicks"] = json!(end * SECOND);
+                }),
+                ValidationError::InOutPoints
+            );
+        }
+        assert_eq!(
+            refused(|document| document["in_point_flicks"] = json!(-1)),
+            ValidationError::InOutPoints
+        );
+        assert!(
+            rebuilt({
+                let mut document = valid();
+                document["in_point_flicks"] = Value::Null;
+                document["out_point_flicks"] = json!(SECOND);
+                document
+            })
+            .is_ok()
         );
     }
 }

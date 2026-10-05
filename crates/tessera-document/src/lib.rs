@@ -235,6 +235,11 @@ mod tests {
         );
         project.place_clip(asset, 0, Time::from_seconds(1)).unwrap();
         project.place_clip(asset, 1, Time::from_seconds(1)).unwrap();
+        project.add_marker(Time::from_seconds(4), "Cut here");
+        project.set_in_point(Time::from_seconds(1)).unwrap();
+        project.set_out_point(Time::from_seconds(8)).unwrap();
+        project.timeline.tracks[0].name = "Interview".into();
+        project.timeline.tracks[1].muted = true;
         project
     }
 
@@ -295,6 +300,15 @@ mod tests {
         project
             .place_clip(music, second_audio, Time::from_seconds(3))
             .unwrap();
+        project.add_marker(Time::from_seconds(20), "Second \"act\"");
+        let early = project.add_marker(Time::from_seconds(30), "");
+        project.move_marker(early, Time::from_seconds(2)).unwrap();
+        project.set_out_point(Time::from_seconds(25)).unwrap();
+        let track = &mut project.timeline.tracks[upper];
+        track.locked = true;
+        track.solo = true;
+        track.height = tessera_timeline::TrackHeight::Tall;
+        project.timeline.tracks[second_audio].height = tessera_timeline::TrackHeight::Compact;
         project
     }
 

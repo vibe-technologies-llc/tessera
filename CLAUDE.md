@@ -68,7 +68,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   moves the later clips with it, `roll_clips` moves the cut between two touching clips, `slip_clip`
   moves a clip's source window and `slide_clip` moves a clip while its touching neighbours give or
   take the time. These live in `project/edits.rs`, and every one that spans several clips restores
-  the timeline and the id counters when it fails. `ripple_delete_clip` pulls the later
+  the timeline and the id counters when it fails. A `Track` carries a `name`
+  (empty shows the default label), `locked`, `muted`, `solo` and a `TrackHeight`; a locked track
+  refuses every edit of its clips and every placement onto it (`TrackLocked`), through
+  `located_clip` and `track_accepting`. The project holds `markers` (sorted by time, with
+  `MarkerId`s from `NextIds` that are never reused; `add_marker`, `move_marker`, `rename_marker`,
+  `remove_marker`, `next_marker_after`, `previous_marker_before`) and an `in_point` and
+  `out_point` that stay in order (`set_in_point`, `set_out_point`, `clear_in_out`). `ripple_delete_clip` pulls the later
   clips on the same track back by the deleted clip's length, while `delete_clip` leaves a gap.
   `Timeline::add_track` inserts a track after the last one of its kind. `remove_track` only takes an
   empty track that isn't the last of its kind, and `swap_tracks` only swaps tracks of the same kind.

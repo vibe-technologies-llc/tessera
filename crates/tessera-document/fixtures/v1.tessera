@@ -14,6 +14,7 @@
     },
     "next_asset_id": 1,
     "next_clip_id": 2,
+    "next_marker_id": 1,
     "assets": [
       {
         "id": 0,
@@ -44,6 +45,11 @@
     "tracks": [
       {
         "kind": "video",
+        "name": "Interview",
+        "locked": false,
+        "muted": false,
+        "solo": false,
+        "height": "normal",
         "clips": [
           {
             "id": 0,
@@ -56,6 +62,11 @@
       },
       {
         "kind": "audio",
+        "name": "",
+        "locked": false,
+        "muted": true,
+        "solo": false,
+        "height": "normal",
         "clips": [
           {
             "id": 1,
@@ -66,6 +77,15 @@
           }
         ]
       }
-    ]
+    ],
+    "markers": [
+      {
+        "id": 0,
+        "time_flicks": 2822400000,
+        "name": "Cut here"
+      }
+    ],
+    "in_point_flicks": 705600000,
+    "out_point_flicks": 5644800000
   }
 }

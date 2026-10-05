@@ -14,11 +14,7 @@ impl Project {
 
     fn known_clips(&self, ids: &[ClipId]) -> Result<BTreeSet<ClipId>, EditError> {
         ids.iter()
-            .map(|&id| {
-                self.find_clip(id)
-                    .map(|_| id)
-                    .ok_or(EditError::UnknownClip(id))
-            })
+            .map(|&id| self.located_clip(id).map(|_| id))
             .collect()
     }
 

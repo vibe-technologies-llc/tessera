@@ -1,7 +1,7 @@
 use std::{io, path::PathBuf};
 
 use serde_json::Value;
-use tessera_timeline::{AssetId, ClipId, InvalidClip, OverlappingClip, TrackKind};
+use tessera_timeline::{AssetId, ClipId, InvalidClip, MarkerId, OverlappingClip, TrackKind};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -121,6 +121,14 @@ pub enum ValidationError {
         #[source]
         source: OverlappingClip,
     },
+    #[error("marker {} appears more than once", .0.0)]
+    DuplicateMarker(MarkerId),
+    #[error("marker {} is not below the next marker id {}", .marker.0, .next.0)]
+    UnissuedMarker { marker: MarkerId, next: MarkerId },
+    #[error("marker {} sits at {flicks} flicks, before the start of the timeline", .marker.0)]
+    NegativeMarker { marker: MarkerId, flicks: i64 },
+    #[error("the in and out points are before zero or not in order")]
+    InOutPoints,
     #[error("the timeline has no {0:?} track")]
     NoTrack(TrackKind),
 }

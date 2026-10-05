@@ -2,8 +2,6 @@
 
 - Link the video and audio clips placed from one asset, so one drop places both and move, trim,
   split, delete and ripple delete keep them in sync (`ripple_delete_clip` shifts only its own track)
-- Markers and in/out points stored in the project
-- Track names, lock, mute, solo and height stored on `Track`
 - Give still images and other assets without a duration a default clip length, instead of
   `clip_for` refusing them with `NoDuration`
 - Carry rotation, sample aspect ratio, pixel format, stream disposition and per-stream start time in
