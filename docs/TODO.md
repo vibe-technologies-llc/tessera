@@ -4,8 +4,6 @@
   split, delete and ripple delete keep them in sync (`ripple_delete_clip` shifts only its own track)
 - Edit several clips in one command (move, delete, ripple delete) for multi-selection
 - Insert, overwrite, roll, slip, slide and ripple trim edits
-- Place an existing `Clip` at a track and start, for copy, paste and duplicate
-- Remove assets from the project, refused while a clip uses them, and prune unused ones
 - Markers and in/out points stored in the project
 - Track names, lock, mute, solo and height stored on `Track`
 - Give still images and other assets without a duration a default clip length, instead of

@@ -55,7 +55,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `move_clip` and `trim_clip` apply it. A move is refused where it would overlap or where the target
   track's kind has no matching stream. A trim is clamped instead, between the neighbouring clips,
   the ends of the media and a minimum length of one frame. `split_clip` cuts a clip strictly inside
-  it, keeping the id on the head and giving the tail a new one. `ripple_delete_clip` pulls the later
+  it, keeping the id on the head and giving the tail a new one. `pasted_clip` and `paste_clip`
+  place a copy of an existing `Clip` (its asset and source range) at a track and start under the
+  next clip id, with the same checks as placing an asset. `remove_asset` refuses an asset a clip
+  still uses (`AssetInUse`), `prune_assets` removes every unused one and returns them, and a
+  removed asset's id is never given out again. `ripple_delete_clip` pulls the later
   clips on the same track back by the deleted clip's length, while `delete_clip` leaves a gap.
   `Timeline::add_track` inserts a track after the last one of its kind. `remove_track` only takes an
   empty track that isn't the last of its kind, and `swap_tracks` only swaps tracks of the same kind.

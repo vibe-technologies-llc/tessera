@@ -173,6 +173,8 @@ pub enum EditError {
     UnknownAsset(AssetId),
     #[error("there is no clip {0:?}")]
     UnknownClip(ClipId),
+    #[error("asset {0:?} is still used by a clip")]
+    AssetInUse(AssetId),
     #[error("there is no track {0}")]
     UnknownTrack(usize),
     #[error("{time:?} does not fall inside clip {clip:?}")]
@@ -413,6 +415,34 @@ impl Project {
         id
     }
 
+    pub fn remove_asset(&mut self, id: AssetId) -> Result<Asset, EditError> {
+        let index = self
+            .assets
+            .iter()
+            .position(|asset| asset.id == id)
+            .ok_or(EditError::UnknownAsset(id))?;
+        if self.is_asset_used(id) {
+            return Err(EditError::AssetInUse(id));
+        }
+        Ok(self.assets.remove(index))
+    }
+
+    pub fn prune_assets(&mut self) -> Vec<Asset> {
+        let (used, unused) = std::mem::take(&mut self.assets)
+            .into_iter()
+            .partition(|asset| self.is_asset_used(asset.id));
+        self.assets = used;
+        unused
+    }
+
+    pub fn is_asset_used(&self, id: AssetId) -> bool {
+        self.timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips())
+            .any(|clip| clip.asset == id)
+    }
+
     pub fn find_clip(&self, id: ClipId) -> Option<(usize, &Clip)> {
         self.timeline
             .tracks
@@ -470,6 +500,35 @@ impl Project {
         };
         self.timeline.tracks[track].insert(clip)?;
         Ok(clip)
+    }
+
+    pub fn pasted_clip(&self, clip: &Clip, track: usize, start: Time) -> Result<Clip, EditError> {
+        let asset = self
+            .asset(clip.asset)
+            .ok_or(EditError::UnknownAsset(clip.asset))?;
+        let track_ref = self.track_accepting(asset, track)?;
+        let pasted = Clip {
+            id: self.next_ids.clip,
+            start: start.max(Time::ZERO),
+            ..*clip
+        };
+        track_ref.check_insert(&pasted)?;
+        Ok(pasted)
+    }
+
+    pub fn paste_clip(
+        &mut self,
+        clip: &Clip,
+        track: usize,
+        start: Time,
+    ) -> Result<Clip, EditError> {
+        let previewed = self.pasted_clip(clip, track, start)?;
+        let pasted = Clip {
+            id: self.next_ids.take_clip(),
+            ..previewed
+        };
+        self.timeline.tracks[track].insert(pasted)?;
+        Ok(pasted)
     }
 
     pub fn moved_clip(&self, id: ClipId, track: usize, start: Time) -> Result<Clip, EditError> {
@@ -1293,5 +1352,127 @@ mod tests {
             Some(upper)
         );
         assert!(project.timeline.tracks[0].clips().is_empty());
+    }
+
+    #[test]
+    fn pasting_copies_a_clip_under_a_new_id() {
+        let (mut project, _, first, _) = two_clip_project();
+        let original = project.find_clip(first).map(|(_, clip)| *clip).unwrap();
+        let next = project.next_ids.clip;
+
+        let preview = project
+            .pasted_clip(&original, 0, Time::from_seconds(10))
+            .unwrap();
+        let pasted = project
+            .paste_clip(&original, 0, Time::from_seconds(10))
+            .unwrap();
+
+        assert_eq!(preview, pasted);
+        assert_eq!(pasted.id, next);
+        assert_eq!(pasted.asset, original.asset);
+        assert_eq!(pasted.source, original.source);
+        assert_eq!(pasted.start, Time::from_seconds(10));
+        assert_eq!(project.next_ids.clip, ClipId(next.0 + 1));
+        assert_eq!(
+            project.find_clip(first).map(|(_, clip)| *clip),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn pasting_follows_the_placement_rules() {
+        let (mut project, _, first, _) = two_clip_project();
+        let original = project.find_clip(first).map(|(_, clip)| *clip).unwrap();
+        let before = project.clone();
+
+        assert!(matches!(
+            project.paste_clip(&original, 0, Time::from_seconds(5)),
+            Err(EditError::Overlapping(_))
+        ));
+        assert_eq!(
+            project.paste_clip(&original, 1, Time::from_seconds(5)),
+            Err(EditError::MissingStream(TrackKind::Audio))
+        );
+        assert_eq!(
+            project.paste_clip(&original, 7, Time::from_seconds(5)),
+            Err(EditError::UnknownTrack(7))
+        );
+        assert_eq!(
+            project.paste_clip(
+                &Clip {
+                    asset: AssetId(9),
+                    ..original
+                },
+                0,
+                Time::from_seconds(10)
+            ),
+            Err(EditError::UnknownAsset(AssetId(9)))
+        );
+        assert_eq!(project, before);
+
+        let clamped = project
+            .paste_clip(&original, 0, Time::from_seconds(-40))
+            .unwrap_err();
+        assert!(matches!(clamped, EditError::Overlapping(_)));
+    }
+
+    #[test]
+    fn assets_in_use_cannot_be_removed() {
+        let (mut project, asset, first, second) = two_clip_project();
+        let spare = project.add_asset("b.mkv".into(), video_info(2));
+
+        assert_eq!(
+            project.remove_asset(asset),
+            Err(EditError::AssetInUse(asset))
+        );
+        assert_eq!(
+            project.remove_asset(AssetId(9)),
+            Err(EditError::UnknownAsset(AssetId(9)))
+        );
+        assert_eq!(project.remove_asset(spare).map(|asset| asset.id), Ok(spare));
+        assert_eq!(project.asset(spare), None);
+
+        project.delete_clip(first).unwrap();
+        assert!(project.is_asset_used(asset));
+
+        project.delete_clip(second).unwrap();
+        assert!(!project.is_asset_used(asset));
+        assert_eq!(project.remove_asset(asset).map(|asset| asset.id), Ok(asset));
+        assert!(project.assets.is_empty());
+    }
+
+    #[test]
+    fn removed_asset_ids_are_not_given_out_again() {
+        let mut project = Project::new("test");
+
+        let first = project.add_asset("a.mkv".into(), video_info(1));
+        project.remove_asset(first).unwrap();
+        let second = project.add_asset("b.mkv".into(), video_info(1));
+
+        assert_ne!(first, second);
+        assert!(project.next_ids.has_issued_asset(first));
+    }
+
+    #[test]
+    fn pruning_removes_only_the_unused_assets() {
+        let (mut project, used, _, _) = two_clip_project();
+        let first_spare = project.add_asset("b.mkv".into(), video_info(2));
+        let second_spare = project.add_asset("c.opus".into(), audio_info(2));
+
+        let pruned = project.prune_assets();
+
+        assert_eq!(
+            pruned.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            [first_spare, second_spare]
+        );
+        assert_eq!(
+            project
+                .assets
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            [used]
+        );
+        assert!(project.prune_assets().is_empty());
     }
 }

@@ -7,7 +7,10 @@ pub const HISTORY_DEPTH: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
     ImportMedia,
+    RemoveAsset,
+    PruneAssets,
     PlaceClip,
+    PasteClip,
     MoveClip,
     TrimClip,
     SplitClips,
@@ -22,7 +25,10 @@ impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::ImportMedia => "Import Media",
+            Self::RemoveAsset => "Remove Asset",
+            Self::PruneAssets => "Prune Unused Assets",
             Self::PlaceClip => "Place Clip",
+            Self::PasteClip => "Paste Clip",
             Self::MoveClip => "Move Clip",
             Self::TrimClip => "Trim Clip",
             Self::SplitClips => "Split Clips",
@@ -387,5 +393,34 @@ mod tests {
         assert_ne!(first, second);
         assert!(![first, second, tail].contains(&retail));
         assert_ne!(imported, reimported);
+    }
+
+    #[test]
+    fn undoing_a_pruned_asset_brings_it_back() {
+        let mut history = History::default();
+        let mut project = clip_project();
+
+        let removed = history
+            .apply(Command::PruneAssets, &mut project, |project| {
+                Ok::<_, EditError>(project.prune_assets())
+            })
+            .unwrap();
+
+        assert_eq!(removed.len(), 1);
+        assert!(project.assets.is_empty());
+        assert_eq!(history.next_undo(), Some(Command::PruneAssets));
+
+        history.undo(&mut project);
+
+        assert_eq!(project.assets, removed);
+
+        let refused = history.apply(Command::RemoveAsset, &mut project, |project| {
+            project.place_clip(removed[0].id, 0, Time::ZERO)?;
+            project.remove_asset(removed[0].id)
+        });
+
+        assert_eq!(refused, Err(EditError::AssetInUse(removed[0].id)));
+        assert_eq!(project.assets, removed);
+        assert!(project.timeline.tracks[0].clips().is_empty());
     }
 }
