@@ -31,6 +31,7 @@ const SAMPLE_BYTES: usize = size_of::<f32>();
 const FRAME_BYTES: usize = CHANNELS * SAMPLE_BYTES;
 const BLOCK_FRAMES: usize = 1024;
 const QUEUED_AHEAD: Duration = Duration::from_millis(200);
+const KEPT_ON_FLUSH: Duration = Duration::from_millis(20);
 const STREAM_NAME: &str = "Tessera";
 const THREAD_NAME: &str = "tessera-audio-output";
 const FEEDER_THREAD_NAME: &str = "tessera-audio-feeder";
@@ -51,7 +52,14 @@ struct Shared {
 struct State {
     queue: VecDeque<f32>,
     clock: Clock,
+    generation: u64,
     stopping: bool,
+}
+
+impl State {
+    fn next_frame(&self) -> i64 {
+        self.clock.consumed + (self.queue.len() / CHANNELS) as i64
+    }
 }
 
 #[derive(Debug, Default)]
@@ -72,7 +80,7 @@ type Ready = mpsc::Sender<Result<(), Error>>;
 impl Output {
     pub fn start(
         sample_rate: NonZeroU32,
-        mut source: impl FnMut(&mut [f32]) + Send + 'static,
+        mut source: impl FnMut(i64, &mut [f32]) + Send + 'static,
     ) -> Result<Self, Error> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -119,6 +127,11 @@ impl Output {
             .clock
             .position(Instant::now(), self.sample_rate)
     }
+
+    pub fn flush(&self) {
+        self.shared
+            .flush(frames_in(KEPT_ON_FLUSH, self.sample_rate) * CHANNELS);
+    }
 }
 
 impl Drop for Output {
@@ -136,6 +149,19 @@ impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn flush(&self, kept_samples: usize) {
+        {
+            let mut state = self.lock();
+            state.queue.truncate(kept_samples);
+            state.generation += 1;
+        }
+        self.wake.notify_all();
+    }
+}
+
+fn frames_in(duration: Duration, sample_rate: NonZeroU32) -> usize {
+    Time::from_duration(duration).to_samples(sample_rate) as usize
 }
 
 impl Clock {
@@ -158,11 +184,11 @@ impl Clock {
     }
 }
 
-fn feed(shared: &Shared, sample_rate: NonZeroU32, source: &mut impl FnMut(&mut [f32])) {
-    let ahead = Time::from_duration(QUEUED_AHEAD).to_samples(sample_rate) as usize * CHANNELS;
+fn feed(shared: &Shared, sample_rate: NonZeroU32, source: &mut impl FnMut(i64, &mut [f32])) {
+    let ahead = frames_in(QUEUED_AHEAD, sample_rate) * CHANNELS;
     let mut block = vec![0.0; BLOCK_FRAMES * CHANNELS];
     loop {
-        {
+        let (first, generation) = {
             let mut state = shared.lock();
             while !state.stopping && state.queue.len() >= ahead {
                 state = shared
@@ -173,9 +199,13 @@ fn feed(shared: &Shared, sample_rate: NonZeroU32, source: &mut impl FnMut(&mut [
             if state.stopping {
                 return;
             }
+            (state.next_frame(), state.generation)
+        };
+        source(first, &mut block);
+        let mut state = shared.lock();
+        if state.generation == generation {
+            state.queue.extend(&block);
         }
-        source(&mut block);
-        shared.lock().queue.extend(&block);
     }
 }
 
@@ -311,6 +341,100 @@ mod tests {
         assert_eq!(fill(&mut queue, &mut bytes), 2);
         assert_eq!(decoded(&bytes), [0.1, 0.2, 0.3, 0.4, 0.0, 0.0]);
         assert_eq!(queue, [0.5]);
+    }
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            wake: Condvar::new(),
+        })
+    }
+
+    fn feed_until(
+        shared: &Arc<Shared>,
+        blocks: usize,
+        mut source: impl FnMut(i64, &mut [f32]) + Send + 'static,
+    ) -> (Vec<i64>, thread::JoinHandle<()>) {
+        let (rendered, firsts) = mpsc::channel();
+        let feeder = thread::spawn({
+            let shared = shared.clone();
+            move || {
+                let rate = NonZeroU32::new(1_000).unwrap();
+                feed(&shared, rate, &mut |first, block: &mut [f32]| {
+                    source(first, block);
+                    rendered.send(first).ok();
+                });
+            }
+        });
+        let firsts = firsts.iter().take(blocks).collect();
+        (firsts, feeder)
+    }
+
+    fn stop(shared: &Shared, feeder: thread::JoinHandle<()>) {
+        shared.lock().stopping = true;
+        shared.wake.notify_all();
+        feeder.join().unwrap();
+    }
+
+    fn wait_for_queue(shared: &Shared, beyond_frames: usize) -> Vec<f32> {
+        loop {
+            {
+                let state = shared.lock();
+                if state.queue.len() > beyond_frames * CHANNELS {
+                    return state.queue.iter().copied().step_by(CHANNELS).collect();
+                }
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn frame_numbers(first: i64, block: &mut [f32]) {
+        for (offset, frame) in block.chunks_mut(CHANNELS).enumerate() {
+            frame.fill((first + offset as i64) as f32);
+        }
+    }
+
+    #[test]
+    fn a_flush_drops_the_queue_past_what_is_kept_and_refills_from_there() {
+        let shared = shared();
+        let (firsts, feeder) = feed_until(&shared, 1, frame_numbers);
+
+        assert_eq!(firsts, [0]);
+
+        {
+            let mut state = shared.lock();
+            state.queue.drain(..100 * CHANNELS);
+            state.clock.advance(100, 0, Instant::now());
+        }
+        shared.flush(10 * CHANNELS);
+        let queue = wait_for_queue(&shared, 10);
+        stop(&shared, feeder);
+
+        assert_eq!(queue[0], 100.0);
+        assert_eq!(queue[9], 109.0);
+        assert_eq!(queue[10], 110.0);
+        assert_eq!(queue.len(), 10 + BLOCK_FRAMES);
+    }
+
+    #[test]
+    fn a_block_rendered_across_a_flush_is_dropped() {
+        let shared = shared();
+        let mut calls = 0;
+        let (firsts, feeder) = feed_until(&shared, 2, {
+            let shared = shared.clone();
+            move |first, block| {
+                calls += 1;
+                frame_numbers(first + 1_000 * calls, block);
+                if calls == 1 {
+                    shared.flush(0);
+                }
+            }
+        });
+        let queued = wait_for_queue(&shared, 0)[0];
+        stop(&shared, feeder);
+
+        assert_eq!(firsts, [0, 0]);
+        assert_eq!(queued, 2_000.0);
     }
 
     #[test]

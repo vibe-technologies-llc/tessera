@@ -69,7 +69,7 @@ struct Playback {
 
 enum PlaybackClock {
     Wall { started: Instant, offset: Time },
-    Audio(WatchedAudio<TimelinePlayback>),
+    Audio(Box<WatchedAudio<TimelinePlayback>>),
 }
 
 trait ElapsedSource {
@@ -126,7 +126,7 @@ impl PlaybackClock {
             return Self::wall();
         }
         match TimelinePlayback::start(project.clone(), from) {
-            Ok(audio) => Self::Audio(WatchedAudio::new(audio, Instant::now())),
+            Ok(audio) => Self::Audio(Box::new(WatchedAudio::new(audio, Instant::now()))),
             Err(error) => {
                 tracing::warn!(%error, "no audio output, playback follows the wall clock");
                 Self::wall()
@@ -187,7 +187,7 @@ impl Playhead {
             playback.clock = PlaybackClock::start(playback.speed, &project, time);
             playback.from = time;
             playback.sample_rate = sample_rate;
-        } else if let PlaybackClock::Audio(audio) = &playback.clock {
+        } else if let PlaybackClock::Audio(audio) = &mut playback.clock {
             audio.source.update_project(project);
         }
     }
@@ -285,16 +285,16 @@ impl Playhead {
     fn tick(&mut self, cx: &mut Context<Self>) -> bool {
         let project = self.project.read(cx);
         let frame_rate = project.settings.frame_rate;
-        let last = last_frame(project.timeline.duration(), frame_rate);
+        let end = project.timeline.duration();
         let Some(playback) = &mut self.playback else {
             return false;
         };
-        let Some(last) = last else {
+        if end <= Time::ZERO {
             self.pause(cx);
             return false;
-        };
+        }
         let elapsed = playback.clock.elapsed();
-        match advance(playback.from, elapsed, playback.speed, frame_rate, last) {
+        match advance(playback.from, elapsed, playback.speed, frame_rate, end) {
             Advance::To(time) => {
                 self.move_to(time, cx);
                 true
@@ -316,14 +316,16 @@ pub(crate) fn last_frame(end: Time, frame_rate: FrameRate) -> Option<Time> {
     (end > Time::ZERO).then(|| frame_rate.frame_start(end - Time::from_flicks(1)))
 }
 
-fn advance(from: Time, elapsed: Time, speed: Speed, frame_rate: FrameRate, last: Time) -> Advance {
-    let time = frame_rate.frame_start(from + elapsed * speed.factor());
-    if time >= last {
+fn advance(from: Time, elapsed: Time, speed: Speed, frame_rate: FrameRate, end: Time) -> Advance {
+    let exact = from + elapsed * speed.factor();
+    let time = frame_rate.frame_start(exact);
+    let last = frame_rate.frame_start(end - Time::from_flicks(1));
+    if speed.factor() > 0 && exact >= end {
         Advance::StopAt(last)
-    } else if time <= Time::ZERO && speed.factor() < 0 {
+    } else if speed.factor() < 0 && time <= Time::ZERO {
         Advance::StopAt(Time::ZERO)
     } else {
-        Advance::To(time)
+        Advance::To(time.min(last))
     }
 }
 
@@ -376,11 +378,11 @@ mod tests {
     #[test]
     fn playback_advances_by_wall_clock_times_speed_on_frame_starts() {
         let rate = FrameRate::FPS_30;
-        let last = rate.frame_to_time(299);
+        let end = rate.frame_to_time(300);
         let from = rate.frame_to_time(30);
         let advanced = |millis, speed| {
             let elapsed = Time::from_duration(Duration::from_millis(millis));
-            advance(from, elapsed, speed, rate, last)
+            advance(from, elapsed, speed, rate, end)
         };
         assert!(matches!(advanced(0, Speed::FORWARD), Advance::To(time) if time == from));
         assert!(
@@ -395,14 +397,17 @@ mod tests {
     }
 
     #[test]
-    fn playback_stops_at_either_end() {
+    fn playback_plays_through_the_last_frame_and_stops_at_either_end() {
         let rate = FrameRate::FPS_30;
+        let end = rate.frame_to_time(60);
         let last = rate.frame_to_time(59);
         let from = rate.frame_to_time(30);
         let stopped = |millis, speed| {
             let elapsed = Time::from_duration(Duration::from_millis(millis));
-            advance(from, elapsed, speed, rate, last)
+            advance(from, elapsed, speed, rate, end)
         };
+
+        assert!(matches!(stopped(980, Speed::FORWARD), Advance::To(time) if time == last));
         assert!(matches!(stopped(1_000, Speed::FORWARD), Advance::StopAt(time) if time == last));
         assert!(
             matches!(stopped(2_000, Speed::BACKWARD), Advance::StopAt(time) if time == Time::ZERO)

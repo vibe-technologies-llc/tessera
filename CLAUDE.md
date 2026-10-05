@@ -183,13 +183,18 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   each other. Media that fails to open or decode is warned about once per path and stream and
   stays silent. `Output` runs a PipeWire playback stream on its
   own thread, whose process callback copies whole frames out of a shared queue (silence on
-  underrun), and a feeder thread that keeps about 200 ms queued by calling the source closure.
+  underrun), and a feeder thread that keeps about 200 ms queued by calling the source closure
+  with the index of the block's first frame (the frames consumed plus those queued). `flush` cuts
+  the queue to its first 20 ms and bumps a generation, so a block rendered across it is dropped
+  and the next one starts right after what was kept.
   Its `position` is the audio clock: the samples the device has played, taken at each callback
   as the samples consumed minus the stream's delay to the device (`pw_time` delay plus
   resampler buffering), interpolated between callbacks with a monotonic clock, capped at what was
   consumed and never running backwards. Silence from an underrun doesn't advance it.
   `TimelinePlayback` ties a `Mixer` to an `Output` from a start time, reports the time played
-  since then, and picks up a replaced project on the next block. Dropping the `Output` stops the
+  since then, and picks up a replaced project on the next block, flushing the queue when the
+  replacement changes what is heard (timeline, assets or settings; markers and in and out points
+  don't), so an edit is heard within about 20 ms. Dropping the `Output` stops the
   stream thread and joins it, and the feeder exits after its current block.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` for compositing timeline frames. It
   doesn't depend on `tessera-media`: a `Layer` borrows a packed straight-alpha BGRA8 image shaped
@@ -230,8 +235,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   The playhead also runs the transport: space plays and pauses, J/K/L shuttle (each press doubles
   the speed up to 8× in that direction) and the arrow keys step one frame. Playing anchors a
   clock at the start time and a ticker task moves the playhead to the frame start under
-  `anchor + elapsed × speed`, so it never drifts, and stops on the timeline's last frame or at
-  zero. At normal forward speed the clock is a `TimelinePlayback`, so the audio clock drives the
+  `anchor + elapsed × speed`, so it never drifts. Forward it plays on until the timeline's end, so the
+  last frame is heard too, and then stops on that frame; backward it stops at zero. At normal forward speed the clock is a `TimelinePlayback`, so the audio clock drives the
   picture, and the playhead passes each project change on to it. Other speeds, or a failed
   audio output (warned about), use the wall clock and play no sound. An audio clock that stops
   advancing for a second (never started, or the stream died) is warned about and replaced by the

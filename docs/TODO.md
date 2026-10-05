@@ -25,10 +25,7 @@
   thread on it, and joining the stream thread on every pause
 - Play the sound of video clips, through linked audio clips or their own stream
 - Mix the audio tracks, with per-clip gain and per-track volume
-- Flush the queued audio when the project changes while playing, instead of playing up to 200 ms of
-  the old timeline
 - Play sound at shuttle speeds, in reverse and while scrubbing or stepping
-- Play the last frame's sound at the end of the timeline instead of stopping at its start
 - Retry media that failed during playback, and open decoders ahead of clip starts with reused mix
   buffers instead of on the feeder thread at the first block
 - Draw waveforms on audio clips
