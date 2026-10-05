@@ -193,6 +193,8 @@ pub enum EditError {
     UnknownClip(ClipId),
     #[error("asset {0:?} is still used by a clip")]
     AssetInUse(AssetId),
+    #[error("clip {0:?} reaches past the end of the new media")]
+    BeyondMedia(ClipId),
     #[error("there is no track {0}")]
     UnknownTrack(usize),
     #[error("{time:?} does not fall inside clip {clip:?}")]
@@ -508,6 +510,36 @@ impl Project {
             return Err(EditError::AssetInUse(id));
         }
         Ok(self.assets.remove(index))
+    }
+
+    pub fn relink_asset(
+        &mut self,
+        id: AssetId,
+        path: PathBuf,
+        info: MediaInfo,
+    ) -> Result<(), EditError> {
+        let relinked = Asset { id, path, info };
+        for track in &self.timeline.tracks {
+            for clip in track.clips().iter().filter(|clip| clip.asset == id) {
+                if !relinked.has_stream(track.kind) {
+                    return Err(EditError::MissingStream(track.kind));
+                }
+                if relinked
+                    .info
+                    .duration
+                    .is_some_and(|duration| clip.source.end() > duration)
+                {
+                    return Err(EditError::BeyondMedia(clip.id));
+                }
+            }
+        }
+        let slot = self
+            .assets
+            .iter_mut()
+            .find(|asset| asset.id == id)
+            .ok_or(EditError::UnknownAsset(id))?;
+        *slot = relinked;
+        Ok(())
     }
 
     pub fn prune_assets(&mut self) -> Vec<Asset> {
@@ -1677,5 +1709,44 @@ mod tests {
         assert_eq!(previous(10), Some(Time::ZERO));
         assert_eq!(previous(30), Some(Time::from_seconds(22)));
         assert_eq!(previous(99), Some(Time::from_seconds(30)));
+    }
+
+    #[test]
+    fn relinking_swaps_the_media_when_every_clip_still_fits() {
+        let (mut project, asset, first, _) = two_clip_project();
+
+        project
+            .relink_asset(asset, "/moved/a.mkv".into(), video_info(12))
+            .unwrap();
+
+        assert_eq!(
+            project.asset(asset).map(|asset| asset.path.clone()),
+            Some("/moved/a.mkv".into())
+        );
+        assert_eq!(
+            project.asset(asset).and_then(|asset| asset.info.duration),
+            Some(Time::from_seconds(12))
+        );
+        assert!(project.find_clip(first).is_some());
+    }
+
+    #[test]
+    fn relinking_refuses_media_that_breaks_a_clip() {
+        let (mut project, asset, first, _) = two_clip_project();
+        let before = project.clone();
+
+        assert_eq!(
+            project.relink_asset(asset, "/short.mkv".into(), video_info(5)),
+            Err(EditError::BeyondMedia(first))
+        );
+        assert_eq!(
+            project.relink_asset(asset, "/sound.opus".into(), audio_info(20)),
+            Err(EditError::MissingStream(TrackKind::Video))
+        );
+        assert_eq!(
+            project.relink_asset(AssetId(9), "/x.mkv".into(), video_info(20)),
+            Err(EditError::UnknownAsset(AssetId(9)))
+        );
+        assert_eq!(project, before);
     }
 }

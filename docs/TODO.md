@@ -12,7 +12,6 @@
 ## Project files
 
 - Recent projects
-- Relink media that has moved or gone missing, and mark missing media in the bin
 - Autosave and recovery after a crash
 
 ## Media decode
@@ -65,7 +64,7 @@
 
 - Filter unsupported files in the import dialog and for files dropped one by one
 - A sequence settings dialog; every project starts as a hardcoded 1920×1080, 30 fps "Untitled"
-- Remove assets, sort and search them, show their metadata and mark unused ones
+- Sort and search the assets, which needs a text input
 - Compare canonical paths when skipping duplicate imports
 - Menus, a shortcut reference and preferences
 

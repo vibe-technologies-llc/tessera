@@ -58,7 +58,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   the ends of the media and a minimum length of one frame. `split_clip` cuts a clip strictly inside
   it, keeping the id on the head and giving the tail a new one. `pasted_clip` and `paste_clip`
   place a copy of an existing `Clip` (its asset and source range) at a track and start under the
-  next clip id, with the same checks as placing an asset. `remove_asset` refuses an asset a clip
+  next clip id, with the same checks as placing an asset. `relink_asset` swaps an asset's path and probed info when every clip still fits (`BeyondMedia`,
+  `MissingStream`). `remove_asset` refuses an asset a clip
   still uses (`AssetInUse`), `prune_assets` removes every unused one and returns them, and a
   removed asset's id is never given out again. `delete_clips`, `ripple_delete_clips`
   and `move_clips` edit several clips by id in one call (a group move may land on the clips it
@@ -232,7 +233,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   thumbnail size) for every video asset that has none, so a thumbnail also returns after an undo
   brings the asset back and is released from the atlas when the asset goes. A dropped folder is
   scanned for files with a media extension. A path that is not valid UTF-8 is refused, since a
-  project could not save it. Failures show as one dismissible row. Thumbnails are UI state kept in
+  project could not save it. Failures show as one dismissible row. Each row shows the asset's metadata (duration, size, codec
+  and rate), is marked Unused when no clip uses it and Missing when a background check found the
+  file gone, and has a Remove button (refused while a clip uses the asset) or, when missing, a
+  Relink button that probes a chosen file and swaps it in through `relink_asset`, which refuses
+  media that lacks a stream a clip needs or ends before a clip does. A Remove unused button
+  appears while there are unused assets. Thumbnail and presence checks are keyed by asset id and
+  path, so a relinked asset gets both again. Thumbnails are UI state kept in
   the bin by `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
   previews the drop as a ghost (red where it would overlap) through `on_drag_move`, and the drop
   places the clip at the previewed, frame-snapped start. Clips on the timeline work the same way.

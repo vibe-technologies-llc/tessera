@@ -6,9 +6,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, ExternalPaths, FontWeight, InteractiveElement,
-    IntoElement, ObjectFit, ParentElement, PathPromptOptions, Render, RenderImage, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px,
+    AnyElement, AppContext, Context, ElementId, Entity, ExternalPaths, FontWeight,
+    InteractiveElement, IntoElement, ObjectFit, ParentElement, PathPromptOptions, Render,
+    RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img,
+    px,
 };
 use tessera_media::{VideoDecoder, VideoFrame, probe};
 use tessera_timeline::{Asset, AssetId, Command, FLICKS_PER_SECOND, MediaInfo, Project, Time};
@@ -61,6 +62,14 @@ impl Render for DraggedAsset {
 enum Job {
     Probe(PathBuf),
     Scan(PathBuf),
+    Relink {
+        id: AssetId,
+        path: PathBuf,
+    },
+    Exists {
+        id: AssetId,
+        path: PathBuf,
+    },
     Thumbnail {
         id: AssetId,
         path: PathBuf,
@@ -76,6 +85,16 @@ enum Finished {
     Scanned {
         folder: PathBuf,
         files: Vec<PathBuf>,
+    },
+    Relinked {
+        id: AssetId,
+        path: PathBuf,
+        info: Result<MediaInfo, tessera_media::Error>,
+    },
+    Exists {
+        id: AssetId,
+        path: PathBuf,
+        present: bool,
     },
     Thumbnail {
         id: AssetId,
@@ -95,6 +114,16 @@ impl Job {
                 files: media_files_under(&folder),
                 folder,
             },
+            Self::Relink { id, path } => Finished::Relinked {
+                info: probe(&path),
+                id,
+                path,
+            },
+            Self::Exists { id, path } => Finished::Exists {
+                present: path.exists(),
+                id,
+                path,
+            },
             Self::Thumbnail { id, path, duration } => Finished::Thumbnail {
                 image: thumbnail(&path, duration),
                 id,
@@ -102,6 +131,11 @@ impl Job {
             },
         }
     }
+}
+
+struct Presence {
+    path: PathBuf,
+    present: Option<bool>,
 }
 
 struct ImportFailure {
@@ -115,7 +149,8 @@ pub struct MediaBin {
     probing: Vec<PathBuf>,
     failures: Vec<ImportFailure>,
     thumbnails: HashMap<AssetId, Arc<RenderImage>>,
-    thumbnail_requested: HashSet<AssetId>,
+    thumbnail_requested: HashMap<AssetId, PathBuf>,
+    presence: HashMap<AssetId, Presence>,
     retired: Vec<Arc<RenderImage>>,
     waiting: VecDeque<Job>,
     running: usize,
@@ -126,7 +161,7 @@ impl MediaBin {
     pub fn new(editor: ProjectEditor, cx: &mut Context<Self>) -> Self {
         let project = editor.project().clone();
         cx.observe(&project, |bin, _, cx| {
-            bin.sync_thumbnails(cx);
+            bin.sync_assets(cx);
             cx.notify();
         })
         .detach();
@@ -136,13 +171,14 @@ impl MediaBin {
             probing: Vec::new(),
             failures: Vec::new(),
             thumbnails: HashMap::new(),
-            thumbnail_requested: HashSet::new(),
+            thumbnail_requested: HashMap::new(),
+            presence: HashMap::new(),
             retired: Vec::new(),
             waiting: VecDeque::new(),
             running: 0,
             generation: 0,
         };
-        bin.sync_thumbnails(cx);
+        bin.sync_assets(cx);
         bin
     }
 
@@ -153,38 +189,63 @@ impl MediaBin {
         self.probing.clear();
         self.failures.clear();
         self.thumbnail_requested.clear();
+        self.presence.clear();
         self.retired
             .extend(self.thumbnails.drain().map(|(_, thumbnail)| thumbnail));
-        self.sync_thumbnails(cx);
+        self.sync_assets(cx);
         cx.notify();
     }
 
-    fn sync_thumbnails(&mut self, cx: &mut Context<Self>) {
+    fn sync_assets(&mut self, cx: &mut Context<Self>) {
         let project = self.project.read(cx);
+        let gone = |id: &AssetId| project.asset(*id).is_none();
         let removed: Vec<AssetId> = self
             .thumbnail_requested
-            .iter()
+            .keys()
+            .chain(self.presence.keys())
             .copied()
-            .filter(|id| project.asset(*id).is_none())
+            .filter(gone)
             .collect();
-        let wanted: Vec<Job> = project
-            .assets
-            .iter()
-            .filter(|asset| asset.info.video().next().is_some())
-            .filter(|asset| !self.thumbnail_requested.contains(&asset.id))
-            .map(|asset| Job::Thumbnail {
-                id: asset.id,
-                path: asset.path.clone(),
-                duration: asset.info.duration,
-            })
-            .collect();
+        let mut wanted = Vec::new();
+        for asset in &project.assets {
+            let has_video = asset.info.video().next().is_some();
+            let thumbnail_stale =
+                has_video && self.thumbnail_requested.get(&asset.id) != Some(&asset.path);
+            if thumbnail_stale {
+                wanted.push(Job::Thumbnail {
+                    id: asset.id,
+                    path: asset.path.clone(),
+                    duration: asset.info.duration,
+                });
+            }
+            if self.presence.get(&asset.id).map(|known| &known.path) != Some(&asset.path) {
+                wanted.push(Job::Exists {
+                    id: asset.id,
+                    path: asset.path.clone(),
+                });
+            }
+        }
         for id in removed {
             self.thumbnail_requested.remove(&id);
+            self.presence.remove(&id);
             self.retired.extend(self.thumbnails.remove(&id));
         }
         for job in wanted {
-            if let Job::Thumbnail { id, .. } = &job {
-                self.thumbnail_requested.insert(*id);
+            match &job {
+                Job::Thumbnail { id, path, .. } => {
+                    self.thumbnail_requested.insert(*id, path.clone());
+                    self.retired.extend(self.thumbnails.remove(id));
+                }
+                Job::Exists { id, path } => {
+                    self.presence.insert(
+                        *id,
+                        Presence {
+                            path: path.clone(),
+                            present: None,
+                        },
+                    );
+                }
+                _ => {}
             }
             self.waiting.push_back(job);
         }
@@ -221,6 +282,17 @@ impl MediaBin {
                 if self.probing.contains(&folder) {
                     self.probing.retain(|probing| *probing != folder);
                     self.import(files, cx);
+                }
+            }
+            Finished::Relinked { id, path, info } => self.finish_relink(id, path, info, cx),
+            Finished::Exists { id, path, present } => {
+                if let Some(known) = self
+                    .presence
+                    .get_mut(&id)
+                    .filter(|known| known.path == path)
+                {
+                    known.present = Some(present);
+                    cx.notify();
                 }
             }
             Finished::Thumbnail { id, path, image } => self.finish_thumbnail(id, &path, image, cx),
@@ -321,6 +393,75 @@ impl MediaBin {
         cx.notify();
     }
 
+    pub fn prompt_relink(&mut self, id: AssetId, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Relink".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            if let Some(path) = paths.into_iter().next() {
+                this.update(cx, |bin, cx| bin.relink(id, path, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn relink(&mut self, id: AssetId, path: PathBuf, cx: &mut Context<Self>) {
+        if path.to_str().is_none() {
+            self.fail(
+                file_name(&path),
+                "the path is not valid UTF-8, so a project could not save it".into(),
+                cx,
+            );
+            return;
+        }
+        self.waiting.push_back(Job::Relink { id, path });
+        self.pump(cx);
+    }
+
+    fn finish_relink(
+        &mut self,
+        id: AssetId,
+        path: PathBuf,
+        probed: Result<MediaInfo, tessera_media::Error>,
+        cx: &mut Context<Self>,
+    ) {
+        let relinked = probed.map_err(|error| error.to_string()).and_then(|info| {
+            self.editor
+                .apply(Command::RelinkAsset, cx, |project| {
+                    project.relink_asset(id, path.clone(), info)
+                })
+                .map_err(|error| error.to_string())
+        });
+        if let Err(reason) = relinked {
+            self.fail(file_name(&path), reason, cx);
+        }
+    }
+
+    fn remove_asset(&mut self, id: AssetId, cx: &mut Context<Self>) {
+        let name = self
+            .project
+            .read(cx)
+            .asset(id)
+            .map(|asset| file_name(&asset.path));
+        let removed = self.editor.apply(Command::RemoveAsset, cx, |project| {
+            project.remove_asset(id).map(drop)
+        });
+        if let Err(error) = removed {
+            self.fail(name.unwrap_or_default(), error.to_string(), cx);
+        }
+    }
+
+    fn prune_assets(&mut self, cx: &mut Context<Self>) {
+        self.editor
+            .perform(Command::PruneAssets, cx, |project| project.prune_assets());
+    }
+
     fn fail(&mut self, source: SharedString, reason: String, cx: &mut Context<Self>) {
         tracing::warn!(%source, %reason, "import failed");
         self.failures.push(ImportFailure {
@@ -389,9 +530,18 @@ impl MediaBin {
                     .into_any_element(),
             ];
         }
-        let assets = assets
-            .iter()
-            .map(|asset| asset_row(asset, self.thumbnails.get(&asset.id)).into_any_element());
+        let used = used_assets(self.project.read(cx));
+        let held = self.project.read(cx).assets.clone();
+        let assets = held.iter().map(|asset| {
+            let state = RowState {
+                used: used.contains(&asset.id),
+                missing: self
+                    .presence
+                    .get(&asset.id)
+                    .is_some_and(|known| known.present == Some(false)),
+            };
+            asset_row(asset, self.thumbnails.get(&asset.id), state, cx).into_any_element()
+        });
         let probing = self.probing.iter().map(|path| {
             row(file_name(path))
                 .flex()
@@ -412,6 +562,11 @@ impl Render for MediaBin {
             }
         }
         let body = self.body(cx);
+        let has_unused = {
+            let project = self.project.read(cx);
+            let used = used_assets(project);
+            project.assets.iter().any(|asset| !used.contains(&asset.id))
+        };
         div()
             .id("media-bin")
             .size_full()
@@ -435,13 +590,16 @@ impl Render for MediaBin {
                     .child("Media")
                     .child(
                         div()
-                            .id("import")
-                            .px_2()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
-                            .on_click(cx.listener(|bin, _, _, cx| bin.prompt_import(cx)))
-                            .child("Import…"),
+                            .flex()
+                            .gap_1()
+                            .children(has_unused.then(|| {
+                                bin_button("prune", "Remove unused")
+                                    .on_click(cx.listener(|bin, _, _, cx| bin.prune_assets(cx)))
+                            }))
+                            .child(
+                                bin_button("import", "Import…")
+                                    .on_click(cx.listener(|bin, _, _, cx| bin.prompt_import(cx))),
+                            ),
                     ),
             )
             .child(
@@ -461,12 +619,73 @@ fn row(name: SharedString) -> gpui::Div {
     div().px_3().py_1().child(name)
 }
 
-fn asset_row(asset: &Asset, thumbnail: Option<&Arc<RenderImage>>) -> impl IntoElement {
+struct RowState {
+    used: bool,
+    missing: bool,
+}
+
+fn used_assets(project: &Project) -> HashSet<AssetId> {
+    project
+        .timeline
+        .tracks
+        .iter()
+        .flat_map(|track| track.clips())
+        .map(|clip| clip.asset)
+        .collect()
+}
+
+fn bin_button(id: impl Into<ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+        .child(label)
+}
+
+fn asset_row(
+    asset: &Asset,
+    thumbnail: Option<&Arc<RenderImage>>,
+    state: RowState,
+    cx: &mut Context<MediaBin>,
+) -> impl IntoElement {
+    let id = asset.id;
     let duration = asset
         .info
         .duration
         .map_or_else(|| UNKNOWN_DURATION.to_owned(), duration_label);
     let dragged = DraggedAsset::of(asset);
+    let name = div().truncate().child(file_name(&asset.path));
+    let name = if state.missing {
+        name.text_color(theme::error())
+    } else {
+        name
+    };
+    let status = if state.missing {
+        Some("Missing")
+    } else if !state.used {
+        Some("Unused")
+    } else {
+        None
+    };
+    let actions = div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_end()
+        .text_xs()
+        .text_color(theme::text_muted())
+        .children(status)
+        .child(if state.missing {
+            bin_button(("relink", id.0), "Relink…")
+                .on_click(cx.listener(move |bin, _, _, cx| bin.prompt_relink(id, cx)))
+                .into_any_element()
+        } else {
+            bin_button(("remove", id.0), "Remove")
+                .on_click(cx.listener(move |bin, _, _, cx| bin.remove_asset(id, cx)))
+                .into_any_element()
+        });
     div()
         .id(("asset", asset.id.0))
         .px_3()
@@ -484,14 +703,53 @@ fn asset_row(asset: &Asset, thumbnail: Option<&Arc<RenderImage>>) -> impl IntoEl
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().truncate().child(file_name(&asset.path)))
+                .child(name)
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme::text_muted())
-                        .child(duration),
+                        .truncate()
+                        .child(format!("{duration} · {}", describe(&asset.info))),
                 ),
         )
+        .child(actions)
+}
+
+fn describe(info: &MediaInfo) -> String {
+    let video = info.video().next().map(|video| {
+        let rate = video
+            .frame_rate
+            .map(|rate| format!(" {} fps", trimmed_rate(rate.as_f64())))
+            .unwrap_or_default();
+        format!("{}×{} {}{rate}", video.width, video.height, video.codec)
+    });
+    let audio = info.audio().next().map(|audio| {
+        format!(
+            "{} {} kHz {}",
+            audio.codec,
+            trimmed_rate(f64::from(audio.sample_rate.get()) / 1000.),
+            channel_label(audio.channels.get())
+        )
+    });
+    let parts: Vec<String> = video.into_iter().chain(audio).collect();
+    if parts.is_empty() {
+        "no streams".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn trimmed_rate(rate: f64) -> String {
+    let text = format!("{rate:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+fn channel_label(channels: u16) -> String {
+    match channels {
+        1 => "mono".to_owned(),
+        2 => "stereo".to_owned(),
+        count => format!("{count} ch"),
+    }
 }
 
 fn thumbnail_frame(asset: &Asset, thumbnail: Option<&Arc<RenderImage>>) -> impl IntoElement {
@@ -772,7 +1030,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        cx.read(|cx| assert!(bin.read(cx).thumbnail_requested.contains(&id)));
+        cx.read(|cx| assert!(bin.read(cx).thumbnail_requested.contains_key(&id)));
 
         bin.update(cx, |bin, cx| bin.editor.undo(cx));
         cx.run_until_parked();
@@ -780,7 +1038,7 @@ mod tests {
         cx.read(|cx| {
             let bin = bin.read(cx);
             assert!(!bin.thumbnails.contains_key(&id));
-            assert!(!bin.thumbnail_requested.contains(&id));
+            assert!(!bin.thumbnail_requested.contains_key(&id));
         });
     }
 
@@ -845,5 +1103,137 @@ mod tests {
         assert_eq!(duration_label(Time::from_seconds(59)), "0:59");
         assert_eq!(duration_label(Time::from_seconds(61)), "1:01");
         assert_eq!(duration_label(Time::from_seconds(3600 + 62)), "1:01:02");
+    }
+
+    #[test]
+    fn streams_are_described_in_a_line() {
+        assert_eq!(describe(&video_info()), "640×360 h264");
+        assert_eq!(describe(&audio_info()), "opus 48 kHz stereo");
+        assert_eq!(describe(&MediaInfo::default()), "no streams");
+
+        let mut both = video_info();
+        both.streams.extend(audio_info().streams);
+        assert_eq!(describe(&both), "640×360 h264 · opus 48 kHz stereo");
+    }
+
+    #[test]
+    fn rates_drop_trailing_zeros() {
+        assert_eq!(trimmed_rate(29.97002997), "29.97");
+        assert_eq!(trimmed_rate(30.0), "30");
+        assert_eq!(trimmed_rate(44.1), "44.1");
+        assert_eq!(channel_label(6), "6 ch");
+    }
+
+    #[gpui::test]
+    fn removing_an_asset_in_use_is_refused_and_an_unused_one_goes(cx: &mut TestAppContext) {
+        let mut project = Project::new("test");
+        let used = project.add_asset("/missing/used.mkv".into(), video_info());
+        let spare = project.add_asset("/missing/spare.mkv".into(), video_info());
+        project.place_clip(used, 0, Time::ZERO).unwrap();
+        let project = cx.new(|_| project);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+
+        bin.update(cx, |bin, cx| bin.remove_asset(used, cx));
+
+        cx.read(|cx| {
+            let bin = bin.read(cx);
+            assert_eq!(bin.failures.len(), 1);
+            assert!(bin.project.read(cx).asset(used).is_some());
+        });
+
+        bin.update(cx, |bin, cx| bin.remove_asset(spare, cx));
+
+        cx.read(|cx| assert!(bin.read(cx).project.read(cx).asset(spare).is_none()));
+    }
+
+    #[gpui::test]
+    fn pruning_removes_every_unused_asset_and_can_be_undone(cx: &mut TestAppContext) {
+        let mut project = Project::new("test");
+        let used = project.add_asset("/missing/used.mkv".into(), video_info());
+        project.add_asset("/missing/spare.mkv".into(), video_info());
+        project.add_asset("/missing/other.opus".into(), audio_info());
+        project.place_clip(used, 0, Time::ZERO).unwrap();
+        let project = cx.new(|_| project);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+
+        bin.update(cx, |bin, cx| bin.prune_assets(cx));
+
+        cx.read(|cx| assert_eq!(bin.read(cx).project.read(cx).assets.len(), 1));
+
+        bin.update(cx, |bin, cx| bin.editor.undo(cx));
+
+        cx.read(|cx| assert_eq!(bin.read(cx).project.read(cx).assets.len(), 3));
+    }
+
+    #[gpui::test]
+    fn media_that_is_not_on_disk_is_marked_missing(cx: &mut TestAppContext) {
+        let dir = scratch_dir("presence");
+        let present = dir.join("here.mkv");
+        fs::write(&present, "").unwrap();
+        let mut project = Project::new("test");
+        let here = project.add_asset(present.clone(), audio_info());
+        let gone = project.add_asset(dir.join("gone.mkv"), audio_info());
+        let project = cx.new(|_| project);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let bin = bin.read(cx);
+            assert_eq!(bin.presence[&here].present, Some(true));
+            assert_eq!(bin.presence[&gone].present, Some(false));
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    fn a_relinked_asset_is_checked_and_decoded_again(cx: &mut TestAppContext) {
+        let mut project = Project::new("test");
+        let asset = project.add_asset("/missing/old.mkv".into(), video_info());
+        let project = cx.new(|_| project);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+        cx.run_until_parked();
+
+        bin.update(cx, |bin, cx| {
+            bin.thumbnails.insert(asset, blank_thumbnail());
+            bin.finish_relink(asset, "/missing/new.mkv".into(), Ok(video_info()), cx);
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let bin = bin.read(cx);
+            let path = std::path::PathBuf::from("/missing/new.mkv");
+            assert_eq!(bin.project.read(cx).asset(asset).unwrap().path, path);
+            assert_eq!(bin.presence[&asset].path, path);
+            assert_eq!(bin.thumbnail_requested[&asset], path);
+            assert!(!bin.thumbnails.contains_key(&asset));
+        });
+    }
+
+    #[gpui::test]
+    fn media_that_cannot_stand_in_for_the_old_is_refused_on_relink(cx: &mut TestAppContext) {
+        let mut project = Project::new("test");
+        let asset = project.add_asset("/missing/old.mkv".into(), video_info());
+        project.place_clip(asset, 0, Time::ZERO).unwrap();
+        let project = cx.new(|_| project);
+        let (bin, cx) =
+            cx.add_window_view(|_, cx| MediaBin::new(ProjectEditor::new(project, cx), cx));
+
+        bin.update(cx, |bin, cx| {
+            bin.finish_relink(asset, "/missing/sound.opus".into(), Ok(audio_info()), cx);
+        });
+
+        cx.read(|cx| {
+            let bin = bin.read(cx);
+            assert_eq!(bin.failures.len(), 1);
+            assert_eq!(
+                bin.project.read(cx).asset(asset).unwrap().path,
+                std::path::PathBuf::from("/missing/old.mkv")
+            );
+        });
     }
 }
