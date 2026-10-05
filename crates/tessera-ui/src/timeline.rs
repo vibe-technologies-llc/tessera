@@ -7,13 +7,13 @@ use std::collections::BTreeSet;
 use gpui::{
     App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity,
     FocusHandle, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Rgba,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Rgba,
     ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
     canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use tessera_timeline::{
-    AssetId, Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Project, Time, TimeRange,
-    Timecode, Timeline, Track, TrackKind,
+    AssetId, Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Marker, MarkerId, Project,
+    Time, TimeRange, Timecode, Timeline, Track, TrackKind,
 };
 
 use self::{
@@ -51,6 +51,8 @@ const SNAP_LINE_WIDTH: f32 = 1.;
 const MARKER_WIDTH: f32 = 9.;
 const MARKER_HEIGHT: f32 = 10.;
 const IN_OUT_EDGE_WIDTH: f32 = 2.;
+const MARKER_LABEL_GAP: f32 = 2.;
+const MARKER_RENAME_WIDTH: f32 = 140.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RulerSpan {
@@ -192,6 +194,7 @@ pub struct TimelinePanel {
     project: Entity<Project>,
     playhead: Entity<Playhead>,
     scrubbing: bool,
+    marker_drag: Option<MarkerDrag>,
     drop_preview: Option<DropPreview>,
     viewport: Viewport,
     lanes: Bounds<Pixels>,
@@ -201,12 +204,25 @@ pub struct TimelinePanel {
     tracks_view: Bounds<Pixels>,
     snapping: bool,
     clipboard: Vec<(Clip, usize)>,
-    renaming: Option<TrackRename>,
+    renaming: Option<Rename>,
     focus_return: Option<FocusHandle>,
 }
 
-struct TrackRename {
-    track: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MarkerDrag {
+    id: MarkerId,
+    grab: Pixels,
+    time: Time,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameTarget {
+    Track(usize),
+    Marker(MarkerId),
+}
+
+struct Rename {
+    target: RenameTarget,
     field: Entity<TextField>,
     _subscriptions: [Subscription; 2],
 }
@@ -226,6 +242,7 @@ impl TimelinePanel {
             project,
             playhead,
             scrubbing: false,
+            marker_drag: None,
             drop_preview: None,
             viewport: Viewport::default(),
             lanes: Bounds::default(),
@@ -264,18 +281,21 @@ impl TimelinePanel {
         self.focus_return = Some(handle);
     }
 
-    fn start_rename(&mut self, track: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(current) = self
-            .project
-            .read(cx)
-            .timeline
-            .tracks
-            .get(track)
-            .map(|track| track.name.clone())
-        else {
+    fn start_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project.read(cx);
+        let (current, placeholder) = match target {
+            RenameTarget::Track(track) => (
+                project.timeline.tracks.get(track).map(|track| &track.name),
+                "Track name",
+            ),
+            RenameTarget::Marker(id) => {
+                (project.marker(id).map(|marker| &marker.name), "Marker name")
+            }
+        };
+        let Some(current) = current.cloned() else {
             return;
         };
-        let field = cx.new(|cx| TextField::new(current, "Track name", cx));
+        let field = cx.new(|cx| TextField::new(current, placeholder, cx));
         let focus_handle = field.read(cx).focus_handle().clone();
         let subscriptions = [
             cx.subscribe_in(&field, window, |panel, _, event, window, cx| match event {
@@ -290,8 +310,8 @@ impl TimelinePanel {
             }),
         ];
         field.read(cx).focus(window);
-        self.renaming = Some(TrackRename {
-            track,
+        self.renaming = Some(Rename {
+            target,
             field,
             _subscriptions: subscriptions,
         });
@@ -302,10 +322,19 @@ impl TimelinePanel {
         let Some(renaming) = self.renaming.take() else {
             return;
         };
-        if let Some(name) = name {
-            self.edit_track(Command::RenameTrack, renaming.track, cx, |track| {
-                track.name = name;
-            });
+        match (name, renaming.target) {
+            (Some(name), RenameTarget::Track(track)) => {
+                self.edit_track(Command::RenameTrack, track, cx, |track| track.name = name);
+            }
+            (Some(name), RenameTarget::Marker(id)) => {
+                let renamed = self.editor.apply(Command::RenameMarker, cx, |project| {
+                    project.rename_marker(id, name)
+                });
+                if let Err(error) = renamed {
+                    tracing::warn!(%error, "could not rename the marker");
+                }
+            }
+            (None, _) => {}
         }
         if let Some(handle) = &self.focus_return {
             window.focus(handle);
@@ -315,7 +344,86 @@ impl TimelinePanel {
 
     pub fn drag_cancelled(&mut self, cx: &mut Context<Self>) {
         self.drop_preview = None;
+        self.marker_drag = None;
         cx.notify();
+    }
+
+    fn marker_at(&self, offset: Point<Pixels>, cx: &App) -> Option<(MarkerId, Time)> {
+        if offset.y < px(RULER_HEIGHT - MARKER_HEIGHT) {
+            return None;
+        }
+        let reach = px(MARKER_WIDTH / 2.);
+        self.project
+            .read(cx)
+            .markers
+            .iter()
+            .map(|marker| (marker, (self.viewport.x_at(marker.time) - offset.x).abs()))
+            .filter(|(_, distance)| *distance <= reach)
+            .min_by(|(_, a), (_, b)| f32::from(*a).total_cmp(&f32::from(*b)))
+            .map(|(marker, _)| (marker.id, marker.time))
+    }
+
+    fn press_ruler(
+        &mut self,
+        offset: Point<Pixels>,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.marker_at(offset, cx) {
+            Some((id, _)) if click_count >= 2 => {
+                self.marker_drag = None;
+                self.start_rename(RenameTarget::Marker(id), window, cx);
+            }
+            Some((id, time)) => {
+                self.marker_drag = Some(MarkerDrag {
+                    id,
+                    grab: offset.x - self.viewport.x_at(time),
+                    time,
+                });
+            }
+            None => {
+                self.scrubbing = true;
+                self.scrub_to(offset.x, cx);
+            }
+        }
+    }
+
+    fn drag_on_ruler(&mut self, offset: Pixels, cx: &mut Context<Self>) {
+        if let Some(drag) = self.marker_drag {
+            let time = self.frame_at(offset - drag.grab, cx).max(Time::ZERO);
+            if time != drag.time {
+                self.marker_drag = Some(MarkerDrag { time, ..drag });
+                cx.notify();
+            }
+        } else if self.scrubbing {
+            self.scrub_to(offset, cx);
+        }
+    }
+
+    fn release_ruler(&mut self, cx: &mut Context<Self>) {
+        self.scrubbing = false;
+        let Some(drag) = self.marker_drag.take() else {
+            return;
+        };
+        let moved = self
+            .project
+            .read(cx)
+            .marker(drag.id)
+            .is_some_and(|marker| marker.time != drag.time);
+        if moved {
+            let result = self.editor.apply(Command::MoveMarker, cx, |project| {
+                project.move_marker(drag.id, drag.time)
+            });
+            if let Err(error) = result {
+                tracing::warn!(%error, "could not move the marker");
+            }
+        }
+        cx.notify();
+    }
+
+    fn ruler_pressed(&self) -> bool {
+        self.scrubbing || self.marker_drag.is_some()
     }
 
     fn selected_clips(&self, cx: &App) -> Vec<(Clip, usize)> {
@@ -470,6 +578,7 @@ impl TimelinePanel {
         self.selection.clear();
         self.drop_preview = None;
         self.renaming = None;
+        self.marker_drag = None;
         self.clipboard.clear();
         self.viewport = Viewport::default();
         self.track_scroll = px(0.);
@@ -1035,7 +1144,31 @@ impl Render for TimelinePanel {
         let renaming = self
             .renaming
             .as_ref()
-            .map(|renaming| (renaming.track, renaming.field.clone()));
+            .and_then(|renaming| match renaming.target {
+                RenameTarget::Track(track) => Some((track, renaming.field.clone())),
+                RenameTarget::Marker(_) => None,
+            });
+        let marker_rename = self
+            .renaming
+            .as_ref()
+            .and_then(|renaming| match renaming.target {
+                RenameTarget::Marker(id) => Some((id, renaming.field.clone())),
+                RenameTarget::Track(_) => None,
+            });
+        let marker_drag = self.marker_drag;
+        let marker_time = |marker: &Marker| {
+            marker_drag
+                .filter(|drag| drag.id == marker.id)
+                .map_or(marker.time, |drag| drag.time)
+        };
+        let markers = project.markers.iter().map(|marker| {
+            let x = viewport.x_at(marker_time(marker));
+            let editing = marker_rename
+                .as_ref()
+                .filter(|(id, _)| *id == marker.id)
+                .map(|(_, field)| field.clone());
+            marker_flag(x, marker.name.clone(), editing)
+        });
         let headers = rows
             .into_iter()
             .map(|row| {
@@ -1079,12 +1212,7 @@ impl Render for TimelinePanel {
                     .child(ruler(panel, viewport, frame_rate))
                     .child(lanes)
                     .children(in_out_range(viewport, project.in_point, project.out_point))
-                    .children(
-                        project
-                            .markers
-                            .iter()
-                            .map(|marker| marker_flag(viewport.x_at(marker.time))),
-                    )
+                    .children(markers)
                     .children(snap_line)
                     .child(playhead_marker(viewport.x_at(playhead))),
             )
@@ -1406,9 +1534,9 @@ fn listen_for_scrub(
                 && event.button == MouseButton::Left
                 && hitbox.is_hovered(window)
             {
+                let offset = event.position - bounds.origin;
                 panel.update(cx, |panel, cx| {
-                    panel.scrubbing = true;
-                    panel.scrub_to(event.position.x - bounds.left(), cx);
+                    panel.press_ruler(offset, event.click_count, window, cx);
                 });
             }
         }
@@ -1416,33 +1544,63 @@ fn listen_for_scrub(
     window.on_mouse_event({
         let panel = panel.clone();
         move |event: &MouseMoveEvent, phase, _, cx| {
-            if phase == DispatchPhase::Bubble && panel.read(cx).scrubbing {
+            if phase == DispatchPhase::Bubble && panel.read(cx).ruler_pressed() {
                 panel.update(cx, |panel, cx| {
                     if event.dragging() {
-                        panel.scrub_to(event.position.x - bounds.left(), cx);
+                        panel.drag_on_ruler(event.position.x - bounds.left(), cx);
                     } else {
-                        panel.scrubbing = false;
+                        panel.release_ruler(cx);
                     }
                 });
             }
         }
     });
     window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-        if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
-            panel.update(cx, |panel, _| panel.scrubbing = false);
+        if phase == DispatchPhase::Bubble
+            && event.button == MouseButton::Left
+            && panel.read(cx).ruler_pressed()
+        {
+            panel.update(cx, |panel, cx| panel.release_ruler(cx));
         }
     });
 }
 
-fn marker_flag(x: Pixels) -> impl IntoElement {
-    div()
+fn marker_flag(x: Pixels, name: String, editing: Option<Entity<TextField>>) -> gpui::Div {
+    let flag = div()
         .absolute()
         .top(px(RULER_HEIGHT - MARKER_HEIGHT))
         .left(x - px(MARKER_WIDTH / 2.))
         .w(px(MARKER_WIDTH))
         .h(px(MARKER_HEIGHT))
         .rounded_t_sm()
-        .bg(theme::marker())
+        .bg(theme::marker());
+    let label_left = x + px(MARKER_WIDTH / 2. + MARKER_LABEL_GAP);
+    let label = match editing {
+        Some(field) => Some(
+            div()
+                .absolute()
+                .top_0()
+                .left(label_left)
+                .w(px(MARKER_RENAME_WIDTH))
+                .h(px(RULER_HEIGHT - 1.))
+                .bg(theme::panel())
+                .child(field),
+        ),
+        None => (!name.is_empty()).then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .left(label_left)
+                .px_1()
+                .rounded_sm()
+                .bg(theme::panel())
+                .text_xs()
+                .text_color(theme::text())
+                .whitespace_nowrap()
+                .child(name)
+        }),
+    };
+    div().absolute().size_full().child(flag).children(label)
 }
 
 fn in_out_range(
@@ -2331,5 +2489,99 @@ mod tests {
 
         assert_eq!(track_of(&panel, cx, 0).name, "");
         assert!(cx.read(|cx| panel.read(cx).renaming.is_none()));
+    }
+
+    const MARKER_Y: f32 = RULER_HEIGHT - MARKER_HEIGHT / 2.;
+
+    fn add_marker(
+        panel: &Entity<TimelinePanel>,
+        cx: &mut VisualTestContext,
+        seconds: i64,
+    ) -> MarkerId {
+        panel.update(cx, |panel, cx| {
+            panel.editor.perform(Command::AddMarker, cx, |project| {
+                project.add_marker(Time::from_seconds(seconds), "")
+            })
+        })
+    }
+
+    fn marker_of(
+        panel: &Entity<TimelinePanel>,
+        cx: &mut VisualTestContext,
+        id: MarkerId,
+    ) -> Marker {
+        cx.read(|cx| panel.read(cx).project.read(cx).marker(id).unwrap().clone())
+    }
+
+    fn playhead_time(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext) -> Time {
+        cx.read(|cx| panel.read(cx).playhead.read(cx).time())
+    }
+
+    #[gpui::test]
+    fn dragging_a_marker_flag_moves_the_marker_and_leaves_the_playhead(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        let marker = add_marker(&panel, cx, 2);
+        let (none, left, y) = (Modifiers::none(), MouseButton::Left, px(MARKER_Y));
+
+        cx.simulate_mouse_down(point(at(2.), y), left, none);
+        cx.simulate_mouse_move(point(at(3.), y), left, none);
+
+        assert_eq!(marker_of(&panel, cx, marker).time, Time::from_seconds(2));
+        assert_eq!(
+            cx.read(|cx| panel.read(cx).marker_drag.map(|drag| drag.time)),
+            Some(Time::from_seconds(3))
+        );
+
+        cx.simulate_mouse_move(point(at(5.), y), left, none);
+        cx.simulate_mouse_up(point(at(5.), y), left, none);
+
+        assert_eq!(marker_of(&panel, cx, marker).time, Time::from_seconds(5));
+        assert_eq!(playhead_time(&panel, cx), Time::ZERO);
+        assert!(cx.read(|cx| panel.read(cx).marker_drag.is_none()));
+
+        panel.update(cx, |panel, cx| panel.editor.undo(cx));
+
+        assert_eq!(marker_of(&panel, cx, marker).time, Time::from_seconds(2));
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_marker_flag_names_it(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        let marker = add_marker(&panel, cx, 2);
+
+        double_click(cx, point(at(2.), px(MARKER_Y)));
+
+        assert_eq!(
+            cx.read(|cx| panel
+                .read(cx)
+                .renaming
+                .as_ref()
+                .map(|renaming| renaming.target)),
+            Some(RenameTarget::Marker(marker))
+        );
+
+        cx.simulate_keystrokes("i n t r o enter");
+
+        assert_eq!(marker_of(&panel, cx, marker).name, "intro");
+        assert_eq!(marker_of(&panel, cx, marker).time, Time::from_seconds(2));
+        assert!(cx.read(|cx| panel.read(cx).renaming.is_none()));
+    }
+
+    #[gpui::test]
+    fn pressing_the_ruler_away_from_a_marker_scrubs(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        let marker = add_marker(&panel, cx, 2);
+
+        cx.simulate_click(point(at(4.), px(MARKER_Y)), Modifiers::none());
+
+        assert_eq!(playhead_time(&panel, cx), Time::from_seconds(4));
+        assert_eq!(marker_of(&panel, cx, marker).time, Time::from_seconds(2));
+
+        cx.simulate_click(
+            point(at(2.), px(MARKER_Y - MARKER_HEIGHT)),
+            Modifiers::none(),
+        );
+
+        assert_eq!(playhead_time(&panel, cx), Time::from_seconds(2));
     }
 }

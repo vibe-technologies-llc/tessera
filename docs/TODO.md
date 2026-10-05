@@ -41,7 +41,6 @@
 - Select several clips with a marquee, and show a ghost for every clip of a group move
 - Scroll while dragging near an edge, add scrollbars, and keep the grab point when the view scrolls
   mid-drag
-- Rename markers and move them by dragging them
 
 ## Media bin and workspace
 

@@ -5,7 +5,9 @@ use gpui::{
 };
 use tessera_timeline::{Timeline, Track, TrackHeight, TrackKind};
 
-use super::{COMPACT_TRACK_HEIGHT, TALL_TRACK_HEIGHT, TRACK_HEIGHT, TimelinePanel, TrackFlag};
+use super::{
+    COMPACT_TRACK_HEIGHT, RenameTarget, TALL_TRACK_HEIGHT, TRACK_HEIGHT, TimelinePanel, TrackFlag,
+};
 use crate::{text_field::TextField, theme};
 
 pub const HEADER_PADDING: f32 = 8.;
@@ -250,7 +252,7 @@ pub fn track_header(
             .on_click(cx.listener(
                 move |panel: &mut TimelinePanel, event: &ClickEvent, window, cx| {
                     if event.click_count() == 2 {
-                        panel.start_rename(index, window, cx);
+                        panel.start_rename(RenameTarget::Track(index), window, cx);
                     }
                 },
             ))

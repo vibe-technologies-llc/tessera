@@ -300,8 +300,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   lands at the playhead (a duplicate right after the selection) keeping the clips' relative
   offsets and tracks, as one `paste_clips` command that is refused whole when anything overlaps or
   a track is locked. M adds a marker at the playhead and Shift+M removes the one there, I and O set
-  the in and out points and Alt+X clears them; markers draw as flags on the ruler and the in and
-  out points as a shaded range. Down and Up jump the playhead to the next and previous edit
+  the in and out points and Alt+X clears them; markers draw as flags on the ruler, with
+  their names beside them, and the in and out points as a shaded range. Pressing the ruler on a
+  flag (its bottom band, within the flag's width) grabs the marker instead of scrubbing: a drag
+  previews it on frame starts and the release commits one `MoveMarker`, and a double-click names
+  it in a `TextField` (`RenameTarget::Marker`, sharing the track rename's field handling). Down and Up jump the playhead to the next and previous edit
   (`Timeline::next_edit_after`, the starts and ends of all clips), Ctrl+Right and Ctrl+Left to the
   next and previous marker, and Escape cancels a drag in progress. Shift+wheel scrolls the track rows vertically, under a fixed
   ruler. Panel interactions are tested
