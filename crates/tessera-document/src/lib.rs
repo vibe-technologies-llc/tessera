@@ -34,10 +34,14 @@ struct Envelope<P> {
 }
 
 pub fn to_string(project: &Project) -> Result<String, FormatError> {
+    encode(project, None)
+}
+
+fn encode(project: &Project, directory: Option<&Path>) -> Result<String, FormatError> {
     let envelope = Envelope {
         format: FORMAT,
         version: CURRENT_VERSION,
-        project: current::Project::try_from(project)?,
+        project: current::Project::encode(project, directory)?,
     };
     let mut text = serde_json::to_string_pretty(&envelope).map_err(FormatError::Encode)?;
     text.push('\n');
@@ -45,6 +49,10 @@ pub fn to_string(project: &Project) -> Result<String, FormatError> {
 }
 
 pub fn from_str(text: &str) -> Result<Project, FormatError> {
+    decode(text, None)
+}
+
+fn decode(text: &str, directory: Option<&Path>) -> Result<Project, FormatError> {
     let Value::Object(mut envelope) = serde_json::from_str(text).map_err(FormatError::Syntax)?
     else {
         return Err(FormatError::NotAProject);
@@ -62,7 +70,7 @@ pub fn from_str(text: &str) -> Result<Project, FormatError> {
             version: CURRENT_VERSION,
             source,
         })?;
-    Ok(project.try_into()?)
+    Ok(project.decode(directory)?)
 }
 
 fn envelope_version(envelope: &Map<String, Value>) -> Result<u64, FormatError> {
@@ -73,11 +81,15 @@ fn envelope_version(envelope: &Map<String, Value>) -> Result<u64, FormatError> {
 }
 
 pub fn save(project: &Project, path: &Path) -> Result<(), Error> {
-    let text = to_string(project).map_err(|source| Error::Format {
+    let target = resolve_symlinks(path)?;
+    let directory = containing_directory(&target).map_err(|source| Error::Write {
         path: path.to_owned(),
         source,
     })?;
-    let target = resolve_symlinks(path)?;
+    let text = encode(project, Some(&directory)).map_err(|source| Error::Format {
+        path: path.to_owned(),
+        source,
+    })?;
     write_atomically(&target, text.as_bytes()).map_err(|source| Error::Write {
         path: path.to_owned(),
         source,
@@ -89,10 +101,20 @@ pub fn open(path: &Path) -> Result<Project, Error> {
         path: path.to_owned(),
         source,
     })?;
-    from_str(&text).map_err(|source| Error::Format {
+    let target = resolve_symlinks(path).unwrap_or_else(|_| path.to_owned());
+    let directory = containing_directory(&target).map_err(|source| Error::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    decode(&text, Some(&directory)).map_err(|source| Error::Format {
         path: path.to_owned(),
         source,
     })
+}
+
+fn containing_directory(file: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(file)?;
+    Ok(absolute.parent().map_or_else(PathBuf::new, Path::to_owned))
 }
 
 const MAX_SYMLINK_HOPS: usize = 40;
@@ -270,7 +292,7 @@ mod tests {
             },
         );
         project.add_asset(
-            "relative/still.png".into(),
+            "/media/still.png".into(),
             MediaInfo {
                 duration: None,
                 streams: vec![video_stream(0, None)],
@@ -500,6 +522,105 @@ mod tests {
         save(&golden_project(), &path).unwrap();
         assert_eq!(dir.entries(), ["edit.tessera"]);
         assert_eq!(fs::read_to_string(&path).unwrap(), GOLDEN_V1);
+    }
+
+    fn project_with_media(path: PathBuf) -> Project {
+        let mut project = Project::new("Portable");
+        project.add_asset(
+            path,
+            MediaInfo {
+                duration: Some(Time::from_seconds(2)),
+                streams: vec![video_stream(0, None)],
+            },
+        );
+        project
+    }
+
+    fn stored_media_path(file: &Path) -> String {
+        let text = fs::read_to_string(file).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+        envelope["project"]["assets"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn media_under_the_project_directory_is_stored_relative_to_it() {
+        let dir = ScratchDir::new("relative-media");
+        let path = dir.0.join("edit.tessera");
+        let project = project_with_media(dir.0.join("footage").join("a.mkv"));
+
+        save(&project, &path).unwrap();
+
+        assert_eq!(stored_media_path(&path), "footage/a.mkv");
+        assert_eq!(open(&path).unwrap(), project);
+    }
+
+    #[test]
+    fn a_moved_project_directory_keeps_finding_its_media() {
+        let dir = ScratchDir::new("moved-media");
+        let first = dir.0.join("first");
+        let second = dir.0.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        save(
+            &project_with_media(first.join("a.mkv")),
+            &first.join("edit.tessera"),
+        )
+        .unwrap();
+        fs::rename(first.join("edit.tessera"), second.join("edit.tessera")).unwrap();
+
+        let opened = open(&second.join("edit.tessera")).unwrap();
+
+        assert_eq!(opened.assets[0].path, second.join("a.mkv"));
+    }
+
+    #[test]
+    fn media_elsewhere_is_stored_with_its_absolute_path() {
+        let dir = ScratchDir::new("absolute-media");
+        let path = dir.0.join("edit.tessera");
+        let project = project_with_media("/media/elsewhere/a.mkv".into());
+
+        save(&project, &path).unwrap();
+
+        assert_eq!(stored_media_path(&path), "/media/elsewhere/a.mkv");
+        assert_eq!(open(&path).unwrap(), project);
+    }
+
+    #[test]
+    fn a_path_relative_to_the_working_directory_is_stored_absolute() {
+        let dir = ScratchDir::new("cwd-media");
+        let path = dir.0.join("edit.tessera");
+        let relative = PathBuf::from("relative/still.png");
+        let absolute = std::path::absolute(&relative).unwrap();
+
+        save(&project_with_media(relative), &path).unwrap();
+
+        assert_eq!(open(&path).unwrap().assets[0].path, absolute);
+    }
+
+    #[test]
+    fn the_pure_text_functions_leave_paths_as_they_are() {
+        let project = project_with_media("relative/still.png".into());
+
+        let text = to_string(&project).unwrap();
+
+        assert_eq!(from_str(&text).unwrap(), project);
+    }
+
+    #[test]
+    fn a_project_saved_through_a_symlink_is_relative_to_the_file_it_points_at() {
+        let dir = ScratchDir::new("symlink-media");
+        let real = dir.0.join("real");
+        fs::create_dir_all(&real).unwrap();
+        symlink(real.join("edit.tessera"), dir.0.join("link.tessera")).unwrap();
+        let project = project_with_media(real.join("a.mkv"));
+
+        save(&project, &dir.0.join("link.tessera")).unwrap();
+
+        assert_eq!(stored_media_path(&real.join("edit.tessera")), "a.mkv");
+        assert_eq!(open(&dir.0.join("link.tessera")).unwrap(), project);
     }
 
     #[test]

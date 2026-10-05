@@ -11,8 +11,6 @@
 
 ## Project files
 
-- Store media paths relative to the project file when the media sits under it, and resolve relative
-  paths against the project's directory rather than the working directory
 - Refuse non-UTF-8 media paths at import or store them losslessly; such a project can never be saved
 - Confirm the overwrite when `.tessera` is appended to a name the save dialog approved without it
 - Save As and recent projects

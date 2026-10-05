@@ -102,7 +102,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   ranges, rates, sizes and channel counts (none zero), asset durations (positive), stream indices
   (unique within an asset) and one track of each kind are checked, each failure a distinct
   `ValidationError`.
-  `to_string` and `from_str` are pure. `save` follows symlinks to the file they point at (refusing a
+  `to_string` and `from_str` are pure and leave media paths as they are. `save` and `open` make them
+  portable: a media path under the project file's directory (the directory of the file a symlink
+  points at) is stored relative to it, any other path is stored absolute (a path relative to the
+  working directory included), and `open` joins a relative stored path onto that directory. `save` follows symlinks to the file they point at (refusing a
   loop, `SymlinkLoop`), writes a synced sibling temp file of its own (`create_new`, named by pid and
   a process-wide counter) carrying the replaced file's permissions, renames it over the target and
   syncs the directory. `open` and `save` errors carry the path. A fixture in

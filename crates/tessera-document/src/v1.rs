@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     num::{NonZeroU16, NonZeroU32},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -119,6 +119,36 @@ impl TryFrom<&model::Project> for Project {
     type Error = FormatError;
 
     fn try_from(project: &model::Project) -> Result<Self, FormatError> {
+        Self::encode(project, None)
+    }
+}
+
+impl Project {
+    pub fn encode(project: &model::Project, directory: Option<&Path>) -> Result<Self, FormatError> {
+        let mut encoded = Self::from_model(project)?;
+        if let Some(directory) = directory {
+            for asset in &mut encoded.assets {
+                if let Some(stored) = stored_path(Path::new(&asset.path), directory) {
+                    asset.path = stored;
+                }
+            }
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(self, directory: Option<&Path>) -> Result<model::Project, ValidationError> {
+        let mut project = model::Project::try_from(self)?;
+        if let Some(directory) = directory {
+            for asset in &mut project.assets {
+                if asset.path.is_relative() {
+                    asset.path = directory.join(&asset.path);
+                }
+            }
+        }
+        Ok(project)
+    }
+
+    fn from_model(project: &model::Project) -> Result<Self, FormatError> {
         Ok(Self {
             name: project.name.clone(),
             settings: project.settings.into(),
@@ -136,6 +166,15 @@ impl TryFrom<&model::Project> for Project {
             out_point_flicks: project.out_point.map(Time::flicks),
         })
     }
+}
+
+fn stored_path(path: &Path, directory: &Path) -> Option<String> {
+    let absolute = std::path::absolute(path).ok()?;
+    let stored = match absolute.strip_prefix(directory) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative,
+        _ => &absolute,
+    };
+    stored.to_str().map(str::to_owned)
 }
 
 impl From<model::SequenceSettings> for SequenceSettings {
