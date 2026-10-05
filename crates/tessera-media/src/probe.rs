@@ -3,7 +3,12 @@ use std::{
     path::Path,
 };
 
-use ffmpeg_next::{codec, ffi::AV_TIME_BASE, format, media};
+use ffmpeg_next::{
+    codec,
+    ffi::AV_TIME_BASE,
+    format::{self, stream::Disposition},
+    media,
+};
 use tessera_timeline::{AudioStream, FrameRate, MediaInfo, Stream, Time, VideoStream};
 
 use crate::Error;
@@ -21,8 +26,15 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo, Error> {
         (input.duration() > 0).then(|| Time::from_rational(input.duration(), CONTAINER_TIME_BASE));
     let streams = input
         .streams()
-        .filter_map(|stream| describe(&stream).transpose())
-        .collect::<Result<_, _>>()?;
+        .filter(|stream| !stream.disposition().contains(Disposition::ATTACHED_PIC))
+        .filter_map(|stream| match describe(&stream) {
+            Ok(described) => described,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "skipping a stream that cannot be decoded");
+                None
+            }
+        })
+        .collect();
     Ok(MediaInfo { duration, streams })
 }
 
@@ -98,6 +110,31 @@ mod tests {
             (audio[0].sample_rate.get(), audio[0].channels.get()),
             (fixture::AUDIO_SAMPLE_RATE.get(), fixture::AUDIO_CHANNELS)
         );
+    }
+
+    #[test]
+    fn cover_art_is_not_listed_as_a_video_stream() {
+        let path =
+            std::env::temp_dir().join(format!("tessera-media-{}-cover.m4a", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+            .args(["-f", "lavfi", "-i", "color=c=red:s=64x64:d=1"])
+            .args(["-frames:v", "1", "-map", "0:a", "-map", "1:v"])
+            .args(["-c:a", "aac", "-c:v", "mjpeg"])
+            .args(["-disposition:v", "attached_pic"])
+            .arg(&path)
+            .status();
+        if !made.is_ok_and(|status| status.success()) {
+            return;
+        }
+        crate::init().unwrap();
+
+        let info = probe(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(info.video().count(), 0);
+        assert_eq!(info.audio().count(), 1);
     }
 
     #[test]

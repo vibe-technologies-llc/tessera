@@ -28,8 +28,7 @@
   decoder fails to open or mid-stream, and retry a device that failed to create
 - Re-anchor audio on packet timestamps after gaps and jumps, not only after a seek, and stop reading
   a terminal IO error from the packet iterator as a clean end of file
-- Skip attached-picture streams (cover art) and undecodable streams when probing instead of listing
-  them as video or failing the import, and decode the probed stream index rather than `best()`
+- Decode the probed stream index rather than `best()`
 - Stop seeking again on every request for a time before the stream's first frame
 - Keep a decoded run of frames for backward stepping and reverse shuttle, and budget frame caches
   across decoders instead of 256 MiB each
@@ -103,8 +102,6 @@
   stills and audio-only files
 - Tests for `Mixer::render`, the `Output` lifecycle, `PlaybackClock`, `ProjectEditor` undo and redo,
   the bin's import path and cross-track clip moves
-- Bring the README up to date: it says Tessera can't import or play video, lists five of the seven
-  crates and leaves out `rust-formatter`
 
 ## Compositing
 

@@ -113,7 +113,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
   system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
   here. Probing leaves out a stream whose size, sample rate or channel count FFmpeg reports as zero,
-  which the model can't hold. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
+  which the model can't hold, an attached picture (cover art) and a stream whose decoder cannot be
+  set up (warned about), instead of failing the import. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
   byte-bounded LRU cache keyed by the span each frame covers. FFmpeg types do not cross its public
   API, apart from the `FfmpegError` re-export. A decoder refuses a stream whose time base has a

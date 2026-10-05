@@ -9,3 +9,4 @@ publish.workspace = true
 ffmpeg-next.workspace = true
 tessera-timeline.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
