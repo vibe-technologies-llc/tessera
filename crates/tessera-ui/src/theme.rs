@@ -71,3 +71,7 @@ pub fn marker() -> Rgba {
 pub fn in_out_range() -> Rgba {
     rgba(0x5fd0e022)
 }
+
+pub fn black() -> Rgba {
+    rgb(0x000000)
+}

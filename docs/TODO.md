@@ -57,19 +57,8 @@
 
 ## Viewer
 
-- Render at the viewer's size instead of the sequence's: a 4K sequence decodes, uploads, reads back
-  and atlases about 33 MB a frame for a panel a few hundred pixels wide
-- Recover when a render job panics or the device is lost: the renderer moved into the job never
-  comes back and the picture freezes for the session, and `composite` errors have no fallback
-- Show black in gaps and past the last clip, instead of flashing the sequence placeholder text
-- Discard a finished render that no longer matches the wanted frame: a deleted clip or a seek shows
-  the old frame for one job, and a gap keeps the last frame until the job ends
-- Show the layers that decoded when one fails, and remember media that fails to open instead of
-  reopening and warning on every frame
-- Close decoders of media no clip uses any more, and give two clips of one file their own decoders
-- Skip the GPU pass for a single opaque layer of the sequence's size, and read back without waiting
-  on the GPU in the same job
-- Decode a frame's layers in parallel, and keep cache hits out of the render latency average
+- Read the composited frame back without waiting on the GPU in the same job
+- Keep cache hits out of the render latency average
 - Release replaced frames from the atlas when they are replaced, not on the next paint
 - Zoom, a 100 % view and safe-area overlays
 

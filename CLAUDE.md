@@ -263,12 +263,22 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   ruler. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` requests every video clip under the
-  playhead as a layer, bottom to top. A background job decodes each at sequence size and
-  composites them into a sequence-sized frame, letterbox bars included, which becomes the GPUI
-  image. The job carries one decoder per media path and size, dropping decoders and frames of
-  media the project no longer holds, and a `Compositor` it creates on first use off the UI thread.
-  If that creation fails it warns once and shows the top layer's decoded frame alone from then on.
-  One job runs at a time, so while scrubbing only the newest request runs next, and the viewer
+  playhead as a layer, bottom to top (`Timeline::video_layers_at`, which leaves out muted tracks).
+  A background job decodes the layers in parallel, one thread each, at the render size and
+  composites them into a frame of that size, letterbox bars included, which becomes the GPUI image.
+  The render size is the sequence scaled down uniformly (in steps of an eighth) to the viewer's
+  frame, never above the sequence (`render_bounds`), and a change of it reopens the decoders. The
+  job carries one decoder per media path, track and size, closing those whose track no longer
+  holds a clip of that media, so two clips of one file on different tracks never share one and
+  split clips on one track do. Media that fails to open is remembered per decoder key and warned
+  about once, and the layers that did decode still show. A single layer that already has the
+  render size skips the compositor. The job creates a `Compositor` on first use off the UI thread;
+  if that fails it warns once and shows the top layer's decoded frame alone from then on, and
+  after a compositing error it shows that frame, recreates the compositor and gives up after three
+  errors in a row. A panic in a job is caught: the viewer shows a failure and starts a new
+  renderer. A gap in the timeline shows black (`Picture::Black`), and a clip that is deleted or
+  moved off its track blacks the picture at once. A finished render is shown only while the
+  playhead is still at it (when paused it must also still match the wanted frame). One job runs at a time, so while scrubbing only the newest request runs next, and the viewer
   releases each replaced frame from the GPUI atlas with `Window::drop_image`. While playing, it
   asks for the frame at the time it will reach the screen instead of the playhead's: the playhead
   plus the render latency (a smoothed average of recent jobs) times the speed, clamped to the

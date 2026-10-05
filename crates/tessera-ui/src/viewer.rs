@@ -1,14 +1,16 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     mem,
+    panic::{self, AssertUnwindSafe},
     path::PathBuf,
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, IntoElement, ObjectFit, ParentElement, Render,
-    RenderImage, SharedString, Styled, StyledImage, Window, div, img,
+    AnyElement, AppContext, Context, Entity, IntoElement, ObjectFit, ParentElement, Pixels, Render,
+    RenderImage, SharedString, Size, Styled, StyledImage, Window, canvas, div, img,
 };
 use tessera_media::{VideoDecoder, VideoFrame};
 use tessera_render::{Compositor, Frame, Layer};
@@ -23,12 +25,18 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DecoderKey {
     path: PathBuf,
+    track: usize,
     bounds: (u32, u32),
 }
 
 type Decoders = HashMap<DecoderKey, VideoDecoder>;
+type FailedMedia = HashMap<DecoderKey, SharedString>;
 
 const LATENCY_SMOOTHING: u32 = 4;
+const SIZE_STEPS: f32 = 8.;
+const COMPOSITOR_STRIKES: u32 = 3;
+const RENDERER_PANICKED: &str = "The renderer stopped unexpectedly";
+const NO_VIDEO: &str = "No video clip is under the playhead";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LayerRequest {
@@ -39,7 +47,7 @@ struct LayerRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FrameRequest {
     layers: Vec<LayerRequest>,
-    sequence: (u32, u32),
+    bounds: (u32, u32),
 }
 
 impl FrameRequest {
@@ -97,30 +105,68 @@ impl CompositorSlot {
 
 struct Renderer {
     decoders: Decoders,
+    failed: FailedMedia,
     compositor: CompositorSlot,
+    compositor_strikes: u32,
 }
 
 impl Renderer {
     fn new() -> Self {
         Self {
             decoders: Decoders::new(),
+            failed: FailedMedia::new(),
             compositor: CompositorSlot::Uncreated,
+            compositor_strikes: 0,
         }
     }
 
+    fn retain(&mut self, mut live: impl FnMut(&DecoderKey) -> bool) {
+        self.decoders.retain(|key, _| live(key));
+        self.failed.retain(|key, _| live(key));
+    }
+
     fn render(&mut self, request: &FrameRequest) -> Picture {
-        let image = decode_layers(&mut self.decoders, &request.layers).and_then(|frames| {
-            assemble_image(self.compositor.compositor(), request.sequence, frames)
-        });
-        match image {
+        let decoded = decode_layers(&mut self.decoders, &mut self.failed, &request.layers);
+        if decoded.frames.is_empty() {
+            let reason = decoded.first_failure.unwrap_or_else(|| NO_VIDEO.into());
+            return Picture::Failed(reason);
+        }
+        let assembled =
+            assemble_image(self.compositor.compositor(), request.bounds, decoded.frames);
+        if assembled.compositing_failed {
+            self.compositor_strikes += 1;
+            self.compositor = if self.compositor_strikes >= COMPOSITOR_STRIKES {
+                CompositorSlot::Unavailable
+            } else {
+                CompositorSlot::Uncreated
+            };
+        } else {
+            self.compositor_strikes = 0;
+        }
+        match assembled.image {
             Ok(image) => Picture::Frame(image),
             Err(reason) => Picture::Failed(reason),
         }
     }
 }
 
+fn render_guarded<R>(
+    mut renderer: R,
+    render: impl FnOnce(&mut R) -> Picture,
+    replacement: impl FnOnce() -> R,
+) -> (R, Picture) {
+    match panic::catch_unwind(AssertUnwindSafe(|| render(&mut renderer))) {
+        Ok(picture) => (renderer, picture),
+        Err(_) => {
+            tracing::error!("the viewer renderer panicked, starting a new one");
+            (replacement(), Picture::Failed(RENDERER_PANICKED.into()))
+        }
+    }
+}
+
 enum Picture {
     Empty,
+    Black,
     Frame(Arc<RenderImage>),
     Failed(SharedString),
 }
@@ -130,6 +176,8 @@ pub struct Viewer {
     playhead: Entity<Playhead>,
     idle_renderer: Option<Renderer>,
     latency: Duration,
+    view: Option<(f32, f32)>,
+    bounds: (u32, u32),
     wanted: Target,
     pending: Option<Rendered>,
     shown: Option<FrameRequest>,
@@ -153,11 +201,14 @@ impl Viewer {
             cx.notify();
         })
         .detach();
+        let bounds = sequence_bounds(project.read(cx));
         let mut viewer = Self {
             project,
             playhead,
             idle_renderer: Some(Renderer::new()),
             latency: Duration::ZERO,
+            view: None,
+            bounds,
             wanted: Target::default(),
             pending: None,
             shown: None,
@@ -168,13 +219,25 @@ impl Viewer {
         viewer
     }
 
+    fn set_view(&mut self, size: Size<Pixels>, scale: f32, cx: &mut Context<Self>) {
+        let view = (
+            f32::from(size.width) * scale,
+            f32::from(size.height) * scale,
+        );
+        if self.view != Some(view) {
+            self.view = Some(view);
+            self.refresh(cx);
+        }
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.bounds = render_bounds(sequence_bounds(self.project.read(cx)), self.view);
         let stale = self
             .shown
             .as_ref()
             .is_some_and(|shown| !self.is_live_request(shown, cx));
         if stale {
-            self.show(None, Picture::Empty, cx);
+            self.show(None, Picture::Black, cx);
         }
         if let Some(pending) = self.pending.take()
             && pending
@@ -198,18 +261,25 @@ impl Viewer {
         self.wanted = Target {
             time,
             speed,
-            request: frame_request(project, time),
+            request: frame_request(project, time, self.bounds),
         };
         self.render_wanted(cx);
     }
 
     fn is_live(&self, decoder: &DecoderKey, cx: &Context<Self>) -> bool {
         let project = self.project.read(cx);
-        decoder.bounds == sequence_bounds(project)
+        decoder.bounds == self.bounds
             && project
-                .assets
-                .iter()
-                .any(|asset| asset.path == decoder.path)
+                .timeline
+                .tracks
+                .get(decoder.track)
+                .is_some_and(|track| {
+                    track.clips().iter().any(|clip| {
+                        project
+                            .asset(clip.asset)
+                            .is_some_and(|asset| asset.path == decoder.path)
+                    })
+                })
     }
 
     fn is_live_request(&self, request: &FrameRequest, cx: &Context<Self>) -> bool {
@@ -224,26 +294,29 @@ impl Viewer {
         if *latest == self.wanted.request {
             return;
         }
-        let Some(mut renderer) = self.idle_renderer.take() else {
-            return;
-        };
         let target = self.wanted.clone();
         let Some(request) = target.request.clone() else {
-            self.idle_renderer = Some(renderer);
+            self.pending = None;
             self.settle(
                 Rendered {
                     target,
-                    picture: Picture::Empty,
+                    picture: Picture::Black,
                 },
                 cx,
             );
             return;
         };
-        renderer.decoders.retain(|key, _| self.is_live(key, cx));
+        let Some(mut renderer) = self.idle_renderer.take() else {
+            return;
+        };
+        renderer.retain(|key| self.is_live(key, cx));
         let started = Instant::now();
         let rendered = cx.background_spawn(async move {
-            let picture = renderer.render(&request);
-            (renderer, picture)
+            render_guarded(
+                renderer,
+                |renderer| renderer.render(&request),
+                Renderer::new,
+            )
         });
         cx.spawn(async move |this, cx| {
             let (renderer, picture) = rendered.await;
@@ -266,7 +339,14 @@ impl Viewer {
 
     fn settle(&mut self, rendered: Rendered, cx: &mut Context<Self>) {
         let playhead = self.playhead.read(cx);
-        match fate(&rendered.target, playhead.time(), playhead.speed()) {
+        let superseded =
+            playhead.speed().is_paused() && rendered.target.request != self.wanted.request;
+        let fate = if superseded {
+            Fate::Drop
+        } else {
+            fate(&rendered.target, playhead.time(), playhead.speed())
+        };
+        match fate {
             Fate::Show => {
                 self.pending = None;
                 self.show(rendered.target.request, rendered.picture, cx);
@@ -287,6 +367,7 @@ impl Viewer {
     fn picture(&self, placeholder: String) -> AnyElement {
         match &self.picture {
             Picture::Empty => div().child(placeholder).into_any_element(),
+            Picture::Black => div().size_full().bg(theme::black()).into_any_element(),
             Picture::Frame(image) => img(image.clone())
                 .size_full()
                 .object_fit(ObjectFit::Contain)
@@ -318,7 +399,9 @@ impl Render for Viewer {
             settings.height,
             settings.frame_rate.as_f64()
         );
+        let viewer = cx.entity();
         let mut frame = div()
+            .relative()
             .max_w_full()
             .max_h_full()
             .h_full()
@@ -328,7 +411,18 @@ impl Render for Viewer {
             .overflow_hidden()
             .bg(theme::frame())
             .text_color(theme::text_muted())
-            .child(self.picture(placeholder));
+            .child(self.picture(placeholder))
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        let scale = window.scale_factor();
+                        viewer.update(cx, |viewer, cx| viewer.set_view(bounds.size, scale, cx));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
         frame.style().aspect_ratio = Some(aspect_ratio);
         div()
             .size_full()
@@ -361,23 +455,36 @@ fn sequence_bounds(project: &Project) -> (u32, u32) {
     (project.settings.width.get(), project.settings.height.get())
 }
 
-fn frame_request(project: &Project, time: Time) -> Option<FrameRequest> {
-    let sequence = sequence_bounds(project);
+fn render_bounds(sequence: (u32, u32), view: Option<(f32, f32)>) -> (u32, u32) {
+    let Some((view_width, view_height)) =
+        view.filter(|(width, height)| *width > 0. && *height > 0.)
+    else {
+        return sequence;
+    };
+    let (width, height) = (sequence.0 as f32, sequence.1 as f32);
+    let fit = (view_width / width).min(view_height / height).min(1.);
+    let stepped = ((fit * SIZE_STEPS).ceil() / SIZE_STEPS).clamp(1. / SIZE_STEPS, 1.);
+    let scaled = |side: f32, original: u32| ((side * stepped).round() as u32).clamp(1, original);
+    (scaled(width, sequence.0), scaled(height, sequence.1))
+}
+
+fn frame_request(project: &Project, time: Time, bounds: (u32, u32)) -> Option<FrameRequest> {
     let layers: Vec<LayerRequest> = project
         .timeline
-        .video_clips_at(time)
-        .filter_map(|clip| {
+        .video_layers_at(time)
+        .filter_map(|(track, clip)| {
             let asset = project.asset(clip.asset)?;
             Some(LayerRequest {
                 decoder: DecoderKey {
                     path: asset.path.clone(),
-                    bounds: sequence,
+                    track,
+                    bounds,
                 },
                 time: clip.source_time_at(time)?,
             })
         })
         .collect();
-    (!layers.is_empty()).then_some(FrameRequest { layers, sequence })
+    (!layers.is_empty()).then_some(FrameRequest { layers, bounds })
 }
 
 fn presentation_time(
@@ -396,7 +503,7 @@ fn presentation_time(
 
 fn fate(target: &Target, playhead: Time, speed: Speed) -> Fate {
     let due = match speed.factor() {
-        0 => target.speed.is_paused() || target.time == playhead,
+        0 => target.time == playhead,
         1.. => target.time <= playhead,
         _ => target.time >= playhead,
     };
@@ -422,64 +529,164 @@ fn speed_label(speed: Speed) -> Option<String> {
     }
 }
 
+struct Decoded {
+    frames: Vec<Arc<VideoFrame>>,
+    first_failure: Option<SharedString>,
+}
+
+enum LayerFailure {
+    Remembered(SharedString),
+    Open(tessera_media::Error),
+    Frame(tessera_media::Error),
+}
+
+struct LayerDecode {
+    decoder: Option<VideoDecoder>,
+    frame: Result<Arc<VideoFrame>, LayerFailure>,
+}
+
 fn decode_layers(
     decoders: &mut Decoders,
+    failed: &mut FailedMedia,
     layers: &[LayerRequest],
-) -> Result<Vec<Arc<VideoFrame>>, SharedString> {
-    layers
+) -> Decoded {
+    let jobs: Vec<(&LayerRequest, Result<Option<VideoDecoder>, SharedString>)> = layers
         .iter()
-        .map(|layer| {
-            decode_layer(decoders, layer).map_err(|error| {
-                tracing::warn!(path = %layer.decoder.path.display(), %error, "viewer decode failed");
-                SharedString::from(error.to_string())
-            })
+        .map(|layer| match failed.get(&layer.decoder) {
+            Some(reason) => (layer, Err(reason.clone())),
+            None => (layer, Ok(decoders.remove(&layer.decoder))),
         })
-        .collect()
+        .collect();
+    let outcomes: Vec<LayerDecode> = if layers.len() > 1 {
+        thread::scope(|scope| {
+            let running: Vec<_> = jobs
+                .into_iter()
+                .map(|(layer, decoder)| scope.spawn(move || decode_layer(layer, decoder)))
+                .collect();
+            running
+                .into_iter()
+                .map(|running| {
+                    running.join().unwrap_or_else(|_| LayerDecode {
+                        decoder: None,
+                        frame: Err(LayerFailure::Remembered(RENDERER_PANICKED.into())),
+                    })
+                })
+                .collect()
+        })
+    } else {
+        jobs.into_iter()
+            .map(|(layer, decoder)| decode_layer(layer, decoder))
+            .collect()
+    };
+    let mut decoded = Decoded {
+        frames: Vec::new(),
+        first_failure: None,
+    };
+    for (layer, outcome) in layers.iter().zip(outcomes) {
+        if let Some(decoder) = outcome.decoder {
+            decoders.insert(layer.decoder.clone(), decoder);
+        }
+        let path = layer.decoder.path.display();
+        match outcome.frame {
+            Ok(frame) => decoded.frames.push(frame),
+            Err(failure) => {
+                let reason = match failure {
+                    LayerFailure::Remembered(reason) => reason,
+                    LayerFailure::Open(error) => {
+                        tracing::warn!(%path, %error, "viewer cannot open the media");
+                        let reason = SharedString::from(error.to_string());
+                        failed.insert(layer.decoder.clone(), reason.clone());
+                        reason
+                    }
+                    LayerFailure::Frame(error) => {
+                        tracing::warn!(%path, %error, "viewer decode failed");
+                        error.to_string().into()
+                    }
+                };
+                decoded.first_failure.get_or_insert(reason);
+            }
+        }
+    }
+    decoded
 }
 
 fn decode_layer(
-    decoders: &mut Decoders,
     layer: &LayerRequest,
-) -> Result<Arc<VideoFrame>, tessera_media::Error> {
-    let (decoder, newly_opened) = match decoders.entry(layer.decoder.clone()) {
-        Entry::Occupied(entry) => (entry.into_mut(), false),
-        Entry::Vacant(entry) => {
-            let DecoderKey { path, bounds } = entry.key();
+    decoder: Result<Option<VideoDecoder>, SharedString>,
+) -> LayerDecode {
+    let mut decoder = match decoder {
+        Err(reason) => {
+            return LayerDecode {
+                decoder: None,
+                frame: Err(LayerFailure::Remembered(reason)),
+            };
+        }
+        Ok(Some(decoder)) => decoder,
+        Ok(None) => {
+            let DecoderKey { path, bounds, .. } = &layer.decoder;
             let (width, height) = *bounds;
-            let opened = VideoDecoder::open(path)?.fit_within(width, height);
-            (entry.insert(opened), true)
+            match VideoDecoder::open(path) {
+                Ok(opened) => {
+                    let opened = opened.fit_within(width, height);
+                    tracing::debug!(
+                        path = %path.display(),
+                        hw_accel = ?opened.hw_accel(),
+                        "viewer decoder opened"
+                    );
+                    opened
+                }
+                Err(error) => {
+                    return LayerDecode {
+                        decoder: None,
+                        frame: Err(LayerFailure::Open(error)),
+                    };
+                }
+            }
         }
     };
-    let frame = decoder.frame_at(layer.time)?;
-    if newly_opened {
-        tracing::debug!(
-            path = %layer.decoder.path.display(),
-            hw_accel = ?decoder.hw_accel(),
-            "viewer decoder opened"
-        );
+    let frame = decoder.frame_at(layer.time).map_err(LayerFailure::Frame);
+    LayerDecode {
+        decoder: Some(decoder),
+        frame,
     }
-    Ok(frame)
+}
+
+struct Assembled {
+    image: Result<Arc<RenderImage>, SharedString>,
+    compositing_failed: bool,
+}
+
+fn fills_the_sequence(frames: &[Arc<VideoFrame>], (width, height): (u32, u32)) -> bool {
+    matches!(frames, [only] if only.width == width && only.height == height)
 }
 
 fn assemble_image(
     compositor: Option<&mut Compositor>,
-    sequence: (u32, u32),
+    bounds: (u32, u32),
     mut frames: Vec<Arc<VideoFrame>>,
-) -> Result<Arc<RenderImage>, SharedString> {
-    let image = match compositor {
-        Some(compositor) => {
-            let composited = composite_frames(compositor, sequence, &frames).map_err(|error| {
-                tracing::warn!(%error, "viewer compositing failed");
-                SharedString::from(error.to_string())
-            })?;
-            render_image(composited)
+) -> Assembled {
+    let mut compositing_failed = false;
+    let composited = match compositor {
+        Some(compositor) if !fills_the_sequence(&frames, bounds) => {
+            match composite_frames(compositor, bounds, &frames) {
+                Ok(composited) => Some(composited),
+                Err(error) => {
+                    tracing::warn!(%error, "viewer compositing failed, showing the top layer as decoded");
+                    compositing_failed = true;
+                    None
+                }
+            }
         }
-        None => {
-            let top = frames.pop().ok_or("No video clip is under the playhead")?;
-            render_image(top)
-        }
+        _ => None,
     };
-    image.ok_or_else(|| "The decoded frame has an unexpected size".into())
+    let image = match composited {
+        Some(composited) => render_image(composited),
+        None => frames.pop().and_then(render_image),
+    };
+    Assembled {
+        image: image.ok_or_else(|| SharedString::from("The decoded frame has an unexpected size")),
+        compositing_failed,
+    }
 }
 
 fn composite_frames(
@@ -600,8 +807,16 @@ mod tests {
     #[test]
     fn the_request_stacks_video_clips_from_the_bottom_track_up() {
         let project = stacked_project();
-        let paths =
-            |seconds| layer_paths(frame_request(&project, Time::from_seconds(seconds)).as_ref());
+        let paths = |seconds| {
+            layer_paths(
+                frame_request(
+                    &project,
+                    Time::from_seconds(seconds),
+                    sequence_bounds(&project),
+                )
+                .as_ref(),
+            )
+        };
         assert_eq!(
             paths(3),
             [
@@ -618,10 +833,13 @@ mod tests {
             ]
         );
         assert_eq!(paths(0), [PathBuf::from("/missing/bottom.mkv")]);
-        assert!(frame_request(&project, Time::from_seconds(9)).is_none());
+        assert!(
+            frame_request(&project, Time::from_seconds(9), sequence_bounds(&project)).is_none()
+        );
 
-        let request = frame_request(&project, Time::from_seconds(4)).unwrap();
-        assert_eq!(request.sequence, sequence_bounds(&project));
+        let request =
+            frame_request(&project, Time::from_seconds(4), sequence_bounds(&project)).unwrap();
+        assert_eq!(request.bounds, sequence_bounds(&project));
         let times: Vec<Time> = request.layers.iter().map(|layer| layer.time).collect();
         assert_eq!(
             times,
@@ -697,8 +915,12 @@ mod tests {
             Fate::Show
         );
         assert_eq!(
-            fate(&target(12, Speed::PAUSED), now, Speed::PAUSED),
+            fate(&target(30, Speed::PAUSED), now, Speed::PAUSED),
             Fate::Show
+        );
+        assert_eq!(
+            fate(&target(12, Speed::PAUSED), now, Speed::PAUSED),
+            Fate::Drop
         );
         assert_eq!(
             fate(&target(27, Speed::FORWARD), now, Speed::BACKWARD),
@@ -754,7 +976,7 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.read(|cx| viewer.read(cx).wanted.request.is_none()));
         assert!(cx.read(|cx| viewer.read(cx).shown.is_none()));
-        assert!(cx.read(|cx| matches!(viewer.read(cx).picture, Picture::Empty)));
+        assert!(cx.read(|cx| matches!(viewer.read(cx).picture, Picture::Black)));
     }
 
     #[gpui::test]
@@ -805,7 +1027,9 @@ mod tests {
     fn the_assembled_image_comes_at_sequence_size() {
         let mut compositor = Compositor::new().expect("a Vulkan adapter");
         let frames = vec![solid(8, 4, RED), solid(4, 4, BLUE)];
-        let image = assemble_image(Some(&mut compositor), (8, 4), frames).unwrap();
+        let image = assemble_image(Some(&mut compositor), (8, 4), frames)
+            .image
+            .unwrap();
         assert_eq!(image.size(0), gpui::size(8.into(), 4.into()));
         assert_eq!(image.as_bytes(0).unwrap()[..4], RED);
     }
@@ -813,8 +1037,132 @@ mod tests {
     #[test]
     fn without_a_compositor_the_top_frame_is_shown_as_decoded() {
         let frames = vec![solid(8, 4, RED), solid(4, 4, BLUE)];
-        let image = assemble_image(None, (8, 4), frames).unwrap();
+        let image = assemble_image(None, (8, 4), frames).image.unwrap();
         assert_eq!(image.size(0), gpui::size(4.into(), 4.into()));
         assert_eq!(image.as_bytes(0).unwrap()[..4], BLUE);
+    }
+
+    #[test]
+    fn a_single_layer_of_the_sequence_size_skips_the_gpu_pass() {
+        let sequence = (8, 4);
+
+        assert!(fills_the_sequence(&[solid(8, 4, RED)], sequence));
+        assert!(!fills_the_sequence(&[solid(4, 4, RED)], sequence));
+        assert!(!fills_the_sequence(
+            &[solid(8, 4, RED), solid(8, 4, BLUE)],
+            sequence
+        ));
+        assert!(!fills_the_sequence(&[], sequence));
+
+        let image = assemble_image(None, sequence, vec![solid(8, 4, BLUE)]);
+
+        assert!(!image.compositing_failed);
+        assert_eq!(image.image.unwrap().as_bytes(0).unwrap()[..4], BLUE);
+    }
+
+    #[test]
+    fn rendering_scales_the_sequence_down_to_the_view_but_never_up() {
+        let sequence = (3840, 2160);
+
+        assert_eq!(render_bounds(sequence, None), sequence);
+        assert_eq!(render_bounds(sequence, Some((0., 0.))), sequence);
+        assert_eq!(render_bounds(sequence, Some((8000., 5000.))), sequence);
+        assert_eq!(render_bounds(sequence, Some((1920., 1080.))), (1920, 1080));
+        assert_eq!(render_bounds(sequence, Some((1000., 1000.))), (1440, 810));
+
+        let (width, height) = render_bounds(sequence, Some((10., 10.)));
+        assert!(width < 600 && height < 340);
+        assert_eq!(
+            render_bounds(sequence, Some((1000., 1000.))),
+            render_bounds(sequence, Some((990., 990.)))
+        );
+    }
+
+    #[test]
+    fn two_clips_of_one_file_on_different_tracks_get_their_own_decoders() {
+        let mut project = Project::new("twins");
+        let upper = project.timeline.add_track(TrackKind::Video);
+        let asset = project.add_asset("/missing/twin.mkv".into(), video_info(8));
+        project.place_clip(asset, 0, Time::ZERO).unwrap();
+        project.place_clip(asset, upper, Time::ZERO).unwrap();
+
+        let request =
+            frame_request(&project, Time::from_seconds(1), sequence_bounds(&project)).unwrap();
+        let tracks: Vec<usize> = request.decoders().map(|decoder| decoder.track).collect();
+
+        assert_eq!(tracks, [0, upper]);
+        assert_ne!(request.layers[0].decoder, request.layers[1].decoder);
+    }
+
+    #[test]
+    fn media_that_fails_to_open_is_remembered_and_the_other_layers_still_show() {
+        let key = |path: &str, track| DecoderKey {
+            path: path.into(),
+            track,
+            bounds: (8, 4),
+        };
+        let layers = [
+            LayerRequest {
+                decoder: key("/missing/first.mkv", 0),
+                time: Time::ZERO,
+            },
+            LayerRequest {
+                decoder: key("/missing/second.mkv", 1),
+                time: Time::ZERO,
+            },
+        ];
+        let mut decoders = Decoders::new();
+        let mut failed = FailedMedia::new();
+
+        let decoded = decode_layers(&mut decoders, &mut failed, &layers);
+
+        assert!(decoded.frames.is_empty());
+        assert!(decoded.first_failure.is_some());
+        assert_eq!(failed.len(), 2);
+        assert!(decoders.is_empty());
+
+        let again = decode_layers(&mut decoders, &mut failed, &layers[..1]);
+
+        assert_eq!(again.first_failure, decoded.first_failure);
+        assert_eq!(failed.len(), 2);
+    }
+
+    #[test]
+    fn a_panicking_render_gives_back_a_fresh_renderer_and_a_failure() {
+        let (renderer, picture) =
+            render_guarded(1_u32, |_| panic!("the device was lost"), || 2_u32);
+
+        assert_eq!(renderer, 2);
+        assert!(matches!(picture, Picture::Failed(reason) if reason == RENDERER_PANICKED));
+
+        let (renderer, picture) = render_guarded(1_u32, |_| Picture::Black, || 2_u32);
+
+        assert_eq!(renderer, 1);
+        assert!(matches!(picture, Picture::Black));
+    }
+
+    #[gpui::test]
+    fn a_deleted_clip_leaves_black_at_once(cx: &mut TestAppContext) {
+        let project = cx.new(|_| project_showing("/missing/only.mkv"));
+        let (viewer, cx) = cx.add_window_view(|_, cx| {
+            let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
+            Viewer::new(project.clone(), playhead, cx)
+        });
+        cx.run_until_parked();
+
+        assert!(cx.read(|cx| viewer.read(cx).shown.is_some()));
+
+        cx.update(|_, cx| {
+            let editor = ProjectEditor::new(project.clone(), cx);
+            let id = project.read(cx).timeline.tracks[0].clips()[0].id;
+            editor
+                .apply(tessera_timeline::Command::DeleteClip, cx, |project| {
+                    project.delete_clip(id)
+                })
+                .unwrap();
+        });
+
+        assert!(cx.read(|cx| viewer.read(cx).shown.is_none()));
+        assert!(cx.read(|cx| matches!(viewer.read(cx).picture, Picture::Black)));
     }
 }

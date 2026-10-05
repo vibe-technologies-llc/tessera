@@ -410,11 +410,16 @@ impl Timeline {
             .unwrap_or(Time::ZERO)
     }
 
-    pub fn video_clips_at(&self, time: Time) -> impl DoubleEndedIterator<Item = &Clip> {
+    pub fn video_layers_at(&self, time: Time) -> impl DoubleEndedIterator<Item = (usize, &Clip)> {
         self.tracks
             .iter()
-            .filter(|track| track.kind == TrackKind::Video && !track.muted)
-            .filter_map(move |track| track.clip_at(time))
+            .enumerate()
+            .filter(|(_, track)| track.kind == TrackKind::Video && !track.muted)
+            .filter_map(move |(index, track)| Some((index, track.clip_at(time)?)))
+    }
+
+    pub fn video_clips_at(&self, time: Time) -> impl DoubleEndedIterator<Item = &Clip> {
+        self.video_layers_at(time).map(|(_, clip)| clip)
     }
 
     pub fn top_video_clip_at(&self, time: Time) -> Option<&Clip> {
