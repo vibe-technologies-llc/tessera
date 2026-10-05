@@ -22,16 +22,12 @@
 
 ## Playback and audio
 
-- Fall back to the wall clock and warn when the audio stream never runs: without a sink, after a
-  PipeWire restart or after a panic in the feeder the audio clock stands still and so does the
-  playhead
 - Keep one PipeWire connection for the session instead of connecting on every play, blocking the UI
   thread on it, and joining the stream thread on every pause
 - Play the sound of video clips, through linked audio clips or their own stream
 - Mix the audio tracks, with per-clip gain and per-track volume
 - Flush the queued audio when the project changes while playing, instead of playing up to 200 ms of
   the old timeline
-- Restart the output when the sequence's sample rate changes while playing
 - Play sound at shuttle speeds, in reverse and while scrubbing or stepping
 - Play the last frame's sound at the end of the timeline instead of stopping at its start
 - Retry media that failed during playback, and open decoders ahead of clip starts with reused mix

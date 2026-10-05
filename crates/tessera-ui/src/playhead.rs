@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroU32,
+    time::{Duration, Instant},
+};
 
 use gpui::{Context, Entity, Task};
 use tessera_audio::TimelinePlayback;
@@ -6,6 +9,7 @@ use tessera_timeline::{FrameRate, Project, Time};
 
 const MAX_SHUTTLE_SPEED: i64 = 8;
 const MIN_TICK: Duration = Duration::from_micros(8_333);
+const AUDIO_STALL_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Speed(i64);
@@ -58,33 +62,92 @@ impl Speed {
 struct Playback {
     speed: Speed,
     from: Time,
+    sample_rate: NonZeroU32,
     clock: PlaybackClock,
     _ticker: Task<()>,
 }
 
 enum PlaybackClock {
-    Wall(Instant),
-    Audio(TimelinePlayback),
+    Wall { started: Instant, offset: Time },
+    Audio(WatchedAudio<TimelinePlayback>),
+}
+
+trait ElapsedSource {
+    fn elapsed(&self) -> Time;
+}
+
+impl ElapsedSource for TimelinePlayback {
+    fn elapsed(&self) -> Time {
+        TimelinePlayback::elapsed(self)
+    }
+}
+
+struct WatchedAudio<S> {
+    source: S,
+    last: Time,
+    changed_at: Instant,
+}
+
+impl<S: ElapsedSource> WatchedAudio<S> {
+    fn new(source: S, now: Instant) -> Self {
+        Self {
+            source,
+            last: Time::ZERO,
+            changed_at: now,
+        }
+    }
+
+    fn poll(&mut self, now: Instant) -> Result<Time, Time> {
+        let elapsed = self.source.elapsed();
+        if elapsed != self.last {
+            self.last = elapsed;
+            self.changed_at = now;
+            return Ok(elapsed);
+        }
+        let silent_for = now.saturating_duration_since(self.changed_at);
+        if silent_for > AUDIO_STALL_AFTER {
+            Err(self.last + Time::from_duration(silent_for))
+        } else {
+            Ok(elapsed)
+        }
+    }
 }
 
 impl PlaybackClock {
+    fn wall() -> Self {
+        Self::Wall {
+            started: Instant::now(),
+            offset: Time::ZERO,
+        }
+    }
+
     fn start(speed: Speed, project: &Project, from: Time) -> Self {
         if speed != Speed::FORWARD {
-            return Self::Wall(Instant::now());
+            return Self::wall();
         }
         match TimelinePlayback::start(project.clone(), from) {
-            Ok(audio) => Self::Audio(audio),
+            Ok(audio) => Self::Audio(WatchedAudio::new(audio, Instant::now())),
             Err(error) => {
                 tracing::warn!(%error, "no audio output, playback follows the wall clock");
-                Self::Wall(Instant::now())
+                Self::wall()
             }
         }
     }
 
-    fn elapsed(&self) -> Time {
+    fn elapsed(&mut self) -> Time {
         match self {
-            Self::Wall(started) => Time::from_duration(started.elapsed()),
-            Self::Audio(audio) => audio.elapsed(),
+            Self::Wall { started, offset } => *offset + Time::from_duration(started.elapsed()),
+            Self::Audio(audio) => match audio.poll(Instant::now()) {
+                Ok(elapsed) => elapsed,
+                Err(position) => {
+                    tracing::warn!("the audio clock stopped, playback follows the wall clock");
+                    *self = Self::Wall {
+                        started: Instant::now(),
+                        offset: position,
+                    };
+                    position
+                }
+            },
         }
     }
 }
@@ -103,19 +166,29 @@ pub struct Playhead {
 impl Playhead {
     pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
         cx.observe(&project, |playhead, project, cx| {
-            if let Some(Playback {
-                clock: PlaybackClock::Audio(audio),
-                ..
-            }) = &playhead.playback
-            {
-                audio.update_project(project.read(cx).clone());
-            }
+            playhead.project_changed(project.read(cx).clone());
         })
         .detach();
         Self {
             project,
             time: Time::ZERO,
             playback: None,
+        }
+    }
+
+    fn project_changed(&mut self, project: Project) {
+        let time = self.time;
+        let Some(playback) = &mut self.playback else {
+            return;
+        };
+        let sample_rate = project.settings.sample_rate;
+        if sample_rate != playback.sample_rate && matches!(playback.clock, PlaybackClock::Audio(_))
+        {
+            playback.clock = PlaybackClock::start(playback.speed, &project, time);
+            playback.from = time;
+            playback.sample_rate = sample_rate;
+        } else if let PlaybackClock::Audio(audio) = &playback.clock {
+            audio.source.update_project(project);
         }
     }
 
@@ -188,6 +261,7 @@ impl Playhead {
             self.playback = Some(Playback {
                 speed,
                 from: start,
+                sample_rate: self.project.read(cx).settings.sample_rate,
                 clock,
                 _ticker: self.spawn_ticker(speed.tick(frame_rate), cx),
             });
@@ -209,12 +283,13 @@ impl Playhead {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(playback) = &self.playback else {
-            return false;
-        };
         let project = self.project.read(cx);
         let frame_rate = project.settings.frame_rate;
-        let Some(last) = last_frame(project.timeline.duration(), frame_rate) else {
+        let last = last_frame(project.timeline.duration(), frame_rate);
+        let Some(playback) = &mut self.playback else {
+            return false;
+        };
+        let Some(last) = last else {
             self.pause(cx);
             return false;
         };
@@ -231,6 +306,10 @@ impl Playhead {
             }
         }
     }
+}
+
+fn output_needs_restart(playing_at: NonZeroU32, wanted: NonZeroU32, audible: bool) -> bool {
+    audible && playing_at != wanted
 }
 
 pub(crate) fn last_frame(end: Time, frame_rate: FrameRate) -> Option<Time> {
@@ -328,5 +407,54 @@ mod tests {
         assert!(
             matches!(stopped(2_000, Speed::BACKWARD), Advance::StopAt(time) if time == Time::ZERO)
         );
+    }
+
+    struct Scripted(std::cell::Cell<i64>);
+
+    impl ElapsedSource for Scripted {
+        fn elapsed(&self) -> Time {
+            Time::from_seconds(self.0.get())
+        }
+    }
+
+    #[test]
+    fn an_audio_clock_that_stops_advancing_is_reported_with_the_position_to_continue_from() {
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut clock = WatchedAudio::new(Scripted(std::cell::Cell::new(0)), start);
+
+        assert_eq!(clock.poll(at(0)), Ok(Time::ZERO));
+
+        clock.source.0.set(2);
+
+        assert_eq!(clock.poll(at(2)), Ok(Time::from_seconds(2)));
+        assert_eq!(clock.poll(at(3)), Ok(Time::from_seconds(2)));
+        assert_eq!(clock.poll(at(4)), Err(Time::from_seconds(4)));
+        assert_eq!(clock.poll(at(6)), Err(Time::from_seconds(6)));
+
+        clock.source.0.set(7);
+
+        assert_eq!(clock.poll(at(7)), Ok(Time::from_seconds(7)));
+    }
+
+    #[test]
+    fn an_audio_clock_that_never_starts_falls_back_after_the_grace_period() {
+        let start = Instant::now();
+        let mut clock = WatchedAudio::new(Scripted(std::cell::Cell::new(0)), start);
+
+        assert_eq!(clock.poll(start + AUDIO_STALL_AFTER / 2), Ok(Time::ZERO));
+        assert_eq!(
+            clock.poll(start + AUDIO_STALL_AFTER + Duration::from_secs(1)),
+            Err(Time::from_seconds(2))
+        );
+    }
+
+    #[test]
+    fn only_a_playing_audio_output_restarts_for_a_new_sample_rate() {
+        let rate = |hz| NonZeroU32::new(hz).unwrap();
+
+        assert!(output_needs_restart(rate(48_000), rate(44_100), true));
+        assert!(!output_needs_restart(rate(48_000), rate(48_000), true));
+        assert!(!output_needs_restart(rate(48_000), rate(44_100), false));
     }
 }

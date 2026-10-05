@@ -228,7 +228,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `anchor + elapsed × speed`, so it never drifts, and stops on the timeline's last frame or at
   zero. At normal forward speed the clock is a `TimelinePlayback`, so the audio clock drives the
   picture, and the playhead passes each project change on to it. Other speeds, or a failed
-  audio output (warned about), use the wall clock and play no sound. Any seek or step pauses playback. The timeline's ruler is a `canvas` that paints its ticks
+  audio output (warned about), use the wall clock and play no sound. An audio clock that stops
+  advancing for a second (never started, or the stream died) is warned about and replaced by the
+  wall clock, continuing from where it stopped (`WatchedAudio`), and a change of the sequence's
+  sample rate while the audio clock runs starts a new output from the playhead. Any seek or step pauses playback. The timeline's ruler is a `canvas` that paints its ticks
   and timecode labels and scrubs the playhead through window mouse listeners, so a drag keeps
   tracking outside the ruler. The timeline maps time to pixels through a `Viewport` (zoom as
   pixels per second, plus the time at the left edge). The wheel scrolls it, Ctrl+wheel zooms
