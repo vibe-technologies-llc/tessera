@@ -9,12 +9,12 @@ pub struct Snap {
 pub struct SnapTargets(Vec<Time>);
 
 impl SnapTargets {
-    pub fn new(timeline: &Timeline, playhead: Time, moving: Option<ClipId>) -> Self {
+    pub fn new(timeline: &Timeline, playhead: Time, moving: &[ClipId]) -> Self {
         let edges = timeline
             .tracks
             .iter()
             .flat_map(|track| track.clips())
-            .filter(|clip| Some(clip.id) != moving)
+            .filter(|clip| !moving.contains(&clip.id))
             .map(|clip| clip.timeline_range())
             .flat_map(|range| [range.start, range.end()]);
         Self([Time::ZERO, playhead].into_iter().chain(edges).collect())
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn snaps_the_nearest_edge_to_the_nearest_target_within_tolerance() {
-        let targets = SnapTargets::new(&timeline(), seconds(20), None);
+        let targets = SnapTargets::new(&timeline(), seconds(20), &[]);
         let tolerance = millis(200);
         let edges = [seconds(5) + millis(150), seconds(10) - millis(100)];
         assert_eq!(
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn a_moving_clip_does_not_snap_to_itself() {
-        let targets = SnapTargets::new(&timeline(), seconds(20), Some(ClipId(0)));
+        let targets = SnapTargets::new(&timeline(), seconds(20), &[ClipId(0)]);
         assert_eq!(targets.snap(&[seconds(2) + millis(10)], millis(200)), None);
         assert_eq!(
             targets.snap(&[millis(100)], millis(200)),

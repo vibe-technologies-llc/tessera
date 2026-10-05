@@ -65,6 +65,10 @@ impl Viewport {
         }
     }
 
+    pub fn clamped(self, limit: Time) -> Self {
+        self.starting_at(self.start, limit)
+    }
+
     pub fn scrolled_by(self, delta: Pixels, limit: Time) -> Self {
         self.starting_at(self.time_at(delta), limit)
     }
@@ -132,6 +136,15 @@ mod tests {
         assert_eq!(
             viewport.scrolled_by(one_second * 200., LIMIT).start(),
             LIMIT
+        );
+    }
+
+    #[test]
+    fn clamping_pulls_a_view_past_the_limit_back_to_it() {
+        assert_eq!(at(40).clamped(Time::from_seconds(100)), at(40));
+        assert_eq!(
+            at(40).clamped(Time::from_seconds(25)).start(),
+            Time::from_seconds(25)
         );
     }
 

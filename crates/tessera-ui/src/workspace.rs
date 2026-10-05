@@ -9,9 +9,9 @@ use tessera_document::EXTENSION;
 use tessera_timeline::{Project, Time};
 
 use crate::{
-    DeleteClip, Import, Open, Pause, PlayPause, Redo, RippleDeleteClip, Save, ShuttleBackward,
-    ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping, Undo,
-    WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    DeleteClip, Import, Open, Pause, PlayPause, Redo, RippleDeleteClip, Save, SelectAll,
+    ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSnapping,
+    Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
@@ -375,6 +375,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &SplitAtPlayhead, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::split_at_playhead);
+            }))
+            .on_action(cx.listener(|workspace, _: &SelectAll, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::select_all);
             }))
             .on_action(cx.listener(|workspace, _: &DeleteClip, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::delete_selection);

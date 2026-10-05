@@ -100,6 +100,10 @@ impl Project {
         Ok(deleted)
     }
 
+    pub fn moved_clips(&self, moves: &[(ClipId, usize, Time)]) -> Result<Vec<Clip>, EditError> {
+        self.clone().move_clips(moves)
+    }
+
     pub fn move_clips(&mut self, moves: &[(ClipId, usize, Time)]) -> Result<Vec<Clip>, EditError> {
         let mut named = BTreeSet::new();
         if let Some(&(id, ..)) = moves.iter().find(|(id, ..)| !named.insert(*id)) {

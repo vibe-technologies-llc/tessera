@@ -2,6 +2,8 @@ mod header;
 mod snap;
 mod viewport;
 
+use std::collections::BTreeSet;
+
 use gpui::{
     App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity, Hitbox,
     HitboxBehavior, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -147,7 +149,7 @@ pub struct TimelinePanel {
     drop_preview: Option<DropPreview>,
     viewport: Viewport,
     lanes: Bounds<Pixels>,
-    selection: Option<ClipId>,
+    selection: BTreeSet<ClipId>,
     grab: Pixels,
     track_scroll: Pixels,
     tracks_view: Bounds<Pixels>,
@@ -157,7 +159,8 @@ pub struct TimelinePanel {
 impl TimelinePanel {
     pub fn new(editor: ProjectEditor, playhead: Entity<Playhead>, cx: &mut Context<Self>) -> Self {
         let project = editor.project().clone();
-        cx.observe(&project, |_, _, cx| cx.notify()).detach();
+        cx.observe(&project, |panel, _, cx| panel.project_changed(cx))
+            .detach();
         cx.observe(&playhead, |panel, _, cx| {
             panel.follow_playhead(cx);
             cx.notify();
@@ -171,7 +174,7 @@ impl TimelinePanel {
             drop_preview: None,
             viewport: Viewport::default(),
             lanes: Bounds::default(),
-            selection: None,
+            selection: BTreeSet::new(),
             grab: px(0.),
             track_scroll: px(0.),
             tracks_view: Bounds::default(),
@@ -179,8 +182,28 @@ impl TimelinePanel {
         }
     }
 
+    fn project_changed(&mut self, cx: &mut Context<Self>) {
+        let project = self.project.read(cx);
+        self.selection.retain(|id| project.find_clip(*id).is_some());
+        self.viewport = self.viewport.clamped(self.scroll_limit(cx));
+        cx.notify();
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selection = self
+            .project
+            .read(cx)
+            .timeline
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips())
+            .map(|clip| clip.id)
+            .collect();
+        cx.notify();
+    }
+
     pub fn project_replaced(&mut self, cx: &mut Context<Self>) {
-        self.selection = None;
+        self.selection.clear();
         self.drop_preview = None;
         self.viewport = Viewport::default();
         self.track_scroll = px(0.);
@@ -208,18 +231,21 @@ impl TimelinePanel {
     pub fn split_at_playhead(&mut self, cx: &mut Context<Self>) {
         let time = self.playhead.read(cx).time();
         let project = self.project.read(cx);
-        let selected = self
+        let selected: Vec<ClipId> = self
             .selection
-            .and_then(|id| project.find_clip(id))
-            .map(|(_, clip)| *clip)
-            .filter(|clip| clip.is_cut_by(time));
-        let targets: Vec<ClipId> = match selected {
-            Some(clip) => vec![clip.id],
-            None => project
+            .iter()
+            .filter_map(|id| project.find_clip(*id))
+            .filter(|(_, clip)| clip.is_cut_by(time))
+            .map(|(_, clip)| clip.id)
+            .collect();
+        let targets: Vec<ClipId> = if selected.is_empty() {
+            project
                 .timeline
                 .clips_cut_by(time)
                 .map(|clip| clip.id)
-                .collect(),
+                .collect()
+        } else {
+            selected
         };
         let split = self.editor.apply(Command::SplitClips, cx, |project| {
             targets
@@ -232,27 +258,28 @@ impl TimelinePanel {
     }
 
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
-        self.remove_selection(Command::DeleteClip, Project::delete_clip, cx);
+        self.remove_selection(Command::DeleteClip, Project::delete_clips, cx);
     }
 
     pub fn ripple_delete_selection(&mut self, cx: &mut Context<Self>) {
-        self.remove_selection(Command::RippleDeleteClip, Project::ripple_delete_clip, cx);
+        self.remove_selection(Command::RippleDeleteClip, Project::ripple_delete_clips, cx);
     }
 
     fn remove_selection(
         &mut self,
         command: Command,
-        remove: impl FnOnce(&mut Project, ClipId) -> Result<Clip, EditError>,
+        remove: impl FnOnce(&mut Project, &[ClipId]) -> Result<Vec<Clip>, EditError>,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = self.selection.take() else {
+        if self.selection.is_empty() {
             return;
-        };
+        }
+        let ids: Vec<ClipId> = std::mem::take(&mut self.selection).into_iter().collect();
         if let Err(error) = self
             .editor
-            .apply(command, cx, |project| remove(project, id))
+            .apply(command, cx, |project| remove(project, &ids))
         {
-            tracing::warn!(%error, "could not delete the clip");
+            tracing::warn!(%error, "could not delete the clips");
         }
         cx.notify();
     }
@@ -354,7 +381,7 @@ impl TimelinePanel {
         }
     }
 
-    fn press_lane(&mut self, track: usize, offset: Pixels, cx: &mut Context<Self>) {
+    fn press_lane(&mut self, track: usize, offset: Pixels, extend: bool, cx: &mut Context<Self>) {
         let time = self.viewport.time_at(offset);
         let pressed = self
             .project
@@ -367,9 +394,22 @@ impl TimelinePanel {
         if let Some(clip) = pressed {
             self.grab = offset - self.viewport.x_at(clip.start);
         }
-        let selection = pressed.map(|clip| clip.id);
-        if selection != self.selection {
-            self.selection = selection;
+        let before = self.selection.clone();
+        match pressed {
+            Some(clip) if extend => {
+                if !self.selection.remove(&clip.id) {
+                    self.selection.insert(clip.id);
+                }
+            }
+            Some(clip) => {
+                if !self.selection.contains(&clip.id) {
+                    self.selection = BTreeSet::from([clip.id]);
+                }
+            }
+            None if !extend => self.selection.clear(),
+            None => {}
+        }
+        if self.selection != before {
             cx.notify();
         }
     }
@@ -384,7 +424,7 @@ impl TimelinePanel {
         self.hover_lane(track, event, cx, |panel, offset, cx| {
             let project = panel.project.read(cx);
             let duration = project.asset(asset).and_then(|asset| asset.info.duration);
-            let (start, snap) = panel.snapped_start(panel.frame_at(offset, cx), duration, None, cx);
+            let (start, snap) = panel.snapped_start(panel.frame_at(offset, cx), duration, &[], cx);
             placement(track, project.clip_for(asset, track, start), snap)
         });
     }
@@ -399,18 +439,43 @@ impl TimelinePanel {
         match grip {
             Grip::Body => {
                 let grab = self.grab;
+                let group: Vec<ClipId> = if self.selection.contains(&id) {
+                    self.selection.iter().copied().collect()
+                } else {
+                    vec![id]
+                };
                 self.hover_lane(track, event, cx, |panel, offset, cx| {
                     let project = panel.project.read(cx);
-                    let duration = project.find_clip(id).map(|(_, clip)| clip.source.duration);
+                    let (clip_track, clip) = project.find_clip(id)?;
                     let start = panel.frame_at(offset - grab, cx);
-                    let (start, snap) = panel.snapped_start(start, duration, Some(id), cx);
-                    placement(track, project.moved_clip(id, track, start), snap)
+                    let (start, snap) =
+                        panel.snapped_start(start, Some(clip.source.duration), &group, cx);
+                    if group.len() == 1 {
+                        return placement(track, project.moved_clip(id, track, start), snap);
+                    }
+                    if clip_track != track {
+                        return None;
+                    }
+                    let moved =
+                        project.moved_clips(&group_moves(project, &group, start - clip.start));
+                    let fits = match moved {
+                        Ok(_) => true,
+                        Err(EditError::Overlapping(_)) => false,
+                        Err(_) => return None,
+                    };
+                    let preview = DropPreview {
+                        track,
+                        range: TimeRange::new(start, clip.source.duration),
+                        fits,
+                        snapped_to: None,
+                    };
+                    Some(preview.snapped(snap))
                 });
             }
             Grip::Edge(edge) => {
                 let offset = event.event.position.x - event.bounds.left();
                 let to = self.frame_at(offset, cx);
-                let snap = self.snap(&[to], Some(id), cx);
+                let snap = self.snap(&[to], &[id], cx);
                 let to = to + snap.map_or(Time::ZERO, |snap| snap.shift);
                 let project = self.project.read(cx);
                 let Some((clip_track, _)) = project.find_clip(id) else {
@@ -458,7 +523,11 @@ impl TimelinePanel {
             Command::PlaceClip,
             |preview| preview.track == track,
             cx,
-            |project, preview| project.place_clip(asset, preview.track, preview.range.start),
+            |project, preview| {
+                project
+                    .place_clip(asset, preview.track, preview.range.start)
+                    .map(|clip| vec![clip])
+            },
         );
     }
 
@@ -468,17 +537,28 @@ impl TimelinePanel {
             Grip::Body => Command::MoveClip,
             Grip::Edge(_) => Command::TrimClip,
         };
+        let grouped =
+            grip == Grip::Body && self.selection.len() > 1 && self.selection.contains(&id);
+        let group: Vec<ClipId> = self.selection.iter().copied().collect();
         self.commit_preview(
             command,
             |preview| grip != Grip::Body || preview.track == track,
             cx,
             |project, preview| match grip {
-                Grip::Body => project.move_clip(id, preview.track, preview.range.start),
-                Grip::Edge(ClipEdge::Start) => {
-                    project.trim_clip(id, ClipEdge::Start, preview.range.start)
+                Grip::Body if grouped => {
+                    let start = project.find_clip(id).map(|(_, clip)| clip.start);
+                    let delta = preview.range.start - start.ok_or(EditError::UnknownClip(id))?;
+                    project.move_clips(&group_moves(project, &group, delta))
                 }
-                Grip::Edge(ClipEdge::End) => {
-                    project.trim_clip(id, ClipEdge::End, preview.range.end())
+                Grip::Body => project
+                    .move_clip(id, preview.track, preview.range.start)
+                    .map(|clip| vec![clip]),
+                Grip::Edge(edge) => {
+                    let to = match edge {
+                        ClipEdge::Start => preview.range.start,
+                        ClipEdge::End => preview.range.end(),
+                    };
+                    project.trim_clip(id, edge, to).map(|clip| vec![clip])
                 }
             },
         );
@@ -489,7 +569,7 @@ impl TimelinePanel {
         command: Command,
         accepts: impl FnOnce(&DropPreview) -> bool,
         cx: &mut Context<Self>,
-        edit: impl FnOnce(&mut Project, DropPreview) -> Result<Clip, EditError>,
+        edit: impl FnOnce(&mut Project, DropPreview) -> Result<Vec<Clip>, EditError>,
     ) {
         let preview = self
             .drop_preview
@@ -500,7 +580,7 @@ impl TimelinePanel {
                 .editor
                 .apply(command, cx, |project| edit(project, preview))
             {
-                Ok(clip) => self.selection = Some(clip.id),
+                Ok(clips) => self.selection = clips.iter().map(|clip| clip.id).collect(),
                 Err(error) => tracing::warn!(%error, "could not edit the timeline"),
             }
         }
@@ -511,7 +591,7 @@ impl TimelinePanel {
         &self,
         start: Time,
         duration: Option<Time>,
-        moving: Option<ClipId>,
+        moving: &[ClipId],
         cx: &App,
     ) -> (Time, Option<Snap>) {
         let edges: Vec<Time> = [Some(start), duration.map(|duration| start + duration)]
@@ -522,7 +602,7 @@ impl TimelinePanel {
         (start + snap.map_or(Time::ZERO, |snap| snap.shift), snap)
     }
 
-    fn snap(&self, edges: &[Time], moving: Option<ClipId>, cx: &App) -> Option<Snap> {
+    fn snap(&self, edges: &[Time], moving: &[ClipId], cx: &App) -> Option<Snap> {
         if !self.snapping {
             return None;
         }
@@ -554,7 +634,7 @@ impl Render for TimelinePanel {
             .and_then(|preview| preview.snapped_to)
             .map(|time| snap_line(self.viewport.x_at(time)));
         let viewport = self.viewport;
-        let selection = self.selection;
+        let selection = &self.selection;
         let playhead = self.playhead.read(cx).time();
         let project = self.project.read(cx);
         let frame_rate = project.settings.frame_rate;
@@ -652,7 +732,7 @@ struct Lane<'a> {
     track: &'a Track,
     viewport: Viewport,
     drop_preview: Option<DropPreview>,
-    selection: Option<ClipId>,
+    selection: &'a BTreeSet<ClipId>,
 }
 
 fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> impl IntoElement {
@@ -680,7 +760,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
             MouseButton::Left,
             cx.listener(move |panel, event: &MouseDownEvent, _, cx| {
                 let offset = event.position.x - panel.lanes.left();
-                panel.press_lane(index, offset, cx);
+                panel.press_lane(index, offset, event.modifiers.shift, cx);
             }),
         )
         .on_drag_move(cx.listener(move |panel, event, _, cx| {
@@ -699,7 +779,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
             let look = ClipLook {
                 label: clip_label(project, clip),
                 color,
-                selected: selection == Some(clip.id),
+                selected: selection.contains(&clip.id),
             };
             clip_block(clip, look, viewport)
         }))
@@ -721,6 +801,14 @@ fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
         .left(viewport.x_at(range.start))
         .w(viewport.width_of(range.duration))
         .rounded_sm()
+}
+
+fn group_moves(project: &Project, group: &[ClipId], delta: Time) -> Vec<(ClipId, usize, Time)> {
+    group
+        .iter()
+        .filter_map(|id| project.find_clip(*id))
+        .map(|(track, clip)| (clip.id, track, clip.start + delta))
+        .collect()
 }
 
 fn placement(
@@ -1090,6 +1178,10 @@ mod tests {
         cx.simulate_mouse_up(point(to, px(V1)), MouseButton::Left, none);
     }
 
+    fn selected(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext) -> BTreeSet<ClipId> {
+        cx.read(|cx| panel.read(cx).selection.clone())
+    }
+
     fn clip_of(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext, id: ClipId) -> Clip {
         cx.read(|cx| *panel.read(cx).project.read(cx).find_clip(id).unwrap().1)
     }
@@ -1098,9 +1190,9 @@ mod tests {
     fn pressing_a_clip_selects_it_and_empty_lane_clears(cx: &mut TestAppContext) {
         let (panel, cx, clip) = timeline_with_a_clip(cx);
         cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
-        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clip]));
         cx.simulate_click(point(at(12.), px(V1)), Modifiers::none());
-        assert_eq!(cx.read(|cx| panel.read(cx).selection), None);
+        assert_eq!(selected(&panel, cx), BTreeSet::new());
     }
 
     #[gpui::test]
@@ -1110,7 +1202,7 @@ mod tests {
         let moved = clip_of(&panel, cx, clip);
         assert_eq!(moved.start, Time::from_seconds(3));
         assert_eq!(moved.source.start, Time::ZERO);
-        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clip]));
     }
 
     #[gpui::test]
@@ -1209,7 +1301,7 @@ mod tests {
         cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
         panel.update(cx, TimelinePanel::delete_selection);
         assert_eq!(starts_on(&panel, cx, 0), seconds(&[10]));
-        assert_eq!(cx.read(|cx| panel.read(cx).selection), None);
+        assert_eq!(selected(&panel, cx), BTreeSet::new());
     }
 
     #[gpui::test]
@@ -1269,7 +1361,7 @@ mod tests {
         wheel(cx, -TRACK_HEIGHT);
         assert_eq!(scroll(cx), px(TRACK_HEIGHT));
         cx.simulate_click(point(at(4.), row_y(V1_ROW - 1)), Modifiers::none());
-        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clip]));
         wheel(cx, -100_000.);
         let (rows, view) = cx.read(|cx| {
             let panel = panel.read(cx);
@@ -1289,13 +1381,143 @@ mod tests {
         let (panel, cx, clip) = timeline_with_a_clip(cx);
         cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
         panel.update(cx, TimelinePanel::zoom_in);
-        assert_eq!(cx.read(|cx| panel.read(cx).selection), Some(clip));
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clip]));
         assert_ne!(cx.read(|cx| panel.read(cx).viewport), Viewport::default());
         let editor = cx.read(|cx| panel.read(cx).editor.clone());
         cx.update(|_, cx| editor.replace(Project::new("other"), cx));
         panel.update(cx, TimelinePanel::project_replaced);
-        assert_eq!(cx.read(|cx| panel.read(cx).selection), None);
+        assert_eq!(selected(&panel, cx), BTreeSet::new());
         assert_eq!(cx.read(|cx| panel.read(cx).viewport), Viewport::default());
         assert!(starts_on(&panel, cx, 0).is_empty());
+    }
+
+    #[gpui::test]
+    fn shift_clicking_adds_and_removes_clips_from_the_selection(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (0, 12)]);
+        let (first, second) = (clips[0], clips[1]);
+
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
+        cx.simulate_click(point(at(14.), px(V1)), Modifiers::shift());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([first, second]));
+
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::shift());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([second]));
+
+        cx.simulate_click(point(at(10.), px(V1)), Modifiers::shift());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([second]));
+
+        cx.simulate_click(point(at(10.), px(V1)), Modifiers::none());
+
+        assert!(selected(&panel, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn select_all_picks_every_clip_on_every_track(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (0, 12), (1, 3)]);
+
+        panel.update(cx, TimelinePanel::select_all);
+
+        assert_eq!(selected(&panel, cx), clips.into_iter().collect());
+    }
+
+    #[gpui::test]
+    fn dragging_one_selected_clip_moves_the_whole_selection(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (0, 12)]);
+        panel.update(cx, TimelinePanel::select_all);
+
+        drag(cx, at(4.), at(6.));
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[3, 14]));
+        assert_eq!(selected(&panel, cx), clips.into_iter().collect());
+    }
+
+    #[gpui::test]
+    fn a_group_move_that_would_collide_changes_nothing(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1), (0, 10), (0, 30)]);
+        panel.update(cx, |panel, cx| {
+            panel.selection = cx.read_entity(&panel.project, |project, _| {
+                project.timeline.tracks[0]
+                    .clips()
+                    .iter()
+                    .take(2)
+                    .map(|clip| clip.id)
+                    .collect()
+            });
+        });
+
+        drag(cx, at(4.), at(20.));
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 10, 30]));
+    }
+
+    #[gpui::test]
+    fn pressing_an_unselected_clip_replaces_the_selection(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (0, 12)]);
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
+
+        cx.simulate_click(point(at(14.), px(V1)), Modifiers::none());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clips[1]]));
+    }
+
+    #[gpui::test]
+    fn deleting_the_selection_removes_every_selected_clip(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_clips(cx, &[(0, 1), (0, 12), (0, 30)]);
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
+        cx.simulate_click(point(at(14.), px(V1)), Modifiers::shift());
+
+        panel.update(cx, TimelinePanel::ripple_delete_selection);
+
+        assert_eq!(starts_on(&panel, cx, 0), seconds(&[14]));
+        assert!(selected(&panel, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_clip_that_goes_away_leaves_the_selection(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (0, 12)]);
+        panel.update(cx, TimelinePanel::select_all);
+
+        panel.update(cx, |panel, cx| {
+            let gone = clips[0];
+            panel
+                .editor
+                .perform(Command::DeleteClip, cx, |project| project.delete_clip(gone))
+                .ok();
+        });
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clips[1]]));
+
+        panel.update(cx, |panel, cx| panel.editor.undo(cx));
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([clips[1]]));
+    }
+
+    #[gpui::test]
+    fn the_view_comes_back_when_the_timeline_shrinks_under_it(cx: &mut TestAppContext) {
+        let (panel, cx, clips) = timeline_with_clips(cx, &[(0, 1), (0, 12)]);
+        panel.update(cx, |panel, cx| {
+            let scrolled =
+                Viewport::default().scrolled_by(px(ONE_SECOND * 15.), Time::from_seconds(20));
+            panel.set_viewport(scrolled, cx);
+        });
+
+        assert_eq!(
+            cx.read(|cx| panel.read(cx).viewport.start()),
+            Time::from_seconds(15)
+        );
+
+        panel.update(cx, |panel, cx| {
+            panel
+                .editor
+                .perform(Command::DeleteClip, cx, |project| {
+                    project.delete_clips(&clips).map(drop)
+                })
+                .ok();
+        });
+
+        assert_eq!(cx.read(|cx| panel.read(cx).viewport.start()), Time::ZERO);
     }
 }

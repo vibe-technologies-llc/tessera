@@ -224,13 +224,18 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   the bin by `AssetId`, not part of the project model. Bin rows drag a `DraggedAsset`: each timeline lane
   previews the drop as a ghost (red where it would overlap) through `on_drag_move`, and the drop
   places the clip at the previewed, frame-snapped start. Clips on the timeline work the same way.
-  Pressing a lane selects the clip under the pointer, or clears the selection, and records where
-  the clip was grabbed. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
+  The selection is a set of clips. Pressing a lane selects the clip under the pointer (keeping the
+  selection when that clip is already in it, so a group can be dragged) or clears the selection,
+  and with Shift held toggles the clip in the selection instead. Ctrl+A selects every clip. It
+  records where the clip was grabbed. The panel drops clips that no longer exist from the
+  selection whenever the project changes, and pulls the view back when the timeline shrinks under
+  it. Dragging a selected clip's body moves the whole selection by the same time (`move_clips`),
+  previewed as the dragged clip's ghost, red when any selected clip would collide. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
   drag that the lanes preview and commit as a move or a trim. While snapping is on (N toggles it),
   a dropped asset's edges, a moved clip's edges and a trimmed edge pull onto the nearest clip edge,
   the playhead or zero within a few pixels (`timeline::snap`), and the lanes draw a line where the
-  preview snapped. Ctrl+K splits the selected clip at the
-  playhead, or every clip under it when the selection is elsewhere or empty. Delete or Backspace
+  preview snapped. Ctrl+K splits the selected clips at the
+  playhead, or every clip under it when none of the selection is there. Delete or Backspace
   deletes the selection, and with Shift held they ripple delete it. The timeline draws video tracks
   from the highest index down, then audio tracks in order (`header::display_order`). Each track
   header has buttons to swap it with its same-kind neighbour or remove it, and a row below the

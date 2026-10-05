@@ -77,15 +77,13 @@
 
 ## Timeline editing
 
-- Drop the selection when its clip goes away through undo, redo or another edit, and clamp the view
-  when the timeline shrinks
 - Commit a trim only on the lane that previewed it, keeping the grab offset: releasing over another
   track commits the stale preview, over the ruler discards it, and the edge jumps on the first move
 - Keep snapped starts on the frame grid; clip ends come from probed durations, so snapping an end
   leaves the start between frames
 - Lay out only the clips in view, instead of building every clip with its handles and label on each
   playhead tick
-- Select several clips by shift-click, marquee and Ctrl+A
+- Select several clips with a marquee, and show a ghost for every clip of a group move
 - Scroll while dragging near an edge, add scrollbars, and keep the grab point when the view scrolls
   mid-drag
 - Insert and overwrite on drop, and say why a red drop was refused
