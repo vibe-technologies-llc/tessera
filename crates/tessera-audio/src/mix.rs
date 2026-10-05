@@ -6,15 +6,16 @@ use std::{
 };
 
 use tessera_media::AudioDecoder;
-use tessera_timeline::{Clip, Project, Time, TimeRange, TrackKind};
+use tessera_timeline::{Clip, Gain, Project, Time, TimeRange, TrackKind};
 
 use crate::CHANNELS;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Span<'a> {
     path: &'a Path,
     stream: usize,
     track: usize,
+    amplitude: f32,
     source_sample: i64,
     frames: Range<usize>,
 }
@@ -100,7 +101,7 @@ impl Mixer {
                 Ok(buffer) => {
                     let mixed = &mut out[span.frames.start * CHANNELS..span.frames.end * CHANNELS];
                     for (mixed, sample) in mixed.iter_mut().zip(&buffer.samples) {
-                        *mixed += sample;
+                        *mixed += sample * span.amplitude;
                     }
                 }
                 Err(error) => {
@@ -147,9 +148,10 @@ fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) 
             track
                 .clips_overlapping(block)
                 .iter()
-                .map(move |clip| (index, clip))
+                .map(move |clip| (index, track.volume, clip))
         })
-        .filter_map(|(track, clip)| {
+        .filter(|(_, volume, clip)| *volume != Gain::SILENT && clip.gain != Gain::SILENT)
+        .filter_map(|(track, volume, clip)| {
             let asset = project.asset(clip.asset)?;
             let stream = asset.info.audio().next()?.index;
             let covered = clip_samples(clip, sample_rate);
@@ -159,6 +161,7 @@ fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) 
                 path: &asset.path,
                 stream,
                 track,
+                amplitude: clip.gain.amplitude() * volume.amplitude(),
                 source_sample: clip.source.start.to_samples(sample_rate) + (start - covered.start),
                 frames: (start - first) as usize..(stop - first) as usize,
             })
@@ -342,6 +345,22 @@ mod tests {
         project.place_clip(asset, track, Time::ZERO).unwrap();
         project.place_clip(asset, second_track, Time::ZERO).unwrap();
         assert_eq!(spans(&project, RATE, 0, 1024).len(), 2);
+    }
+
+    #[test]
+    fn clip_gain_and_track_volume_scale_a_clip_and_silence_leaves_it_out() {
+        let (mut project, asset, track) = project_with_tone();
+        let clip = project.place_clip(asset, track, Time::ZERO).unwrap();
+        project.adjust_clip_gains(&[clip.id], 60).unwrap();
+        project.timeline.tracks[track].volume = Gain::from_tenths(-60).unwrap();
+
+        let amplitude = spans(&project, RATE, 0, 16)[0].amplitude;
+
+        assert!((amplitude - 1.0).abs() < 1e-6);
+
+        project.timeline.tracks[track].volume = Gain::SILENT;
+
+        assert!(spans(&project, RATE, 0, 16).is_empty());
     }
 
     #[test]

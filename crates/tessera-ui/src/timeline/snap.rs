@@ -60,6 +60,7 @@ mod tests {
                     source: TimeRange::new(Time::ZERO, seconds(3)),
                     start: seconds(start),
                     link: None,
+                    gain: tessera_timeline::Gain::UNITY,
                 })
                 .unwrap();
         }

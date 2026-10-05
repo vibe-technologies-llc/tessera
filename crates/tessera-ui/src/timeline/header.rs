@@ -1,9 +1,9 @@
 use gpui::{
     AnyView, App, AppContext, ClickEvent, Context, ElementId, Entity, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, prelude::FluentBuilder, px,
+    IntoElement, ParentElement, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, Window, div, prelude::FluentBuilder, px,
 };
-use tessera_timeline::{Timeline, Track, TrackHeight, TrackKind};
+use tessera_timeline::{Gain, Timeline, Track, TrackHeight, TrackKind};
 
 use super::{
     COMPACT_TRACK_HEIGHT, RenameTarget, TALL_TRACK_HEIGHT, TRACK_HEIGHT, TimelinePanel, TrackFlag,
@@ -34,7 +34,10 @@ pub struct TrackRow {
     pub locked: bool,
     pub muted: bool,
     pub solo: bool,
+    pub volume: Gain,
 }
+
+pub const VOLUME_STEP_TENTHS: i32 = Gain::TENTHS_PER_DECIBEL;
 
 pub fn row_height(height: TrackHeight) -> f32 {
     match height {
@@ -91,6 +94,7 @@ pub fn track_rows(timeline: &Timeline) -> Vec<TrackRow> {
                 locked: track.locked,
                 muted: track.muted,
                 solo: track.solo,
+                volume: track.volume,
             }
         })
         .collect()
@@ -150,6 +154,7 @@ pub fn track_header(
         locked,
         muted,
         solo,
+        volume,
     } = row;
     let swap_with = |neighbour: Option<usize>| {
         neighbour.map(|other| {
@@ -288,8 +293,42 @@ pub fn track_header(
                 .h(px(HEADER_LINE_HEIGHT))
                 .flex()
                 .items_center()
+                .justify_between()
                 .child(toggles)
+                .when(kind == TrackKind::Audio, |line| {
+                    line.child(volume_readout(index, volume, cx))
+                })
         }))
+}
+
+fn volume_readout(index: usize, volume: Gain, cx: &Context<TimelinePanel>) -> impl IntoElement {
+    div()
+        .id(("track-volume", index))
+        .text_xs()
+        .cursor_ns_resize()
+        .tooltip(tooltip(
+            "Scroll to change the volume, double-click to reset it",
+        ))
+        .on_scroll_wheel(cx.listener(
+            move |panel: &mut TimelinePanel, event: &ScrollWheelEvent, window, cx| {
+                cx.stop_propagation();
+                let delta = event.delta.pixel_delta(window.line_height()).y;
+                let step = match f32::from(delta) {
+                    up if up > 0. => VOLUME_STEP_TENTHS,
+                    down if down < 0. => -VOLUME_STEP_TENTHS,
+                    _ => return,
+                };
+                panel.adjust_track_volume(index, step, cx);
+            },
+        ))
+        .on_click(cx.listener(
+            move |panel: &mut TimelinePanel, event: &ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    panel.reset_track_volume(index, cx);
+                }
+            },
+        ))
+        .child(volume.to_string())
 }
 
 fn active_button(button: gpui::Stateful<gpui::Div>) -> gpui::Stateful<gpui::Div> {
@@ -449,6 +488,7 @@ mod tests {
                 ),
                 start: tessera_timeline::Time::ZERO,
                 link: None,
+                gain: tessera_timeline::Gain::UNITY,
             })
             .unwrap();
         timeline.tracks[1] = clip_track;

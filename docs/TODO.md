@@ -17,7 +17,6 @@
 
 - Keep one PipeWire connection for the session instead of connecting on every play, blocking the UI
   thread on it, and joining the stream thread on every pause
-- Mix the audio tracks, with per-clip gain and per-track volume
 - Play sound at shuttle speeds, in reverse and while scrubbing or stepping
 - Retry media that failed during playback, and open decoders ahead of clip starts with reused mix
   buffers instead of on the feeder thread at the first block

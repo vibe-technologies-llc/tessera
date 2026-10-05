@@ -109,6 +109,27 @@ impl Project {
         Ok(deleted)
     }
 
+    pub fn adjust_clip_gains(
+        &mut self,
+        ids: &[ClipId],
+        tenths: i32,
+    ) -> Result<Vec<Clip>, EditError> {
+        let ids = self.known_clips(ids)?;
+        let mut adjusted = Vec::new();
+        for track in &mut self.timeline.tracks {
+            if !track.clips().iter().any(|clip| ids.contains(&clip.id)) {
+                continue;
+            }
+            for clip in track.clips_mut() {
+                if ids.contains(&clip.id) {
+                    clip.gain = clip.gain.adjusted(tenths);
+                    adjusted.push(*clip);
+                }
+            }
+        }
+        Ok(adjusted)
+    }
+
     pub fn paste_clips(&mut self, pastes: &[(Clip, usize, Time)]) -> Result<Vec<Clip>, EditError> {
         self.atomically(|project| {
             let mut copies_of: BTreeMap<LinkId, usize> = BTreeMap::new();
@@ -485,6 +506,33 @@ mod tests {
         Time::from_seconds(seconds)
     }
 
+    #[test]
+    fn clip_gains_change_together_within_their_range_and_not_on_locked_tracks() {
+        let (mut project, asset) = project_with_asset();
+        let first = project.place_clip(asset, 0, seconds(0)).unwrap();
+        let second = project.place_clip(asset, 0, seconds(10)).unwrap();
+
+        let adjusted = project
+            .adjust_clip_gains(&[first.id, second.id], 30)
+            .unwrap();
+
+        assert!(adjusted.iter().all(|clip| clip.gain.tenths() == 30));
+
+        project.adjust_clip_gains(&[first.id], 1_000).unwrap();
+
+        assert_eq!(
+            project.find_clip(first.id).unwrap().1.gain,
+            crate::Gain::LOUDEST
+        );
+
+        project.timeline.tracks[0].locked = true;
+
+        assert_eq!(
+            project.adjust_clip_gains(&[second.id], -10),
+            Err(EditError::TrackLocked(0))
+        );
+    }
+
     fn project_with_asset() -> (Project, AssetId) {
         let mut project = Project::new("test");
         let asset = project.add_asset(
@@ -521,6 +569,7 @@ mod tests {
             start: seconds(start),
             source: TimeRange::new(seconds(source_start), seconds(duration)),
             link: None,
+            gain: crate::Gain::UNITY,
         };
         project.timeline.tracks[0].insert(clip).unwrap();
         id
@@ -671,6 +720,7 @@ mod tests {
                 start: Time::MAX - seconds(5),
                 source: TimeRange::new(Time::ZERO, seconds(4)),
                 link: None,
+                gain: crate::Gain::UNITY,
             })
             .unwrap();
 
@@ -708,6 +758,7 @@ mod tests {
             start: Time::ZERO,
             source: TimeRange::new(seconds(2), seconds(3)),
             link: None,
+            gain: crate::Gain::UNITY,
         };
 
         project.overwrite_clip(&copy, 0, seconds(3)).unwrap();

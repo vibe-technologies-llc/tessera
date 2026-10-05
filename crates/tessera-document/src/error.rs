@@ -145,4 +145,10 @@ pub enum ValidationError {
     LinkedOnOneTrack { link: LinkId, track: usize },
     #[error("the clips of link {} do not share their asset, start and source range", .0.0)]
     LinkOutOfStep(LinkId),
+    #[error("clip {} has a gain of {tenths} tenths of a decibel, outside the range a clip can hold", .clip.0)]
+    ClipGain { clip: ClipId, tenths: i32 },
+    #[error(
+        "a track has a volume of {tenths} tenths of a decibel, outside the range a track can hold"
+    )]
+    TrackVolume { tenths: i32 },
 }

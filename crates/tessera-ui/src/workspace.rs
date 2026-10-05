@@ -10,11 +10,12 @@ use tessera_timeline::{Command, Project, Revision, Time};
 
 use crate::{
     AddMarker, Cancel, ClearInOut, CopyClips, CutClips, DeleteClip, DuplicateClips, FocusSearch,
-    Import, NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, OpenRecent,
-    OpenSequenceSettings, PasteClips, Pause, PlayPause, PreviousEdit, PreviousMarker, Redo,
-    RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint, SetOutPoint,
-    ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSafeAreas,
-    ToggleSnapping, Undo, UnlinkClips, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    Import, LowerClipGain, NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, OpenRecent,
+    OpenSequenceSettings, PasteClips, Pause, PlayPause, PreviousEdit, PreviousMarker,
+    RaiseClipGain, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint,
+    SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward,
+    ToggleSafeAreas, ToggleSnapping, Undo, UnlinkClips, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
+    ZoomToFit,
     autosave::{AUTOSAVE_INTERVAL, AutosaveDirectory, Orphan, Slot, orphans},
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
@@ -678,6 +679,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &SplitAtPlayhead, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::split_at_playhead);
+            }))
+            .on_action(cx.listener(|workspace, _: &RaiseClipGain, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::raise_clip_gain);
+            }))
+            .on_action(cx.listener(|workspace, _: &LowerClipGain, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::lower_clip_gain);
             }))
             .on_action(cx.listener(|workspace, _: &UnlinkClips, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::unlink_selection);

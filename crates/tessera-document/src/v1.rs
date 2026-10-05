@@ -6,8 +6,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
-    self as model, AssetId, ClipId, FrameRate, InsertError, LinkId, MarkerId, MediaInfo, NextIds,
-    Time, TimeRange, Timeline,
+    self as model, AssetId, ClipId, FrameRate, Gain, InsertError, LinkId, MarkerId, MediaInfo,
+    NextIds, Time, TimeRange, Timeline,
 };
 
 use crate::{FormatError, ValidationError};
@@ -103,6 +103,7 @@ struct Track {
     muted: bool,
     solo: bool,
     height: TrackHeight,
+    volume_tenths_db: i32,
     clips: Vec<Clip>,
 }
 
@@ -115,6 +116,7 @@ struct Clip {
     source_start_flicks: i64,
     source_duration_flicks: i64,
     link: Option<u64>,
+    gain_tenths_db: i32,
 }
 
 impl TryFrom<&model::Project> for Project {
@@ -294,6 +296,7 @@ impl From<&model::Track> for Track {
             muted: track.muted,
             solo: track.solo,
             height: track.height.into(),
+            volume_tenths_db: track.volume.tenths(),
             clips: track.clips().iter().map(Clip::from).collect(),
         }
     }
@@ -308,6 +311,7 @@ impl From<&model::Clip> for Clip {
             source_start_flicks: clip.source.start.flicks(),
             source_duration_flicks: clip.source.duration.flicks(),
             link: clip.link.map(|link| link.0),
+            gain_tenths_db: clip.gain.tenths(),
         }
     }
 }
@@ -607,6 +611,10 @@ impl Track {
         track.muted = self.muted;
         track.solo = self.solo;
         track.height = self.height.into();
+        track.volume =
+            Gain::from_tenths(self.volume_tenths_db).ok_or(ValidationError::TrackVolume {
+                tenths: self.volume_tenths_db,
+            })?;
         for clip in self.clips {
             let clip = clip.rebuilt(project, track.kind)?;
             track.insert(clip).map_err(|refused| match refused {
@@ -636,6 +644,10 @@ impl Clip {
             ),
             start: Time::from_flicks(self.start_flicks),
             link: self.link.map(LinkId),
+            gain: Gain::from_tenths(self.gain_tenths_db).ok_or(ValidationError::ClipGain {
+                clip: ClipId(self.id),
+                tenths: self.gain_tenths_db,
+            })?,
         };
         let asset = project
             .asset(clip.asset)
@@ -685,6 +697,7 @@ mod tests {
             "source_start_flicks": source_start * SECOND,
             "source_duration_flicks": duration * SECOND,
             "link": null,
+            "gain_tenths_db": 0,
         })
     }
 
@@ -696,6 +709,7 @@ mod tests {
             "muted": false,
             "solo": false,
             "height": "normal",
+            "volume_tenths_db": 0,
             "clips": clips,
         })
     }
@@ -963,6 +977,21 @@ mod tests {
         assert_eq!(
             refused(|document| document["tracks"][0]["clips"][1]["id"] = json!(0)),
             ValidationError::DuplicateClip(ClipId(0))
+        );
+    }
+
+    #[test]
+    fn gains_and_volumes_must_lie_in_range() {
+        assert_eq!(
+            refused(|document| document["tracks"][0]["clips"][1]["gain_tenths_db"] = json!(121)),
+            ValidationError::ClipGain {
+                clip: ClipId(1),
+                tenths: 121
+            }
+        );
+        assert_eq!(
+            refused(|document| document["tracks"][1]["volume_tenths_db"] = json!(-601)),
+            ValidationError::TrackVolume { tenths: -601 }
         );
     }
 

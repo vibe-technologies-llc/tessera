@@ -7,6 +7,7 @@ mod links;
 mod markers;
 
 use crate::{
+    gain::Gain,
     media::MediaInfo,
     time::{FrameRate, Time, TimeRange},
 };
@@ -158,6 +159,7 @@ pub struct Clip {
     pub source: TimeRange,
     pub start: Time,
     pub link: Option<LinkId>,
+    pub gain: Gain,
 }
 
 impl Clip {
@@ -280,6 +282,7 @@ pub struct Track {
     pub muted: bool,
     pub solo: bool,
     pub height: TrackHeight,
+    pub volume: Gain,
     clips: Arc<Vec<Clip>>,
 }
 
@@ -292,6 +295,7 @@ impl Track {
             muted: false,
             solo: false,
             height: TrackHeight::default(),
+            volume: Gain::UNITY,
             clips: Arc::default(),
         }
     }
@@ -633,6 +637,7 @@ impl Project {
             source: TimeRange::new(Time::ZERO, duration),
             start: start.max(Time::ZERO),
             link: None,
+            gain: Gain::UNITY,
         })
     }
 
@@ -864,6 +869,7 @@ mod tests {
             source: TimeRange::new(Time::from_seconds(10), Time::from_seconds(duration)),
             start: Time::from_seconds(start),
             link: None,
+            gain: Gain::UNITY,
         }
     }
 

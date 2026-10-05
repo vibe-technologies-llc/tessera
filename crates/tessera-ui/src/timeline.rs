@@ -12,8 +12,8 @@ use gpui::{
     canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use tessera_timeline::{
-    AssetId, Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Marker, MarkerId, Project,
-    Time, TimeRange, Timecode, Timeline, Track, TrackKind,
+    AssetId, Clip, ClipEdge, ClipId, Command, EditError, FrameRate, Gain, Marker, MarkerId,
+    Project, Time, TimeRange, Timecode, Timeline, Track, TrackKind,
 };
 
 use self::{
@@ -698,6 +698,50 @@ impl TimelinePanel {
         if let Err(error) = split {
             tracing::warn!(%error, "could not split the clips");
         }
+    }
+
+    pub fn raise_clip_gain(&mut self, cx: &mut Context<Self>) {
+        self.adjust_clip_gain(header::VOLUME_STEP_TENTHS, cx);
+    }
+
+    pub fn lower_clip_gain(&mut self, cx: &mut Context<Self>) {
+        self.adjust_clip_gain(-header::VOLUME_STEP_TENTHS, cx);
+    }
+
+    fn adjust_clip_gain(&mut self, tenths: i32, cx: &mut Context<Self>) {
+        let project = self.project.read(cx);
+        let ids: Vec<ClipId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                project.find_clip(*id).is_some_and(|(track, _)| {
+                    let track = &project.timeline.tracks[track];
+                    track.kind == TrackKind::Audio && !track.locked
+                })
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let adjusted = self.editor.apply(Command::SetClipGain, cx, |project| {
+            project.adjust_clip_gains(&ids, tenths)
+        });
+        if let Err(error) = adjusted {
+            tracing::warn!(%error, "could not change the clip gain");
+        }
+    }
+
+    fn adjust_track_volume(&mut self, index: usize, tenths: i32, cx: &mut Context<Self>) {
+        self.edit_track(Command::SetTrackVolume, index, cx, |track| {
+            track.volume = track.volume.adjusted(tenths);
+        });
+    }
+
+    fn reset_track_volume(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.edit_track(Command::SetTrackVolume, index, cx, |track| {
+            track.volume = Gain::UNITY;
+        });
     }
 
     pub fn unlink_selection(&mut self, cx: &mut Context<Self>) {
@@ -1556,10 +1600,15 @@ fn visible_clips(track: &Track, visible: Option<TimeRange>) -> &[Clip] {
 }
 
 fn clip_label(project: &Project, clip: &Clip) -> SharedString {
-    project
+    let name = project
         .asset(clip.asset)
         .map(|asset| file_name(&asset.path))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if clip.gain == Gain::UNITY {
+        name
+    } else {
+        format!("{name} · {}", clip.gain).into()
+    }
 }
 
 fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
@@ -2614,6 +2663,7 @@ mod tests {
                     source: TimeRange::new(Time::ZERO, Time::from_seconds(5)),
                     start: Time::from_seconds(start),
                     link: None,
+                    gain: tessera_timeline::Gain::UNITY,
                 })
                 .unwrap();
         }
@@ -2950,6 +3000,52 @@ mod tests {
             asset_drop_preview(&project, asset, 0, Time::ZERO, None, DropMode::Insert).unwrap();
 
         assert_eq!(inserting.partner, None);
+    }
+
+    #[gpui::test]
+    fn scrolling_the_volume_readout_turns_an_audio_track_up_and_double_click_resets_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        let readout = point(
+            px(HEADER_RIGHT - HEADER_PADDING - 8.),
+            header_line_y(A1_ROW, 1),
+        );
+        let scroll = |cx: &mut VisualTestContext, lines: f32| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: readout,
+                delta: ScrollDelta::Lines(point(0., lines)),
+                modifiers: Modifiers::none(),
+                touch_phase: TouchPhase::Moved,
+            });
+        };
+        let volume = |cx: &mut VisualTestContext| track_of(&panel, cx, 2).volume.tenths();
+
+        scroll(cx, 1.);
+        scroll(cx, 1.);
+
+        assert_eq!(volume(cx), 20);
+
+        scroll(cx, -1.);
+
+        assert_eq!(volume(cx), 10);
+
+        double_click(cx, readout);
+
+        assert_eq!(volume(cx), 0);
+    }
+
+    #[gpui::test]
+    fn alt_arrows_change_the_gain_of_selected_audio_clips_only(cx: &mut TestAppContext) {
+        let (panel, cx, picture, sound) = timeline_with_a_linked_pair(cx);
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
+
+        panel.update(cx, TimelinePanel::raise_clip_gain);
+        panel.update(cx, TimelinePanel::raise_clip_gain);
+        panel.update(cx, TimelinePanel::lower_clip_gain);
+
+        assert_eq!(clip_of(&panel, cx, sound.id).gain.tenths(), 10);
+        assert_eq!(clip_of(&panel, cx, picture.id).gain, Gain::UNITY);
     }
 
     const MARKER_Y: f32 = RULER_HEIGHT - MARKER_HEIGHT / 2.;

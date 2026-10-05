@@ -1,9 +1,11 @@
+mod gain;
 mod history;
 mod media;
 mod project;
 mod time;
 mod timecode;
 
+pub use gain::Gain;
 pub use history::{Command, HISTORY_DEPTH, History, Revision};
 pub use media::{AudioStream, MediaInfo, Stream, VideoStream};
 pub use project::{

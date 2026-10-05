@@ -255,9 +255,11 @@ mod tests {
                 ],
             },
         );
-        project
+        let pair = project
             .place_linked(asset, 0, Time::from_seconds(1))
             .unwrap();
+        project.adjust_clip_gains(&[pair[1].id], 25).unwrap();
+        project.timeline.tracks[1].volume = tessera_timeline::Gain::from_tenths(-60).unwrap();
         project.add_marker(Time::from_seconds(4), "Cut here");
         project.set_in_point(Time::from_seconds(1)).unwrap();
         project.set_out_point(Time::from_seconds(8)).unwrap();

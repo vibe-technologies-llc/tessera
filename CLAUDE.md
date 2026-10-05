@@ -82,8 +82,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `paste_clips` links the copies of partners pasted together under a new id. `unlink_clips`
   unlinks the groups of the given clips; any other edit that leaves partners out of step (an
   insert or overwrite that shifts or cuts one, a ripple trim, roll, slip or slide) drops their
-  link (`settle_links`). A `Track` carries a `name`
-  (empty shows the default label), `locked`, `muted`, `solo` and a `TrackHeight`; a locked track
+  link (`settle_links`). Every clip has a `gain` and every track a `volume`, both a `Gain` in
+  tenths of a decibel from `Gain::SILENT` (−60 dB, played as silence) to `Gain::LOUDEST` (+12 dB),
+  `UNITY` by default; `adjust_clip_gains` moves the gain of several clips at once, saturating at
+  those ends. A `Track` carries a `name`
+  (empty shows the default label), `locked`, `muted`, `solo`, its `volume` and a `TrackHeight`; a locked track
   refuses every edit of its clips and every placement onto it (`TrackLocked`), through
   `located_clip` and `track_accepting`. A muted video track is left out of the composite
   (`video_clips_at`), a muted audio track is silent, and `solo` applies to audio tracks only. The project holds `markers` (sorted by time, with
@@ -186,8 +189,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   at a timeline sample index: every clip on every audible audio track (not muted, and when any audio track is soloed only the
   soloed ones) that overlaps the block (`clips_overlapping`) is read
   from an `AudioDecoder` (decoding the asset's first probed audio stream, at the project's sample
-  rate) and summed into its
-  part of the block; the sum then goes through a soft limiter that leaves samples up to ±0.9 alone
+  rate), scaled by the clip's gain times its track's volume (a silent one is skipped) and summed
+  into its part of the block; the sum then goes through a soft limiter that leaves samples up to ±0.9 alone
   and eases the rest toward ±1.0. A clip's first sample is the first one at or after its start
   (`ceil_samples`), and the source sample for every later one is counted from there in whole
   samples (`AudioDecoder::samples_from`), so blocks that follow each other continue in the source
@@ -315,7 +318,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   neighbour or remove it (the disabled remove button's tooltip says why), toggles for lock, mute
   (hide on a video track) and solo (audio only) and a button that cycles the row height between
   compact, normal and tall (`header::row_height`), and a row below the tracks adds video or audio
-  tracks. Split and delete skip the clips of locked tracks. Double-clicking a track's name edits it in a `TextField`. Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+D copy, cut, paste
+  tracks. An audio track's header shows its volume beside the toggles (not on a compact row):
+  scrolling it steps a decibel up or down and a double-click resets it. Alt+Up and Alt+Down raise
+  and lower the gain of the selected audio clips by a decibel, and a clip whose gain isn't unity
+  shows it after its name. Split and delete skip the clips of locked tracks. Double-clicking a track's name edits it in a `TextField`. Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+D copy, cut, paste
   and duplicate the selection: the panel keeps a clipboard of clips with their tracks, a paste
   lands at the playhead (a duplicate right after the selection) keeping the clips' relative
   offsets and tracks, as one `paste_clips` command that is refused whole when anything overlaps or

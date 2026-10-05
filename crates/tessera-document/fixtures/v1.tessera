@@ -51,6 +51,7 @@
         "muted": false,
         "solo": false,
         "height": "normal",
+        "volume_tenths_db": 0,
         "clips": [
           {
             "id": 0,
@@ -58,7 +59,8 @@
             "start_flicks": 705600000,
             "source_start_flicks": 0,
             "source_duration_flicks": 7056000000,
-            "link": 0
+            "link": 0,
+            "gain_tenths_db": 0
           }
         ]
       },
@@ -69,6 +71,7 @@
         "muted": true,
         "solo": false,
         "height": "normal",
+        "volume_tenths_db": -60,
         "clips": [
           {
             "id": 1,
@@ -76,7 +79,8 @@
             "start_flicks": 705600000,
             "source_start_flicks": 0,
             "source_duration_flicks": 7056000000,
-            "link": 0
+            "link": 0,
+            "gain_tenths_db": 25
           }
         ]
       }
