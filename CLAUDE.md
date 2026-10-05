@@ -141,7 +141,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   decoder that fails to open, or fails mid-stream, is replaced by a software one (`hw_accel`
   turns `None`), and a hardware device that failed to be created is tried again after 30 s. Decoders use frame and slice threads on every core; on a short file that
   reads the whole stream ahead and drains the decoder, which is why the seek-policy test opens one
-  with a single thread. `VideoDecoder::open` decodes in hardware through the first of
+  with a single thread. `VideoDecoder::open` and `AudioDecoder::open` take the index of the stream
+  to decode, the one probing recorded in `MediaInfo`, and refuse an index that isn't a stream of
+  their kind (`NoVideo`, `NoAudio`); the media bin's thumbnails decode the first probed video
+  stream. `VideoDecoder::open` decodes in hardware through the first of
   `PREFERRED_HW_ACCELS` (VAAPI, then Vulkan Video) that the codec has a device config for and whose
   device can be created; `open_with` takes the list, and an empty one decodes in
   software. Each device is created once per process and shared by every decoder, and a failed
@@ -169,15 +172,16 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   allowed to touch it). `Mixer::render` fills a block of interleaved stereo `f32` samples starting
   at a timeline sample index: every clip on every audible audio track (not muted, and when any audio track is soloed only the
   soloed ones) that overlaps the block (`clips_overlapping`) is read
-  from an `AudioDecoder` (one per media path, at the project's sample rate) and summed into its
+  from an `AudioDecoder` (decoding the asset's first probed audio stream, at the project's sample
+  rate) and summed into its
   part of the block; the sum then goes through a soft limiter that leaves samples up to ±0.9 alone
   and eases the rest toward ±1.0. A clip's first sample is the first one at or after its start
   (`ceil_samples`), and the source sample for every later one is counted from there in whole
   samples (`AudioDecoder::samples_from`), so blocks that follow each other continue in the source
   without seeking or repeating a sample even when the clip starts between samples. Decoders are
-  kept per media path and track, so two clips of one file overlapping in time do not seek each
-  other. Media that fails to open or
-  decode is warned about once and stays silent. `Output` runs a PipeWire playback stream on its
+  kept per media path, stream and track, so two clips of one file overlapping in time do not seek
+  each other. Media that fails to open or decode is warned about once per path and stream and
+  stays silent. `Output` runs a PipeWire playback stream on its
   own thread, whose process callback copies whole frames out of a shared queue (silence on
   underrun), and a feeder thread that keeps about 200 ms queued by calling the source closure.
   Its `position` is the audio clock: the samples the device has played, taken at each callback
@@ -303,7 +307,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   composites them into a frame of that size, letterbox bars included, which becomes the GPUI image.
   The render size is the sequence scaled down uniformly (in steps of an eighth) to the viewer's
   frame, never above the sequence (`render_bounds`), and a change of it reopens the decoders. The
-  job carries one decoder per media path, track and size, closing those whose track no longer
+  job carries one decoder per media path, stream (the asset's first probed video stream), track and
+  size, closing those whose track no longer
   holds a clip of that media, so two clips of one file on different tracks never share one and
   split clips on one track do. Media that fails to open is remembered per decoder key and warned
   about once, and the layers that did decode still show. A single layer that already has the

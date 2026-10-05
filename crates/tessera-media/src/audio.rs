@@ -15,7 +15,7 @@ use tessera_timeline::{FLICKS_PER_SECOND, Time};
 
 use crate::{
     Error,
-    decode::{TimeBase, is_again, read_packet, stream_start},
+    decode::{TimeBase, is_again, read_packet, stream_of_kind, stream_start},
 };
 
 const OUTPUT_FORMAT: format::Sample = format::Sample::F32(sample::Type::Packed);
@@ -77,16 +77,21 @@ struct DecodedSamples {
 }
 
 impl AudioDecoder {
-    pub fn open(path: impl AsRef<Path>, sample_rate: NonZeroU32) -> Result<Self, Error> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        stream: usize,
+        sample_rate: NonZeroU32,
+    ) -> Result<Self, Error> {
         let path = path.as_ref().to_owned();
         let input = format::input(&path).map_err(|source| Error::Open {
             path: path.clone(),
             source,
         })?;
-        let stream = input
-            .streams()
-            .best(media::Type::Audio)
-            .ok_or_else(|| Error::NoAudio { path: path.clone() })?;
+        let stream =
+            stream_of_kind(&input, stream, media::Type::Audio).ok_or_else(|| Error::NoAudio {
+                path: path.clone(),
+                index: stream,
+            })?;
         let stream_index = stream.index();
         let time_base = TimeBase::of(&stream, &path)?;
         let start = stream_start(&input, &stream);
@@ -429,7 +434,8 @@ mod tests {
     #[test]
     fn levels_are_found_in_any_order() {
         let fixture = Fixture::generate("audio_any_order");
-        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
         for index in [0, 7, 3, 12, 19, 11, 5, 6, 18] {
             let block = decoder
                 .samples(block_inside_frame(index, OUTPUT_RATE), BLOCK)
@@ -442,7 +448,8 @@ mod tests {
     fn output_is_stereo_at_the_requested_rate() {
         let fixture = Fixture::generate("audio_rates");
         for rate in [22_050, 44_100, 48_000, 96_000].map(|rate| NonZeroU32::new(rate).unwrap()) {
-            let mut decoder = AudioDecoder::open(fixture.path(), rate).unwrap();
+            let mut decoder =
+                AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, rate).unwrap();
             let block = decoder.samples(block_inside_frame(9, rate), BLOCK).unwrap();
             assert_eq!(block.sample_rate, rate);
             assert_eq!(block.samples.len(), BLOCK * AudioBuffer::CHANNELS);
@@ -453,7 +460,8 @@ mod tests {
     #[test]
     fn consecutive_reads_continue_without_seeking() {
         let fixture = Fixture::generate("audio_seek_policy");
-        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
         assert!(decoder.needs_seek(0));
         let start = Time::from_samples(10_000, OUTPUT_RATE);
         decoder.samples(start, 1_000).unwrap();
@@ -469,11 +477,12 @@ mod tests {
         let fixture = Fixture::generate("audio_chunked");
         let length = fixture_duration().to_samples(OUTPUT_RATE) as usize + 500;
         let start = Time::from_samples(-250, OUTPUT_RATE);
-        let whole = AudioDecoder::open(fixture.path(), OUTPUT_RATE)
+        let whole = AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE)
             .unwrap()
             .samples(start, length)
             .unwrap();
-        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
         let mut chunked = Vec::new();
         let mut first = -250;
         for chunk in [1, 480, 1_023, 4_096, 7, 20_000, 64].into_iter().cycle() {
@@ -494,7 +503,8 @@ mod tests {
     #[test]
     fn frame_boundaries_land_on_their_sample_after_a_seek() {
         let fixture = Fixture::generate("audio_boundaries");
-        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
         let before_boundary = 32;
         for index in [12, 4, 17, 1, 9] {
             let boundary = fixture::audio_frame_start(index, OUTPUT_RATE);
@@ -524,7 +534,8 @@ mod tests {
     #[test]
     fn reads_past_the_end_are_silent() {
         let fixture = Fixture::generate("audio_past_the_end");
-        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
         let block = decoder.samples(Time::from_seconds(60), BLOCK).unwrap();
         assert_silent(&block.samples);
         let end = fixture_duration().to_samples(OUTPUT_RATE);
@@ -546,7 +557,8 @@ mod tests {
     #[test]
     fn reads_straddling_the_start_begin_with_silence() {
         let fixture = Fixture::generate("audio_before_the_start");
-        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
         let block = decoder
             .samples(Time::from_samples(-1_000, OUTPUT_RATE), 2_000)
             .unwrap();
@@ -558,16 +570,28 @@ mod tests {
     #[test]
     fn a_file_without_audio_is_rejected() {
         let fixture = Fixture::generate_without_audio("audio_missing_stream");
-        let error = AudioDecoder::open(fixture.path(), OUTPUT_RATE)
+        let error = AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE)
             .err()
             .unwrap();
         assert!(matches!(error, Error::NoAudio { .. }), "{error}");
     }
 
     #[test]
+    fn a_video_stream_is_not_decoded_as_audio() {
+        let fixture = Fixture::generate("audio_from_video_stream");
+        let error = AudioDecoder::open(fixture.path(), fixture::VIDEO_STREAM, OUTPUT_RATE)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, Error::NoAudio { index, .. } if index == fixture::VIDEO_STREAM),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn missing_file_is_an_open_error() {
         crate::init().unwrap();
-        let error = AudioDecoder::open("/nonexistent/tessera/clip.mkv", OUTPUT_RATE)
+        let error = AudioDecoder::open("/nonexistent/tessera/clip.mkv", 0, OUTPUT_RATE)
             .err()
             .unwrap();
         assert!(matches!(error, Error::Open { .. }), "{error}");
@@ -576,7 +600,8 @@ mod tests {
     #[test]
     fn every_stream_is_offset_by_the_same_container_start() {
         let fixture = Fixture::generate_starting_late("audio_container_start", 25, 1);
-        let mut decoder = AudioDecoder::open(fixture.path(), OUTPUT_RATE).unwrap();
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
         let delay = fixture::audio_frame_start(1, OUTPUT_RATE) as usize;
 
         let block = decoder.samples(Time::ZERO, delay + 500).unwrap();

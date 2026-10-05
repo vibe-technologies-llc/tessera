@@ -15,7 +15,6 @@
 - Apply the display-matrix rotation and the sample aspect ratio, so phone footage isn't sideways and
   anamorphic DV and HDV aren't squashed
 - Re-anchor audio on packet timestamps after gaps and jumps, not only after a seek
-- Decode the probed stream index rather than `best()`
 - Keep a decoded run of frames for backward stepping and reverse shuttle, and budget frame caches
   across decoders instead of 256 MiB each
 - Deinterlace interlaced sources, and interpolate chroma fully in the scaler

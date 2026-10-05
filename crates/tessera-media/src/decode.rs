@@ -84,16 +84,21 @@ struct Source {
 unsafe impl Send for Scaler {}
 
 impl VideoDecoder {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::open_with(path, PREFERRED_HW_ACCELS)
+    pub fn open(path: impl AsRef<Path>, stream: usize) -> Result<Self, Error> {
+        Self::open_with(path, stream, PREFERRED_HW_ACCELS)
     }
 
-    pub fn open_with(path: impl AsRef<Path>, hw_accels: &[HwAccel]) -> Result<Self, Error> {
-        Self::open_threaded(path, hw_accels, AUTOMATIC_THREAD_COUNT)
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        stream: usize,
+        hw_accels: &[HwAccel],
+    ) -> Result<Self, Error> {
+        Self::open_threaded(path, stream, hw_accels, AUTOMATIC_THREAD_COUNT)
     }
 
     fn open_threaded(
         path: impl AsRef<Path>,
+        stream: usize,
         hw_accels: &[HwAccel],
         thread_count: c_int,
     ) -> Result<Self, Error> {
@@ -102,10 +107,11 @@ impl VideoDecoder {
             path: path.clone(),
             source,
         })?;
-        let stream = input
-            .streams()
-            .best(media::Type::Video)
-            .ok_or_else(|| Error::NoVideo { path: path.clone() })?;
+        let stream =
+            stream_of_kind(&input, stream, media::Type::Video).ok_or_else(|| Error::NoVideo {
+                path: path.clone(),
+                index: stream,
+            })?;
         let stream_index = stream.index();
         let time_base = TimeBase::of(&stream, &path)?;
         let start = stream_start(&input, &stream);
@@ -364,6 +370,16 @@ pub(crate) fn is_again(error: &ffmpeg_next::Error) -> bool {
         == ffmpeg_next::Error::Other {
             errno: ffmpeg_next::error::EAGAIN,
         }
+}
+
+pub(crate) fn stream_of_kind(
+    input: &format::context::Input,
+    index: usize,
+    medium: media::Type,
+) -> Option<format::stream::Stream<'_>> {
+    input
+        .stream(index)
+        .filter(|stream| stream.parameters().medium() == medium)
 }
 
 pub(crate) fn stream_start(input: &format::context::Input, stream: &format::stream::Stream) -> i64 {
@@ -630,7 +646,7 @@ mod tests {
     #[test]
     fn frames_are_found_across_keyframes_in_any_order() {
         let fixture = Fixture::generate("frames_in_any_order");
-        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
         for index in [0, 7, 3, 12, 19, 11, 5] {
             let frame = decoder
                 .frame_at(middle_of_frame(fixture::FRAME_RATE, index))
@@ -651,7 +667,7 @@ mod tests {
     #[test]
     fn stepping_through_every_frame_without_a_cache() {
         let fixture = Fixture::generate("stepping");
-        let mut decoder = VideoDecoder::open(fixture.path())
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM)
             .unwrap()
             .cache_capacity(0);
         let forward = 0..fixture::FRAME_COUNT;
@@ -668,7 +684,7 @@ mod tests {
     fn stepping_through_ntsc_frames_in_a_millisecond_time_base() {
         let rate = FrameRate::NTSC_30;
         let fixture = Fixture::generate_at_rate("ntsc_milliseconds", rate);
-        let mut decoder = VideoDecoder::open(fixture.path())
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM)
             .unwrap()
             .cache_capacity(0);
 
@@ -685,7 +701,7 @@ mod tests {
     #[test]
     fn software_decode_runs_on_every_core() {
         let fixture = Fixture::generate_without_audio("threads");
-        let decoder = VideoDecoder::open_with(fixture.path(), &[]).unwrap();
+        let decoder = VideoDecoder::open_with(fixture.path(), fixture::VIDEO_STREAM, &[]).unwrap();
 
         let cores = std::thread::available_parallelism().unwrap().get();
         let threading = decoder.decoder.threading();
@@ -698,7 +714,9 @@ mod tests {
         const ONE_THREAD: c_int = 1;
 
         let fixture = Fixture::generate("seek_policy");
-        let mut decoder = VideoDecoder::open_threaded(fixture.path(), &[], ONE_THREAD).unwrap();
+        let mut decoder =
+            VideoDecoder::open_threaded(fixture.path(), fixture::VIDEO_STREAM, &[], ONE_THREAD)
+                .unwrap();
 
         let ts = |decoder: &VideoDecoder, index| {
             decoder.stream_ts(middle_of_frame(fixture::FRAME_RATE, index))
@@ -717,7 +735,7 @@ mod tests {
     #[test]
     fn repeated_requests_within_a_frame_hit_the_cache() {
         let fixture = Fixture::generate("cache_hits");
-        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
         let first = decoder
             .frame_at(fixture::FRAME_RATE.frame_to_time(4))
             .unwrap();
@@ -737,7 +755,7 @@ mod tests {
     #[test]
     fn time_past_the_end_gives_the_last_frame() {
         let fixture = Fixture::generate("past_the_end");
-        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
         let last = fixture::FRAME_COUNT - 1;
         let frame = decoder.frame_at(Time::from_seconds(60)).unwrap();
         assert_eq!(frame.time, fixture::FRAME_RATE.frame_to_time(last));
@@ -747,7 +765,8 @@ mod tests {
     #[test]
     fn no_accelerator_offered_decodes_in_software() {
         let fixture = Fixture::generate("software_only");
-        let mut decoder = VideoDecoder::open_with(fixture.path(), &[]).unwrap();
+        let mut decoder =
+            VideoDecoder::open_with(fixture.path(), fixture::VIDEO_STREAM, &[]).unwrap();
         assert_eq!(decoder.hw_accel(), None);
         for index in [0, 9, 4] {
             let frame = decoder
@@ -763,8 +782,9 @@ mod tests {
         let Some(fixture) = Fixture::generate_h264("h264_accelerated") else {
             return;
         };
-        let mut software = VideoDecoder::open_with(fixture.path(), &[]).unwrap();
-        let mut preferred = VideoDecoder::open(fixture.path()).unwrap();
+        let mut software =
+            VideoDecoder::open_with(fixture.path(), fixture::VIDEO_STREAM, &[]).unwrap();
+        let mut preferred = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
         for index in [0, 7, 3, 12, 19, 11, 5] {
             let time = middle_of_frame(fixture::FRAME_RATE, index);
             let expected = software.frame_at(time).unwrap();
@@ -786,7 +806,7 @@ mod tests {
         let Some(fixture) = Fixture::generate_h264("h264_stepping") else {
             return;
         };
-        let mut decoder = VideoDecoder::open(fixture.path())
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM)
             .unwrap()
             .cache_capacity(0);
         let forward = 0..fixture::FRAME_COUNT;
@@ -802,7 +822,7 @@ mod tests {
     #[test]
     fn fitting_keeps_the_aspect_ratio() {
         let fixture = Fixture::generate("fitting");
-        let mut decoder = VideoDecoder::open(fixture.path())
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM)
             .unwrap()
             .fit_within(16, 16);
         let frame = decoder.frame_at(Time::ZERO).unwrap();
@@ -959,9 +979,28 @@ mod tests {
     }
 
     #[test]
+    fn only_the_requested_stream_is_decoded_and_it_must_be_video() {
+        let fixture = Fixture::generate("video_stream_index");
+
+        let audio = VideoDecoder::open(fixture.path(), fixture::AUDIO_STREAM)
+            .err()
+            .unwrap();
+        let absent = VideoDecoder::open(fixture.path(), 7).err().unwrap();
+
+        assert!(
+            matches!(audio, Error::NoVideo { index, .. } if index == fixture::AUDIO_STREAM),
+            "{audio}"
+        );
+        assert!(
+            matches!(absent, Error::NoVideo { index: 7, .. }),
+            "{absent}"
+        );
+    }
+
+    #[test]
     fn missing_file_is_an_open_error() {
         crate::init().unwrap();
-        let error = VideoDecoder::open("/nonexistent/tessera/clip.mkv")
+        let error = VideoDecoder::open("/nonexistent/tessera/clip.mkv", 0)
             .err()
             .unwrap();
         assert!(matches!(error, Error::Open { .. }), "{error}");
@@ -970,7 +1009,7 @@ mod tests {
     #[test]
     fn a_stream_that_starts_late_still_begins_at_time_zero() {
         let fixture = Fixture::generate_starting_late("video_starting_late", 25, 0);
-        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
 
         for index in [0, 9, 4] {
             let frame = decoder
@@ -984,7 +1023,7 @@ mod tests {
     #[test]
     fn asking_for_a_time_before_the_first_frame_seeks_only_once() {
         let fixture = Fixture::generate("video_before_the_start");
-        let mut decoder = VideoDecoder::open(fixture.path()).unwrap();
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
         let before = Time::from_seconds(-1);
 
         let first = decoder.frame_at(before).unwrap();

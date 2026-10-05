@@ -29,10 +29,16 @@ pub enum Error {
         #[source]
         source: FfmpegError,
     },
-    #[error("{path} has no video stream")]
-    NoVideo { path: std::path::PathBuf },
-    #[error("{path} has no audio stream")]
-    NoAudio { path: std::path::PathBuf },
+    #[error("{path} has no video stream at index {index}")]
+    NoVideo {
+        path: std::path::PathBuf,
+        index: usize,
+    },
+    #[error("{path} has no audio stream at index {index}")]
+    NoAudio {
+        path: std::path::PathBuf,
+        index: usize,
+    },
     #[error("failed to seek in {path}: {source}")]
     Seek {
         path: std::path::PathBuf,

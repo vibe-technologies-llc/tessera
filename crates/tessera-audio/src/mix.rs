@@ -13,17 +13,28 @@ use crate::CHANNELS;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Span<'a> {
     path: &'a Path,
+    stream: usize,
     track: usize,
     source_sample: i64,
     frames: Range<usize>,
 }
 
-type DecoderKey = (PathBuf, usize);
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Source {
+    path: PathBuf,
+    stream: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DecoderKey {
+    source: Source,
+    track: usize,
+}
 
 pub struct Mixer {
     project: Project,
     decoders: HashMap<DecoderKey, AudioDecoder>,
-    failed: HashSet<PathBuf>,
+    failed: HashSet<Source>,
 }
 
 impl Mixer {
@@ -46,9 +57,14 @@ impl Mixer {
             self.decoders.clear();
         }
         let project = &self.project;
-        let held = |path: &PathBuf| project.assets.iter().any(|asset| asset.path == *path);
+        let held = |source: &Source| {
+            project.assets.iter().any(|asset| {
+                asset.path == source.path
+                    && asset.info.audio().any(|audio| audio.index == source.stream)
+            })
+        };
         self.decoders
-            .retain(|(path, track), _| held(path) && *track < project.timeline.tracks.len());
+            .retain(|key, _| held(&key.source) && key.track < project.timeline.tracks.len());
         self.failed.retain(held);
     }
 
@@ -58,17 +74,24 @@ impl Mixer {
         let spans = spans(&self.project, sample_rate, first, out.len() / CHANNELS);
         for span in spans {
             let path = span.path;
-            if self.failed.contains(path) {
+            let source = Source {
+                path: path.to_owned(),
+                stream: span.stream,
+            };
+            if self.failed.contains(&source) {
                 continue;
             }
-            let key = (path.to_owned(), span.track);
+            let key = DecoderKey {
+                source,
+                track: span.track,
+            };
             let decoder = match self.decoders.get_mut(&key) {
                 Some(decoder) => decoder,
-                None => match AudioDecoder::open(path, sample_rate) {
+                None => match AudioDecoder::open(path, span.stream, sample_rate) {
                     Ok(opened) => self.decoders.entry(key.clone()).or_insert(opened),
                     Err(error) => {
                         tracing::warn!(path = %path.display(), %error, "audio clip cannot be played");
-                        self.failed.insert(path.to_owned());
+                        self.failed.insert(key.source);
                         continue;
                     }
                 },
@@ -83,7 +106,7 @@ impl Mixer {
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "audio clip stopped playing");
                     self.decoders.remove(&key);
-                    self.failed.insert(path.to_owned());
+                    self.failed.insert(key.source);
                 }
             }
         }
@@ -127,12 +150,14 @@ fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) 
                 .map(move |clip| (index, clip))
         })
         .filter_map(|(track, clip)| {
-            let path = &project.asset(clip.asset)?.path;
+            let asset = project.asset(clip.asset)?;
+            let stream = asset.info.audio().next()?.index;
             let covered = clip_samples(clip, sample_rate);
             let start = covered.start.max(first);
             let stop = covered.end.min(end);
             (start < stop).then(|| Span {
-                path,
+                path: &asset.path,
+                stream,
                 track,
                 source_sample: clip.source.start.to_samples(sample_rate) + (start - covered.start),
                 frames: (start - first) as usize..(stop - first) as usize,
@@ -175,13 +200,14 @@ mod tests {
     const RATE: NonZeroU32 = NonZeroU32::new(48_000).unwrap();
     const ONE_SECOND: i64 = RATE.get() as i64;
     const TONE: &str = "/media/tone.wav";
+    const TONE_STREAM: usize = 1;
 
     fn project_with_tone() -> (Project, AssetId, usize) {
         let mut project = Project::new("mix");
         let info = MediaInfo {
             duration: Some(Time::from_seconds(2)),
             streams: vec![Stream::Audio(AudioStream {
-                index: 0,
+                index: TONE_STREAM,
                 codec: "pcm_s16le".into(),
                 sample_rate: RATE,
                 channels: NonZero::new(2).unwrap(),
@@ -297,6 +323,7 @@ mod tests {
 
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].path, spans[1].path);
+        assert_eq!(spans[0].stream, TONE_STREAM);
         assert_ne!(spans[0].track, spans[1].track);
     }
 
@@ -320,11 +347,20 @@ mod tests {
     #[test]
     fn replacing_the_project_forgets_failures_for_media_it_no_longer_holds() {
         let (project, _, _) = project_with_tone();
+        let source = |path: &str, stream| Source {
+            path: path.into(),
+            stream,
+        };
         let mut mixer = Mixer::new(project.clone());
-        mixer.failed.insert("/media/gone.wav".into());
-        mixer.failed.insert(TONE.into());
+        mixer.failed.extend([
+            source("/media/gone.wav", 0),
+            source(TONE, 0),
+            source(TONE, TONE_STREAM),
+        ]);
+
         mixer.set_project(project);
-        assert_eq!(mixer.failed, HashSet::from([PathBuf::from(TONE)]));
+
+        assert_eq!(mixer.failed, HashSet::from([source(TONE, TONE_STREAM)]));
     }
 
     #[test]

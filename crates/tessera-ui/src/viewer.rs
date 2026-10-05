@@ -25,6 +25,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DecoderKey {
     path: PathBuf,
+    stream: usize,
     track: usize,
     bounds: (u32, u32),
 }
@@ -309,9 +310,13 @@ impl Viewer {
                 .get(decoder.track)
                 .is_some_and(|track| {
                     track.clips().iter().any(|clip| {
-                        project
-                            .asset(clip.asset)
-                            .is_some_and(|asset| asset.path == decoder.path)
+                        project.asset(clip.asset).is_some_and(|asset| {
+                            asset.path == decoder.path
+                                && asset
+                                    .info
+                                    .video()
+                                    .any(|video| video.index == decoder.stream)
+                        })
                     })
                 })
     }
@@ -533,6 +538,7 @@ fn frame_request(project: &Project, time: Time, bounds: (u32, u32)) -> Option<Fr
             Some(LayerRequest {
                 decoder: DecoderKey {
                     path: asset.path.clone(),
+                    stream: asset.info.video().next()?.index,
                     track,
                     bounds,
                 },
@@ -685,9 +691,14 @@ fn decode_layer(
         }
         Ok(Some(decoder)) => decoder,
         Ok(None) => {
-            let DecoderKey { path, bounds, .. } = &layer.decoder;
+            let DecoderKey {
+                path,
+                stream,
+                bounds,
+                ..
+            } = &layer.decoder;
             let (width, height) = *bounds;
-            match VideoDecoder::open(path) {
+            match VideoDecoder::open(path, *stream) {
                 Ok(opened) => {
                     let opened = opened.fit_within(width, height);
                     tracing::debug!(
@@ -809,6 +820,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn layers_decode_the_probed_video_stream() {
+        let mut project = Project::new("streams");
+        let mut info = audio_info(4);
+        info.streams.extend(
+            video_info(4)
+                .streams
+                .into_iter()
+                .map(|stream| match stream {
+                    Stream::Video(video) => Stream::Video(VideoStream { index: 1, ..video }),
+                    audio @ Stream::Audio(_) => audio,
+                }),
+        );
+        let asset = project.add_asset("/missing/both.mkv".into(), info);
+        project.place_clip(asset, 0, Time::ZERO).unwrap();
+
+        let request = frame_request(&project, Time::ZERO, sequence_bounds(&project)).unwrap();
+
+        assert_eq!(request.layers[0].decoder.stream, 1);
+    }
+
     fn project_showing(media: &str) -> Project {
         let mut project = Project::new(media);
         let asset = project.add_asset(media.into(), video_info(4));
@@ -905,6 +937,7 @@ mod tests {
         let request =
             frame_request(&project, Time::from_seconds(4), sequence_bounds(&project)).unwrap();
         assert_eq!(request.bounds, sequence_bounds(&project));
+        assert!(request.decoders().all(|decoder| decoder.stream == 0));
         let times: Vec<Time> = request.layers.iter().map(|layer| layer.time).collect();
         assert_eq!(
             times,
@@ -1163,6 +1196,7 @@ mod tests {
     fn media_that_fails_to_open_is_remembered_and_the_other_layers_still_show() {
         let key = |path: &str, track| DecoderKey {
             path: path.into(),
+            stream: 0,
             track,
             bounds: (8, 4),
         };

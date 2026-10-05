@@ -83,6 +83,7 @@ enum Job {
     Thumbnail {
         id: AssetId,
         path: PathBuf,
+        stream: usize,
         duration: Option<Time>,
     },
 }
@@ -136,8 +137,13 @@ impl Job {
                 id,
                 path,
             },
-            Self::Thumbnail { id, path, duration } => Finished::Thumbnail {
-                image: thumbnail(&path, duration),
+            Self::Thumbnail {
+                id,
+                path,
+                stream,
+                duration,
+            } => Finished::Thumbnail {
+                image: thumbnail(&path, stream, duration),
                 id,
                 path,
             },
@@ -314,13 +320,13 @@ impl MediaBin {
             .collect();
         let mut wanted = Vec::new();
         for asset in project.assets.iter() {
-            let has_video = asset.info.video().next().is_some();
-            let thumbnail_stale =
-                has_video && self.thumbnail_requested.get(&asset.id) != Some(&asset.path);
-            if thumbnail_stale {
+            let video = asset.info.video().next();
+            let thumbnail_stale = self.thumbnail_requested.get(&asset.id) != Some(&asset.path);
+            if let Some(video) = video.filter(|_| thumbnail_stale) {
                 wanted.push(Job::Thumbnail {
                     id: asset.id,
                     path: asset.path.clone(),
+                    stream: video.index,
                     duration: asset.info.duration,
                 });
             }
@@ -988,8 +994,8 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
         })
 }
 
-fn thumbnail(path: &Path, duration: Option<Time>) -> Option<Arc<RenderImage>> {
-    match decode_thumbnail(path, duration) {
+fn thumbnail(path: &Path, stream: usize, duration: Option<Time>) -> Option<Arc<RenderImage>> {
+    match decode_thumbnail(path, stream, duration) {
         Ok(frame) => render_image(frame),
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "thumbnail failed");
@@ -1000,12 +1006,13 @@ fn thumbnail(path: &Path, duration: Option<Time>) -> Option<Arc<RenderImage>> {
 
 fn decode_thumbnail(
     path: &Path,
+    stream: usize,
     duration: Option<Time>,
 ) -> Result<Arc<VideoFrame>, tessera_media::Error> {
     let time = duration.map_or(Time::ZERO, |duration| {
         Time::from_flicks(duration.flicks() / THUMBNAIL_POSITION_DIVISOR)
     });
-    VideoDecoder::open_with(path, &[])?
+    VideoDecoder::open_with(path, stream, &[])?
         .fit_within(
             THUMBNAIL_WIDTH * THUMBNAIL_PIXEL_DENSITY,
             THUMBNAIL_HEIGHT * THUMBNAIL_PIXEL_DENSITY,
