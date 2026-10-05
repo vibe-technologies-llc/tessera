@@ -182,8 +182,8 @@ impl Playhead {
             return;
         };
         let sample_rate = project.settings.sample_rate;
-        if sample_rate != playback.sample_rate && matches!(playback.clock, PlaybackClock::Audio(_))
-        {
+        let audible = matches!(playback.clock, PlaybackClock::Audio(_));
+        if output_needs_restart(playback.sample_rate, sample_rate, audible) {
             playback.clock = PlaybackClock::start(playback.speed, &project, time);
             playback.from = time;
             playback.sample_rate = sample_rate;
