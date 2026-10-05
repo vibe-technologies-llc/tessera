@@ -34,6 +34,13 @@ impl ProjectEditor {
         });
     }
 
+    pub fn mark_unsaved(&self, cx: &mut App) {
+        self.history.update(cx, |history, cx| {
+            history.mark_unsaved();
+            cx.notify();
+        });
+    }
+
     pub fn apply<T, E>(
         &self,
         command: Command,

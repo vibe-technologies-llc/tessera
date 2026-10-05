@@ -5,10 +5,6 @@
 - Carry rotation, sample aspect ratio, pixel format, stream disposition and per-stream start time in
   `MediaInfo`, and let a clip choose which of several audio streams it plays
 
-## Project files
-
-- Autosave and recovery after a crash
-
 ## Media decode
 
 - Apply the display-matrix rotation and the sample aspect ratio, so phone footage isn't sideways and

@@ -1,3 +1,4 @@
+mod autosave;
 mod editor;
 mod frame_image;
 mod media_bin;
@@ -26,6 +27,8 @@ const DIALOG_CONTEXT: &str = "Dialog";
 const SHORTCUT_CONTEXT: &str = "Workspace && !TextField && !Dialog";
 
 pub const NEW_PROJECT_NAME: &str = "Untitled";
+
+const AUTOSAVE_DIRECTORY: &str = "autosave";
 
 actions!(
     tessera,
@@ -130,10 +133,23 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-pub fn restore_recent_projects(cx: &mut App) {
-    if let Some(file) = recent::default_file() {
-        cx.set_global(recent::RecentProjects::stored_in(file));
-    }
+pub fn use_state_directory(cx: &mut App) {
+    let Some(state) = state_directory() else {
+        tracing::warn!("no state directory, recent projects and autosave stay off");
+        return;
+    };
+    cx.set_global(recent::RecentProjects::stored_in(
+        state.join(recent::RECENT_FILE),
+    ));
+    cx.set_global(autosave::AutosaveDirectory(state.join(AUTOSAVE_DIRECTORY)));
+}
+
+fn state_directory() -> Option<std::path::PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::home_dir().map(|home| home.join(".local").join("state")))?;
+    Some(state.join(APP_ID))
 }
 
 pub fn open_main_window(project: Project, cx: &mut App) -> gpui::Result<WindowHandle<Workspace>> {
@@ -150,7 +166,11 @@ pub fn open_main_window(project: Project, cx: &mut App) -> gpui::Result<WindowHa
     };
     cx.open_window(options, |window, cx| {
         let project = cx.new(|_| project);
-        cx.new(|cx| Workspace::new(project, window, cx))
+        cx.new(|cx| {
+            let mut workspace = Workspace::new(project, window, cx);
+            workspace.offer_recovery(window, cx);
+            workspace
+        })
     })
 }
 

@@ -97,13 +97,25 @@ struct Entry {
     revision: Revision,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct History {
     undo: VecDeque<Entry>,
     redo: Vec<Entry>,
     current: Revision,
     newest: Revision,
-    saved: Revision,
+    saved: Option<Revision>,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            current: Revision::default(),
+            newest: Revision::default(),
+            saved: Some(Revision::default()),
+        }
+    }
 }
 
 impl History {
@@ -168,11 +180,15 @@ impl History {
     }
 
     pub fn mark_saved(&mut self, revision: Revision) {
-        self.saved = revision;
+        self.saved = Some(revision);
+    }
+
+    pub fn mark_unsaved(&mut self) {
+        self.saved = None;
     }
 
     pub fn is_saved(&self) -> bool {
-        self.saved == self.current
+        self.saved == Some(self.current)
     }
 
     fn swap_in(&mut self, entry: Entry, project: &mut Project) -> Entry {
@@ -296,6 +312,25 @@ mod tests {
         let _ = history.apply(Command::RemoveTrack, &mut project, |project| {
             project.timeline.remove_track(99)
         });
+
+        assert!(history.is_saved());
+    }
+
+    #[test]
+    fn a_project_marked_unsaved_stays_unsaved_through_undo_and_redo() {
+        let mut history = History::default();
+        let mut project = Project::new("test");
+
+        history.mark_unsaved();
+
+        assert!(!history.is_saved());
+
+        add_track(&mut history, &mut project);
+        history.undo(&mut project);
+
+        assert!(!history.is_saved());
+
+        history.mark_saved(history.revision());
 
         assert!(history.is_saved());
     }

@@ -95,7 +95,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `next_undo` and `next_redo` describe the next step before it is taken. Every project state the
   history reaches gets a `Revision` never given out again, which undo and redo carry with their
   snapshots; `mark_saved` records the revision a save wrote, so `is_saved` holds exactly when undo
-  and redo return to it.
+  and redo return to it, and `mark_unsaved` (a recovered autosave) leaves no revision saved.
 - **`tessera-document`** reads and writes project files (`.tessera`, `EXTENSION`): pretty JSON in
   an envelope `{ "format": "tessera-project", "version": N, "project": … }`, with times as integer
   flicks. The model stays serde-free: each format version has its own DTO module (`v1.rs`, aliased
@@ -352,11 +352,21 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   (`RecentProjectsDialog`), and choosing one opens it like Ctrl+O. `RecentProjects` (`recent.rs`)
   is a GPUI global: every file a project is saved to or opened from moves to the front of it (at
   most `MAX_RECENT_PROJECTS`, UTF-8 paths only), and a file that fails to open drops out. It is
-  in memory unless `restore_recent_projects` loaded it from `$XDG_STATE_HOME/tessera/recent-projects`
+  in memory unless `use_state_directory` loaded it from `$XDG_STATE_HOME/tessera/recent-projects`
   (`~/.local/state` without one, one path per line), which it is then written back to on a
-  background task after each change; only the binary calls that, so tests never touch it.
+  background task after each change. The same call sets the `AutosaveDirectory` global
+  (`…/tessera/autosave`); only the binary makes it, so tests never touch the real state directory.
+  With that directory set, each `Workspace` claims an autosave `Slot` (`autosave.rs`, named by pid
+  and a process-wide counter, `<slot>.tessera` plus a `<slot>.source` holding the project's file)
+  and every `AUTOSAVE_INTERVAL` writes the project into it through the file IO queue while it has
+  unsaved changes not yet written. A save that leaves the project saved, and Don't Save in
+  `confirm_discard`, remove the slot. `open_main_window` calls `offer_recovery`: the newest slot
+  whose pid has no `/proc` entry (an orphan of a session that crashed) is offered as Recover,
+  Discard or Not Now; Recover asks about the current project's changes, swaps the recovered
+  project in, takes the orphan over as the session's own slot and leaves the project marked
+  unsaved (`History::mark_unsaved`) under the file it came from.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend,
-  restores the recent projects and opens the main window.
+  points the UI at the state directory and opens the main window.
 
 GPUI 0.2.2 renders through blade and cannot share a `wgpu` device. Until that changes, composited
 frames reach the viewer as a GPUI image read back to the CPU, not through a shared GPU texture.

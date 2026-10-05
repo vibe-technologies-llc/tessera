@@ -5847,6 +5847,7 @@ dependencies = [
  "tessera-media",
  "tessera-render",
  "tessera-timeline",
+ "thiserror 2.0.21",
  "tracing",
 ]
 

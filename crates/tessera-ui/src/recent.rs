@@ -14,8 +14,7 @@ use crate::{
 };
 
 pub const MAX_RECENT_PROJECTS: usize = 10;
-const STATE_DIRECTORY: &str = "tessera";
-const RECENT_FILE: &str = "recent-projects";
+pub const RECENT_FILE: &str = "recent-projects";
 const DIALOG_WIDTH: f32 = 460.;
 const NO_RECENT_PROJECTS: &str = "No recent projects";
 
@@ -75,14 +74,6 @@ fn parse(text: &str) -> Vec<PathBuf> {
         recent.remember(PathBuf::from(line));
     }
     recent.paths
-}
-
-pub fn default_file() -> Option<PathBuf> {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::home_dir().map(|home| home.join(".local").join("state")))?;
-    Some(state.join(STATE_DIRECTORY).join(RECENT_FILE))
 }
 
 pub fn update(cx: &mut App, change: impl FnOnce(&mut RecentProjects)) {

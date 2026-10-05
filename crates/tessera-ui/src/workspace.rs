@@ -6,7 +6,7 @@ use gpui::{
     PathPromptOptions, PromptLevel, Render, Styled, Subscription, Task, Window, div, px,
 };
 use tessera_document::EXTENSION;
-use tessera_timeline::{Command, Project, Time};
+use tessera_timeline::{Command, Project, Revision, Time};
 
 use crate::{
     AddMarker, Cancel, ClearInOut, CopyClips, CutClips, DeleteClip, DuplicateClips, FocusSearch,
@@ -15,6 +15,7 @@ use crate::{
     RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint, SetOutPoint,
     ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward, ToggleSafeAreas,
     ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
+    autosave::{AUTOSAVE_INTERVAL, AutosaveDirectory, Orphan, Slot, orphans},
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
@@ -27,6 +28,9 @@ use crate::{
 };
 
 const UNSAVED_MARK: &str = "• ";
+const RECOVER: &str = "Recover";
+const DISCARD_RECOVERY: &str = "Discard";
+const RECOVERY_CHOICES: [&str; 3] = [RECOVER, DISCARD_RECOVERY, "Not Now"];
 
 #[derive(Clone, Copy)]
 enum UnsavedChanges {
@@ -58,6 +62,9 @@ pub struct Workspace {
     file_io: Shared<Task<()>>,
     asking_to_discard: bool,
     dialog: Option<(Dialog, Subscription)>,
+    autosave: Option<Slot>,
+    autosaved: Option<Revision>,
+    _autosave_timer: Option<Task<()>>,
 }
 
 enum Dialog {
@@ -89,6 +96,19 @@ impl Workspace {
             this.update(cx, |workspace, cx| workspace.should_close(window, cx))
                 .unwrap_or(true)
         });
+        let autosave = cx
+            .try_global::<AutosaveDirectory>()
+            .map(|directory| Slot::claim(&directory.0));
+        let autosave_timer = autosave.is_some().then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(AUTOSAVE_INTERVAL).await;
+                    if this.update(cx, Workspace::autosave).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
         let timeline_focus_return = focus_handle.clone();
         let bin_focus_return = focus_handle.clone();
         Self {
@@ -110,7 +130,144 @@ impl Workspace {
             file_io: Task::ready(()).shared(),
             asking_to_discard: false,
             dialog: None,
+            autosave,
+            autosaved: None,
+            _autosave_timer: autosave_timer,
         }
+    }
+
+    fn autosave(&mut self, cx: &mut Context<Self>) {
+        let Some(slot) = self.autosave.clone() else {
+            return;
+        };
+        let history = self.editor.history().read(cx);
+        if history.is_saved() {
+            self.discard_autosave(cx);
+            return;
+        }
+        let revision = history.revision();
+        if self.autosaved == Some(revision) {
+            return;
+        }
+        self.autosaved = Some(revision);
+        let project = self.project().read(cx).clone();
+        let file = self.file.clone();
+        let writing = self.queue_file_io(cx, move || slot.write(&project, file.as_deref()));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Err(error)) = writing.await {
+                tracing::warn!(%error, "could not autosave the project");
+                this.update(cx, |workspace, _| {
+                    if workspace.autosaved == Some(revision) {
+                        workspace.autosaved = None;
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn discard_autosave(&mut self, cx: &mut Context<Self>) {
+        let Some(slot) = self.autosave.clone() else {
+            return;
+        };
+        if self.autosaved.take().is_some() {
+            drop(self.queue_file_io(cx, move || slot.remove()));
+        }
+    }
+
+    pub fn offer_recovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(AutosaveDirectory(directory)) = cx.try_global::<AutosaveDirectory>().cloned()
+        else {
+            return;
+        };
+        let found = cx.background_spawn(async move {
+            let orphan = orphans(&directory).into_iter().next()?;
+            let recovered = orphan.recover();
+            Some((orphan, recovered))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Some((orphan, recovered)) = found.await else {
+                return;
+            };
+            let project = match recovered {
+                Ok(project) => project,
+                Err(error) => {
+                    tracing::warn!(%error, "an autosave cannot be read, discarding it");
+                    orphan.discard();
+                    return;
+                }
+            };
+            let name = orphan
+                .file
+                .as_deref()
+                .map_or_else(|| project.name.clone(), |file| file_name(file).to_string());
+            let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    &format!("Recover the unsaved changes to “{name}”?"),
+                    Some("Tessera stopped before they were saved."),
+                    &RECOVERY_CHOICES,
+                    cx,
+                )
+            }) else {
+                return;
+            };
+            match answer
+                .await
+                .ok()
+                .and_then(|index| RECOVERY_CHOICES.get(index))
+            {
+                Some(&RECOVER) => {
+                    let Ok(confirming) = this.update_in(cx, |workspace, window, cx| {
+                        workspace.confirm_discard(window, cx)
+                    }) else {
+                        return;
+                    };
+                    if confirming.await {
+                        this.update_in(cx, |workspace, window, cx| {
+                            workspace.recover(orphan, project, window, cx);
+                        })
+                        .ok();
+                    }
+                }
+                Some(&DISCARD_RECOVERY) => {
+                    cx.background_spawn(async move { orphan.discard() }).await;
+                }
+                _ => {}
+            }
+        })
+        .detach();
+    }
+
+    fn recover(
+        &mut self,
+        orphan: Orphan,
+        project: Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::info!(autosave = %orphan.slot.project().display(), "recovered unsaved changes");
+        self.replace_project(project, cx);
+        self.editor.mark_unsaved(cx);
+        match orphan.file.clone() {
+            Some(file) => self.set_file(file, window, cx),
+            None => {
+                self.file = None;
+                window.set_window_title(&self.title(cx));
+            }
+        }
+        let Some(slot) = self.autosave.clone() else {
+            return;
+        };
+        self.autosaved = Some(self.editor.revision(cx));
+        let adopting = self.queue_file_io(cx, move || slot.adopt(&orphan));
+        cx.spawn(async move |_, _| {
+            if let Ok(Err(error)) = adopting.await {
+                tracing::warn!(%error, "could not take over the recovered autosave");
+            }
+        })
+        .detach();
     }
 
     fn open_sequence_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -185,7 +342,10 @@ impl Workspace {
                 workspace.asking_to_discard = false;
                 match choice {
                     UnsavedChanges::Save => workspace.save(window, cx),
-                    UnsavedChanges::Discard => Task::ready(true),
+                    UnsavedChanges::Discard => {
+                        workspace.discard_autosave(cx);
+                        Task::ready(true)
+                    }
                     UnsavedChanges::Cancel => Task::ready(false),
                 }
             });
@@ -311,6 +471,9 @@ impl Workspace {
                     tracing::info!(path = %path.display(), "saved the project");
                     workspace.editor.mark_saved(revision, cx);
                     workspace.set_file(path, window, cx);
+                    if workspace.editor.history().read(cx).is_saved() {
+                        workspace.discard_autosave(cx);
+                    }
                     true
                 }
                 Err(error) => {
@@ -850,6 +1013,92 @@ mod tests {
         cx.simulate_prompt_answer("Ok");
 
         assert_eq!(recent_paths(cx), [first]);
+    }
+
+    fn autosave_path(workspace: &Entity<Workspace>, cx: &mut VisualTestContext) -> PathBuf {
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .autosave
+                .as_ref()
+                .unwrap()
+                .project()
+                .to_owned()
+        })
+    }
+
+    #[gpui::test]
+    fn unsaved_changes_are_autosaved_until_they_are_saved_or_discarded(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("autosave");
+        cx.update(|cx| cx.set_global(AutosaveDirectory(dir.0.join("autosave"))));
+        let project = cx.new(|_| sample_project("Cut", "/media/cut.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        let autosave = autosave_path(&workspace, cx);
+        let autosave_now = |cx: &mut VisualTestContext| {
+            workspace.update(cx, Workspace::autosave);
+            cx.run_until_parked();
+        };
+
+        autosave_now(cx);
+
+        assert!(!autosave.exists());
+
+        split_at(&workspace, 4, cx);
+        autosave_now(cx);
+
+        assert_eq!(
+            tessera_document::open(&autosave).unwrap(),
+            current(&workspace, cx)
+        );
+
+        let path = dir.0.join("cut.tessera");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_to(path.clone(), window, cx).detach();
+        });
+        cx.run_until_parked();
+
+        assert!(!autosave.exists());
+
+        split_at(&workspace, 12, cx);
+        autosave_now(cx);
+
+        assert!(autosave.exists());
+
+        cx.simulate_keystrokes("ctrl-n");
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Don't Save");
+        cx.run_until_parked();
+
+        assert!(!autosave.exists());
+    }
+
+    #[gpui::test]
+    fn changes_left_by_a_crashed_session_can_be_recovered(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("recovery");
+        let directory = dir.0.join("autosave");
+        cx.update(|cx| cx.set_global(AutosaveDirectory(directory.clone())));
+        let lost = sample_project("Lost", "/media/lost.mkv");
+        let file = dir.0.join("lost.tessera");
+        let crashed = Slot::named(&directory, &format!("{}-0", u32::MAX - 1));
+        crashed.write(&lost, Some(&file)).unwrap();
+        let project = cx.new(|_| Project::new(NEW_PROJECT_NAME));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        workspace.update_in(cx, Workspace::offer_recovery);
+        cx.run_until_parked();
+        cx.simulate_prompt_answer(RECOVER);
+        cx.run_until_parked();
+
+        assert_eq!(current(&workspace, cx), lost);
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some("• lost.tessera — Tessera")
+        );
+        assert!(!crashed.project().exists());
+        assert!(autosave_path(&workspace, cx).exists());
+        assert!(orphans(&directory).is_empty());
     }
 
     #[gpui::test]

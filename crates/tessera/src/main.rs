@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
 
     Application::new().run(|cx| {
         tessera_ui::init(cx);
-        tessera_ui::restore_recent_projects(cx);
+        tessera_ui::use_state_directory(cx);
         if let Err(error) =
             tessera_ui::open_main_window(Project::new(tessera_ui::NEW_PROJECT_NAME), cx)
         {
