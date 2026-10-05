@@ -333,7 +333,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   it in a `TextField` (`RenameTarget::Marker`, sharing the track rename's field handling). Down and Up jump the playhead to the next and previous edit
   (`Timeline::next_edit_after`, the starts and ends of all clips), Ctrl+Right and Ctrl+Left to the
   next and previous marker, and Escape cancels a drag in progress. Shift+wheel scrolls the track rows vertically, under a fixed
-  ruler. Panel interactions are tested
+  ruler. A horizontal scrollbar under the lanes and a vertical one at their right
+  (`timeline/scrollbar.rs`, a `Thumb` as fractions of the extent, hidden when everything fits) are
+  dragged by the grabbed point, and a press beside the thumb centres it there. A drag over the
+  lanes keeps its pointer as a `DragHover` (lane, offset, what is dragged), so whenever the view
+  scrolls mid-drag, by the wheel or by autoscroll, the preview is recomputed and the grabbed point
+  stays under the pointer; within `AUTOSCROLL_EDGE` of either side of the lanes a ticker scrolls
+  the view, faster the closer to the edge, up to a visible width past the timeline's end. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` requests every video clip under the
   playhead as a layer, bottom to top (`Timeline::video_layers_at`, which leaves out muted tracks).

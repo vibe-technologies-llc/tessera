@@ -1,4 +1,5 @@
 mod header;
+mod scrollbar;
 mod snap;
 mod viewport;
 
@@ -21,6 +22,7 @@ use self::{
         add_track_row, content_height, display_order, next_height_of, row_height, track_header,
         track_rows,
     },
+    scrollbar::{Axis, SCROLLBAR_THICKNESS, Thumb, scrollbar},
     snap::{Snap, SnapTargets},
     viewport::Viewport,
 };
@@ -54,6 +56,9 @@ const SNAP_LINE_WIDTH: f32 = 1.;
 const MARKER_WIDTH: f32 = 9.;
 const MARKER_HEIGHT: f32 = 10.;
 const IN_OUT_EDGE_WIDTH: f32 = 2.;
+const AUTOSCROLL_EDGE: f32 = 32.;
+const AUTOSCROLL_MAX_STEP: f32 = 24.;
+const AUTOSCROLL_TICK: std::time::Duration = std::time::Duration::from_millis(16);
 const MARKER_LABEL_GAP: f32 = 2.;
 const MARKER_RENAME_WIDTH: f32 = 140.;
 
@@ -207,6 +212,10 @@ pub struct TimelinePanel {
     scrubbing: bool,
     marker_drag: Option<MarkerDrag>,
     marquee: Option<Marquee>,
+    drag_hover: Option<DragHover>,
+    autoscroll_step: Pixels,
+    autoscrolling: bool,
+    scrolling: Option<(Axis, f32)>,
     drop_preview: Option<DropPreview>,
     viewport: Viewport,
     lanes: Bounds<Pixels>,
@@ -225,6 +234,19 @@ struct MarkerDrag {
     id: MarkerId,
     grab: Pixels,
     time: Time,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Dragging {
+    Asset { id: AssetId, mode: DropMode },
+    Clip(DraggedClip),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DragHover {
+    track: usize,
+    offset: Pixels,
+    dragging: Dragging,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -306,6 +328,10 @@ impl TimelinePanel {
             scrubbing: false,
             marker_drag: None,
             marquee: None,
+            drag_hover: None,
+            autoscroll_step: px(0.),
+            autoscrolling: false,
+            scrolling: None,
             drop_preview: None,
             viewport: Viewport::default(),
             lanes: Bounds::default(),
@@ -407,6 +433,8 @@ impl TimelinePanel {
 
     pub fn drag_cancelled(&mut self, cx: &mut Context<Self>) {
         self.drop_preview = None;
+        self.drag_hover = None;
+        self.autoscroll_step = px(0.);
         self.marker_drag = None;
         self.marquee = None;
         cx.notify();
@@ -903,6 +931,7 @@ impl TimelinePanel {
             self.viewport.scrolled_by(-(delta.x + delta.y), limit)
         };
         self.set_viewport(viewport, cx);
+        self.rehover(cx);
     }
 
     fn follow_playhead(&mut self, cx: &App) {
@@ -1017,16 +1046,11 @@ impl TimelinePanel {
         event: &DragMoveEvent<DraggedAsset>,
         cx: &mut Context<Self>,
     ) {
-        let asset = event.drag(cx).id;
-        let mode = DropMode::of(event.event.modifiers);
-        self.hover_lane(track, event, cx, |panel, offset, cx| {
-            let project = panel.project.read(cx);
-            let duration = project
-                .asset(asset)
-                .and_then(|asset| asset.default_clip_duration());
-            let (start, snap) = panel.snapped_start(panel.frame_at(offset, cx), duration, &[], cx);
-            asset_drop_preview(project, asset, track, start, snap, mode)
-        });
+        let dragging = Dragging::Asset {
+            id: event.drag(cx).id,
+            mode: DropMode::of(event.event.modifiers),
+        };
+        self.drag_over_lane(track, dragging, event.event.position, event.bounds, cx);
     }
 
     fn drag_clip_over_lane(
@@ -1035,61 +1059,117 @@ impl TimelinePanel {
         event: &DragMoveEvent<DraggedClip>,
         cx: &mut Context<Self>,
     ) {
-        let DraggedClip { id, grip } = *event.drag(cx);
-        match grip {
-            Grip::Body => {
-                let grab = self.grab;
+        let dragging = Dragging::Clip(*event.drag(cx));
+        self.drag_over_lane(track, dragging, event.event.position, event.bounds, cx);
+    }
+
+    fn drag_over_lane(
+        &mut self,
+        track: usize,
+        dragging: Dragging,
+        position: Point<Pixels>,
+        lane: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let trimming_here = match dragging {
+            Dragging::Clip(DraggedClip {
+                id,
+                grip: Grip::Edge(_),
+            }) => {
+                let clip_track = self.project.read(cx).find_clip(id).map(|(track, _)| track);
+                if clip_track != Some(track) {
+                    return;
+                }
+                true
+            }
+            _ => false,
+        };
+        if !trimming_here && !lane.contains(&position) {
+            if self
+                .drop_preview
+                .is_some_and(|preview| preview.track == track)
+            {
+                self.drag_hover = None;
+                self.autoscroll_step = px(0.);
+                self.show_preview(None, cx);
+            }
+            return;
+        }
+        let hover = DragHover {
+            track,
+            offset: position.x - lane.left(),
+            dragging,
+        };
+        self.drag_hover = Some(hover);
+        self.autoscroll_step = autoscroll_step(hover.offset, self.lanes.size.width);
+        self.start_autoscroll(cx);
+        let preview = self.hover_preview(hover, cx);
+        self.show_preview(preview, cx);
+    }
+
+    fn hover_preview(&self, hover: DragHover, cx: &App) -> Option<DropPreview> {
+        let DragHover {
+            track,
+            offset,
+            dragging,
+        } = hover;
+        let project = self.project.read(cx);
+        match dragging {
+            Dragging::Asset { id, mode } => {
+                let duration = project
+                    .asset(id)
+                    .and_then(|asset| asset.default_clip_duration());
+                let (start, snap) =
+                    self.snapped_start(self.frame_at(offset, cx), duration, &[], cx);
+                asset_drop_preview(project, id, track, start, snap, mode)
+            }
+            Dragging::Clip(DraggedClip {
+                id,
+                grip: Grip::Body,
+            }) => {
                 let group: Vec<ClipId> = if self.selection.contains(&id) {
                     self.selection.iter().copied().collect()
                 } else {
                     vec![id]
                 };
-                self.hover_lane(track, event, cx, |panel, offset, cx| {
-                    let project = panel.project.read(cx);
-                    let (clip_track, clip) = project.find_clip(id)?;
-                    let start = panel.frame_at(offset - grab, cx);
-                    let (start, snap) =
-                        panel.snapped_start(start, Some(clip.source.duration), &group, cx);
-                    if group.len() == 1 {
-                        return placement(
-                            track,
-                            project.moved_clip(id, track, start),
-                            snap,
-                            DropMode::Place,
-                        );
-                    }
-                    let moves = group_moves(project, &group, start - clip.start, clip_track, track);
-                    let moved = project.moved_clips(&moves);
-                    let fits = match moved {
-                        Ok(_) => true,
-                        Err(EditError::Overlapping(_)) => false,
-                        Err(_) => return None,
-                    };
-                    let preview = DropPreview {
+                let (clip_track, clip) = project.find_clip(id)?;
+                let start = self.frame_at(offset - self.grab, cx);
+                let (start, snap) =
+                    self.snapped_start(start, Some(clip.source.duration), &group, cx);
+                if group.len() == 1 {
+                    return placement(
                         track,
-                        range: TimeRange::new(start, clip.source.duration),
-                        fits,
-                        reason: (!fits).then_some(OVERLAP_REASON),
-                        mode: DropMode::Place,
-                        snapped_to: None,
-                        group: Some(GroupShift {
-                            shift: start - clip.start,
-                            from: clip_track,
-                        }),
-                        partner: None,
-                    };
-                    Some(preview.snapped(snap))
-                });
-            }
-            Grip::Edge(edge) => {
-                let offset = event.event.position.x - event.bounds.left();
-                let project = self.project.read(cx);
-                let Some((clip_track, clip)) = project.find_clip(id) else {
-                    return;
-                };
-                if clip_track != track {
-                    return;
+                        project.moved_clip(id, track, start),
+                        snap,
+                        DropMode::Place,
+                    );
                 }
+                let moves = group_moves(project, &group, start - clip.start, clip_track, track);
+                let fits = match project.moved_clips(&moves) {
+                    Ok(_) => true,
+                    Err(EditError::Overlapping(_)) => false,
+                    Err(_) => return None,
+                };
+                let preview = DropPreview {
+                    track,
+                    range: TimeRange::new(start, clip.source.duration),
+                    fits,
+                    reason: (!fits).then_some(OVERLAP_REASON),
+                    mode: DropMode::Place,
+                    snapped_to: None,
+                    group: Some(GroupShift {
+                        shift: start - clip.start,
+                        from: clip_track,
+                    }),
+                    partner: None,
+                };
+                Some(preview.snapped(snap))
+            }
+            Dragging::Clip(DraggedClip {
+                id,
+                grip: Grip::Edge(edge),
+            }) => {
+                let (_, clip) = project.find_clip(id)?;
                 let anchor = match edge {
                     ClipEdge::Start => self.grab,
                     ClipEdge::End => self.grab - self.viewport.width_of(clip.source.duration),
@@ -1097,39 +1177,132 @@ impl TimelinePanel {
                 let to = self.frame_at(offset - anchor, cx);
                 let snap = self.snap(&[to], &[id], cx);
                 let to = to + snap.map_or(Time::ZERO, |snap| snap.shift);
-                let project = self.project.read(cx);
                 let partner = project.partners(id).first().map(|(partner, _)| *partner);
-                let preview = placement(
+                placement(
                     track,
                     project.trimmed_clip(id, edge, to),
                     snap,
                     DropMode::Place,
                 )
-                .map(|preview| DropPreview { partner, ..preview });
-                self.show_preview(preview, cx);
+                .map(|preview| DropPreview { partner, ..preview })
             }
         }
     }
 
-    fn hover_lane<T: 'static>(
-        &mut self,
-        track: usize,
-        event: &DragMoveEvent<T>,
-        cx: &mut Context<Self>,
-        preview: impl FnOnce(&Self, Pixels, &App) -> Option<DropPreview>,
-    ) {
-        let position = event.event.position;
-        let preview = if event.bounds.contains(&position) {
-            preview(self, position.x - event.bounds.left(), cx)
-        } else if self
-            .drop_preview
-            .is_some_and(|preview| preview.track == track)
-        {
-            None
-        } else {
+    fn start_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscrolling || self.autoscroll_step == px(0.) {
+            return;
+        }
+        self.autoscrolling = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_TICK).await;
+                let Ok(true) = this.update(cx, |panel, cx| panel.autoscroll(cx)) else {
+                    break;
+                };
+            }
+        })
+        .detach();
+    }
+
+    fn autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let hover = self.drag_hover.filter(|_| cx.has_active_drag());
+        let step = self.autoscroll_step;
+        if hover.is_none() || step == px(0.) {
+            self.autoscrolling = false;
+            return false;
+        }
+        let limit = self.scroll_limit(cx) + self.viewport.duration_of(self.lanes.size.width);
+        let viewport = self.viewport.scrolled_by(step, limit);
+        if viewport == self.viewport {
+            self.autoscrolling = false;
+            return false;
+        }
+        self.set_viewport(viewport, cx);
+        self.rehover(cx);
+        true
+    }
+
+    fn rehover(&mut self, cx: &mut Context<Self>) {
+        if let Some(hover) = self.drag_hover.filter(|_| cx.has_active_drag()) {
+            let preview = self.hover_preview(hover, cx);
+            self.show_preview(preview, cx);
+        }
+    }
+
+    fn horizontal_thumb(&self, cx: &App) -> Option<Thumb> {
+        let visible = self.viewport.duration_of(self.lanes.size.width);
+        let extent = self.scroll_limit(cx) + visible;
+        Thumb::new(
+            self.viewport.start().as_seconds_f64(),
+            visible.as_seconds_f64(),
+            extent.as_seconds_f64(),
+        )
+    }
+
+    fn vertical_thumb(&self, cx: &App) -> Option<Thumb> {
+        let content = content_height(&self.project.read(cx).timeline.tracks);
+        Thumb::new(
+            f64::from(f32::from(self.track_scroll)),
+            f64::from(f32::from(self.tracks_view.size.height)),
+            f64::from(content),
+        )
+    }
+
+    fn thumb(&self, axis: Axis, cx: &App) -> Option<Thumb> {
+        match axis {
+            Axis::Horizontal => self.horizontal_thumb(cx),
+            Axis::Vertical => self.vertical_thumb(cx),
+        }
+    }
+
+    fn is_scrolling_with(&self, axis: Axis) -> bool {
+        self.scrolling
+            .is_some_and(|(scrolling, _)| scrolling == axis)
+    }
+
+    fn press_scrollbar(&mut self, axis: Axis, fraction: f32, cx: &mut Context<Self>) {
+        let Some(thumb) = self.thumb(axis, cx) else {
             return;
         };
-        self.show_preview(preview, cx);
+        let grab = thumb.grab_at(fraction);
+        self.scrolling = Some((axis, grab));
+        self.scroll_thumb_to(axis, thumb.start_for(fraction, grab), cx);
+    }
+
+    fn drag_scrollbar(&mut self, axis: Axis, fraction: f32, cx: &mut Context<Self>) {
+        let Some((_, grab)) = self.scrolling.filter(|(scrolling, _)| *scrolling == axis) else {
+            return;
+        };
+        if let Some(thumb) = self.thumb(axis, cx) {
+            self.scroll_thumb_to(axis, thumb.start_for(fraction, grab), cx);
+        }
+    }
+
+    fn release_scrollbar(&mut self, cx: &mut Context<Self>) {
+        if self.scrolling.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn scroll_thumb_to(&mut self, axis: Axis, start: f32, cx: &mut Context<Self>) {
+        match axis {
+            Axis::Horizontal => {
+                let limit = self.scroll_limit(cx);
+                let extent = limit + self.viewport.duration_of(self.lanes.size.width);
+                let time = Time::from_flicks((extent.flicks() as f64 * f64::from(start)) as i64);
+                let viewport = self.viewport.scrolled_to(time, limit);
+                self.set_viewport(viewport, cx);
+            }
+            Axis::Vertical => {
+                let content = content_height(&self.project.read(cx).timeline.tracks);
+                let scroll = self.clamped_track_scroll(px(content * start), content);
+                if scroll != self.track_scroll {
+                    self.track_scroll = scroll;
+                    cx.notify();
+                }
+            }
+        }
     }
 
     fn show_preview(&mut self, preview: Option<DropPreview>, cx: &mut Context<Self>) {
@@ -1216,6 +1389,8 @@ impl TimelinePanel {
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut Project, DropPreview) -> Result<Vec<Clip>, EditError>,
     ) {
+        self.drag_hover = None;
+        self.autoscroll_step = px(0.);
         let preview = self
             .drop_preview
             .take()
@@ -1293,8 +1468,12 @@ impl Render for TimelinePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !cx.has_active_drag() {
             self.drop_preview = None;
+            self.drag_hover = None;
+            self.autoscroll_step = px(0.);
         }
         let panel = cx.entity();
+        let horizontal_thumb = self.horizontal_thumb(cx);
+        let vertical_thumb = self.vertical_thumb(cx);
         let drop_preview = self.drop_preview;
         let snap_line = drop_preview
             .and_then(|preview| preview.snapped_to)
@@ -1331,7 +1510,16 @@ impl Render for TimelinePanel {
             .map(|marquee| marquee_rect(marquee, viewport, scroll));
         let lanes = scrolled_tracks(scroll, lanes)
             .children(marquee)
-            .child(tracks_view_probe(panel.clone()));
+            .child(tracks_view_probe(panel.clone()))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .child(scrollbar(panel.clone(), Axis::Vertical, vertical_thumb)),
+            );
+        let horizontal_scrollbar = scrollbar(panel.clone(), Axis::Horizontal, horizontal_thumb);
         let renaming = self
             .renaming
             .as_ref()
@@ -1390,7 +1578,8 @@ impl Render for TimelinePanel {
                     .border_r_1()
                     .border_color(theme::border())
                     .child(timecode_readout(Timecode::new(playhead, frame_rate)))
-                    .child(scrolled_tracks(scroll, headers)),
+                    .child(scrolled_tracks(scroll, headers))
+                    .child(div().h(px(SCROLLBAR_THICKNESS)).flex_none()),
             )
             .child(
                 div()
@@ -1402,6 +1591,7 @@ impl Render for TimelinePanel {
                     .flex_col()
                     .child(ruler(panel, viewport, frame_rate))
                     .child(lanes)
+                    .child(horizontal_scrollbar)
                     .children(in_out_range(viewport, project.in_point, project.out_point))
                     .children(markers)
                     .children(snap_line)
@@ -1619,6 +1809,22 @@ fn clip_frame(range: TimeRange, viewport: Viewport) -> gpui::Div {
         .left(viewport.x_at(range.start))
         .w(viewport.width_of(range.duration))
         .rounded_sm()
+}
+
+fn autoscroll_step(offset: Pixels, width: Pixels) -> Pixels {
+    let edge = AUTOSCROLL_EDGE;
+    let (offset, width) = (f32::from(offset), f32::from(width));
+    if width <= edge * 2. {
+        return px(0.);
+    }
+    let depth = if offset < edge {
+        offset - edge
+    } else if offset > width - edge {
+        offset - (width - edge)
+    } else {
+        return px(0.);
+    };
+    px((depth / edge).clamp(-1., 1.) * AUTOSCROLL_MAX_STEP)
 }
 
 fn group_moves(
@@ -3046,6 +3252,72 @@ mod tests {
 
         assert_eq!(clip_of(&panel, cx, sound.id).gain.tenths(), 10);
         assert_eq!(clip_of(&panel, cx, picture.id).gain, Gain::UNITY);
+    }
+
+    fn viewport_of(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext) -> Viewport {
+        cx.read(|cx| panel.read(cx).viewport)
+    }
+
+    fn lanes_of(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        cx.read(|cx| panel.read(cx).lanes)
+    }
+
+    #[gpui::test]
+    fn dragging_near_the_right_edge_scrolls_and_the_ghost_stays_under_the_pointer(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        let lanes = lanes_of(&panel, cx);
+        let none = Modifiers::none();
+        let near_edge = lanes.right() - px(4.);
+
+        cx.simulate_mouse_down(point(at(4.), px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(at(4.) + px(4.), px(V1)), MouseButton::Left, none);
+        cx.simulate_mouse_move(point(near_edge, px(V1)), MouseButton::Left, none);
+        cx.executor().advance_clock(AUTOSCROLL_TICK * 10);
+        cx.run_until_parked();
+
+        let viewport = viewport_of(&panel, cx);
+        let ghost = cx.read(|cx| panel.read(cx).drop_preview.unwrap().range.start);
+        let grab = at(4.) - at(1.);
+
+        assert!(viewport.start() > Time::ZERO);
+        assert_eq!(
+            ghost,
+            FrameRate::FPS_30.frame_start(viewport.time_at(near_edge - lanes.left() - grab))
+        );
+
+        cx.simulate_mouse_up(point(near_edge, px(V1)), MouseButton::Left, none);
+    }
+
+    #[gpui::test]
+    fn dragging_the_horizontal_scrollbar_scrolls_the_timeline(cx: &mut TestAppContext) {
+        let (panel, cx, _) = timeline_with_a_clip(cx);
+        for _ in 0..4 {
+            panel.update(cx, TimelinePanel::zoom_in);
+        }
+        cx.run_until_parked();
+        let lanes = lanes_of(&panel, cx);
+        let height = cx.update(|window, _| window.viewport_size().height);
+        let bar_y = height - px(SCROLLBAR_THICKNESS / 2.);
+        let none = Modifiers::none();
+
+        assert_eq!(viewport_of(&panel, cx).start(), Time::ZERO);
+
+        cx.simulate_mouse_down(point(lanes.left() + px(2.), bar_y), MouseButton::Left, none);
+        cx.simulate_mouse_move(
+            point(lanes.left() + lanes.size.width / 2., bar_y),
+            MouseButton::Left,
+            none,
+        );
+        cx.simulate_mouse_up(
+            point(lanes.left() + lanes.size.width / 2., bar_y),
+            MouseButton::Left,
+            none,
+        );
+
+        assert!(viewport_of(&panel, cx).start() > Time::ZERO);
+        assert!(cx.read(|cx| panel.read(cx).scrolling.is_none()));
     }
 
     const MARKER_Y: f32 = RULER_HEIGHT - MARKER_HEIGHT / 2.;

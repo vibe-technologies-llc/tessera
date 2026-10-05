@@ -29,8 +29,6 @@
 
 ## Timeline editing
 
-- Scroll while dragging near an edge, add scrollbars, and keep the grab point when the view scrolls
-  mid-drag
 
 ## Media bin and workspace
 

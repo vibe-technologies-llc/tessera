@@ -65,6 +65,10 @@ impl Viewport {
         }
     }
 
+    pub fn scrolled_to(self, start: Time, limit: Time) -> Self {
+        self.starting_at(start, limit)
+    }
+
     pub fn clamped(self, limit: Time) -> Self {
         self.starting_at(self.start, limit)
     }
