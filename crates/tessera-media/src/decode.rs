@@ -1,6 +1,6 @@
 use std::{
     ffi::c_int,
-    num::{NonZeroI32, NonZeroI64},
+    num::{NonZeroI32, NonZeroI64, NonZeroU32},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -16,12 +16,13 @@ use ffmpeg_next::{
     frame, media, rescale,
     software::scaling,
 };
-use tessera_timeline::{FLICKS_PER_SECOND, Time};
+use tessera_timeline::{FLICKS_PER_SECOND, PixelAspect, Rotation, Time};
 
 use crate::{
     Error,
     cache::FrameCache,
     hw::{self, HwAccel, PREFERRED_HW_ACCELS},
+    probe,
 };
 
 const OUTPUT_FORMAT: Pixel = Pixel::BGRA;
@@ -63,7 +64,39 @@ pub struct VideoDecoder {
 
 struct Converter {
     bounds: Option<(u32, u32)>,
+    shape: Shape,
     scaler: Option<Scaler>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Shape {
+    rotation: Rotation,
+    pixel_aspect: PixelAspect,
+}
+
+impl Shape {
+    fn of(input: &format::context::Input, stream: &format::stream::Stream) -> Self {
+        Self {
+            rotation: probe::rotation(stream),
+            pixel_aspect: probe::pixel_aspect(input, stream),
+        }
+    }
+
+    fn scaled_bounds(self, bounds: Option<(u32, u32)>) -> Option<(u32, u32)> {
+        bounds.map(|(width, height)| {
+            if self.rotation.swaps_sides() {
+                (height, width)
+            } else {
+                (width, height)
+            }
+        })
+    }
+
+    fn stretched_width(self, width: u32) -> u32 {
+        NonZeroU32::new(width).map_or(width, |width| {
+            self.pixel_aspect.stretched_width(width).get()
+        })
+    }
 }
 
 struct Scaler {
@@ -115,6 +148,7 @@ impl VideoDecoder {
         let stream_index = stream.index();
         let time_base = TimeBase::of(&stream, &path)?;
         let start = stream_start(&input, &stream);
+        let shape = Shape::of(&input, &stream);
         let (decoder, hw_accel) =
             open_decoder(&stream, hw_accels, thread_count).map_err(|source| Error::Stream {
                 index: stream_index,
@@ -131,6 +165,7 @@ impl VideoDecoder {
             hw_accel,
             converter: Converter {
                 bounds: None,
+                shape,
                 scaler: None,
             },
             current: None,
@@ -144,6 +179,7 @@ impl VideoDecoder {
     pub fn fit_within(mut self, width: u32, height: u32) -> Self {
         self.converter = Converter {
             bounds: Some((width.max(1), height.max(1))),
+            shape: self.converter.shape,
             scaler: None,
         };
         self.cache.clear();
@@ -443,7 +479,12 @@ impl Converter {
             frame
         };
         let source = Source::new(frame.format(), frame.width(), frame.height(), matrix, range);
-        let (width, height) = fitted_size(source.width, source.height, self.bounds);
+        let stretched = self.shape.stretched_width(source.width);
+        let (width, height) = fitted_size(
+            stretched,
+            source.height,
+            self.shape.scaled_bounds(self.bounds),
+        );
         let scaler = match self.scaler.take() {
             Some(scaler) if scaler.source == source => scaler,
             _ => Scaler::new(source, width, height).map_err(|source| Error::Decode { source })?,
@@ -454,11 +495,17 @@ impl Converter {
         context
             .run(frame, scaled)
             .map_err(|source| Error::Decode { source })?;
+        let (width, height, bgra) = turned(
+            scaled.width(),
+            scaled.height(),
+            packed_rows(scaled),
+            self.shape.rotation,
+        );
         Ok(VideoFrame {
-            width: scaled.width(),
-            height: scaled.height(),
+            width,
+            height,
             time,
-            bgra: packed_rows(scaled),
+            bgra,
         })
     }
 }
@@ -553,6 +600,35 @@ fn packed_rows(frame: &frame::Video) -> Vec<u8> {
         packed.extend_from_slice(&row[..row_len]);
     }
     packed
+}
+
+fn turned(width: u32, height: u32, bgra: Vec<u8>, rotation: Rotation) -> (u32, u32, Vec<u8>) {
+    if rotation == Rotation::Upright {
+        return (width, height, bgra);
+    }
+    let (width, height) = (width as usize, height as usize);
+    let pixel = |x: usize, y: usize| {
+        let at = (y * width + x) * BYTES_PER_PIXEL;
+        &bgra[at..at + BYTES_PER_PIXEL]
+    };
+    let (turned_width, turned_height) = if rotation.swaps_sides() {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let mut turned = Vec::with_capacity(bgra.len());
+    for y in 0..turned_height {
+        for x in 0..turned_width {
+            let (source_x, source_y) = match rotation {
+                Rotation::Upright => (x, y),
+                Rotation::Clockwise => (y, height - 1 - x),
+                Rotation::UpsideDown => (width - 1 - x, height - 1 - y),
+                Rotation::Counterclockwise => (width - 1 - y, x),
+            };
+            turned.extend_from_slice(pixel(source_x, source_y));
+        }
+    }
+    (turned_width as u32, turned_height as u32, turned)
 }
 
 fn fitted_size(width: u32, height: u32, bounds: Option<(u32, u32)>) -> (u32, u32) {
@@ -847,6 +923,7 @@ mod tests {
         frame.set_color_range(range);
         let mut converter = Converter {
             bounds: None,
+            shape: Shape::default(),
             scaler: None,
         };
         let converted = converter.convert(&frame, Time::ZERO).unwrap();
@@ -921,10 +998,104 @@ mod tests {
         }
         let mut converter = Converter {
             bounds: None,
+            shape: Shape::default(),
             scaler: None,
         };
         let converted = converter.convert(&frame, Time::ZERO).unwrap();
         assert_eq!(converted.bgra[..4], [50, 100, 200, 255]);
+    }
+
+    fn numbered(width: u32, height: u32) -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|pixel| [pixel as u8; BYTES_PER_PIXEL])
+            .collect()
+    }
+
+    fn pixel_numbers(bgra: &[u8]) -> Vec<u8> {
+        bgra.chunks(BYTES_PER_PIXEL).map(|pixel| pixel[0]).collect()
+    }
+
+    #[test]
+    fn turning_moves_every_pixel_by_a_quarter_turn() {
+        let turn = |rotation| {
+            let (width, height, bgra) = turned(3, 2, numbered(3, 2), rotation);
+            (width, height, pixel_numbers(&bgra))
+        };
+
+        assert_eq!(turn(Rotation::Upright), (3, 2, vec![0, 1, 2, 3, 4, 5]));
+        assert_eq!(turn(Rotation::Clockwise), (2, 3, vec![3, 0, 4, 1, 5, 2]));
+        assert_eq!(turn(Rotation::UpsideDown), (3, 2, vec![5, 4, 3, 2, 1, 0]));
+        assert_eq!(
+            turn(Rotation::Counterclockwise),
+            (2, 3, vec![2, 5, 1, 4, 0, 3])
+        );
+    }
+
+    fn generated(name: &str, filter: &str, rotation: Option<&str>) -> Option<PathBuf> {
+        let directory = std::env::temp_dir();
+        let plain = directory.join(format!(
+            "tessera-media-{}-{name}-plain.mp4",
+            std::process::id()
+        ));
+        let path = directory.join(format!("tessera-media-{}-{name}.mp4", std::process::id()));
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("color=c=black:s=64x48:d=1,{filter}"))
+            .args(["-c:v", "mpeg4", "-q:v", "2"])
+            .arg(&plain)
+            .status()
+            .is_ok_and(|status| status.success());
+        let tagged = encoded
+            && std::process::Command::new("ffmpeg")
+                .args(["-loglevel", "error", "-y"])
+                .args(["-display_rotation", rotation.unwrap_or("0"), "-i"])
+                .arg(&plain)
+                .args(["-c", "copy"])
+                .arg(&path)
+                .status()
+                .is_ok_and(|status| status.success());
+        std::fs::remove_file(&plain).ok();
+        crate::init().unwrap();
+        tagged.then_some(path)
+    }
+
+    fn brightness(frame: &VideoFrame, x: u32, y: u32) -> u8 {
+        frame.bgra[((y * frame.width + x) * 4) as usize]
+    }
+
+    #[test]
+    fn phone_footage_is_turned_upright() {
+        let filter = "drawbox=x=0:y=0:w=32:h=24:color=white:t=fill";
+        let Some(path) = generated("turned", filter, Some("90")) else {
+            return;
+        };
+
+        let decoded = VideoDecoder::open(&path, 0).and_then(|mut decoder| {
+            let whole = decoder.frame_at(Time::ZERO)?;
+            let fitted = decoder.fit_within(24, 24).frame_at(Time::ZERO)?;
+            Ok((whole, fitted))
+        });
+        std::fs::remove_file(&path).ok();
+        let (whole, fitted) = decoded.unwrap();
+
+        assert_eq!((whole.width, whole.height), (48, 64));
+        assert!(brightness(&whole, 8, 56) > 200);
+        assert!(brightness(&whole, 40, 8) < 50);
+        assert_eq!((fitted.width, fitted.height), (18, 24));
+    }
+
+    #[test]
+    fn anamorphic_footage_is_stretched_to_its_display_width() {
+        let Some(path) = generated("anamorphic", "setsar=2", None) else {
+            return;
+        };
+
+        let frame =
+            VideoDecoder::open(&path, 0).and_then(|mut decoder| decoder.frame_at(Time::ZERO));
+        std::fs::remove_file(&path).ok();
+        let frame = frame.unwrap();
+
+        assert_eq!((frame.width, frame.height), (128, 48));
     }
 
     #[test]

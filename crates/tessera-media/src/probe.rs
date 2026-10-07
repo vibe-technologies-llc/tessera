@@ -116,7 +116,7 @@ fn start_offset(input: &format::context::Input, stream: &format::stream::Stream)
     )
 }
 
-fn rotation(stream: &format::stream::Stream) -> Rotation {
+pub(crate) fn rotation(stream: &format::stream::Stream) -> Rotation {
     let matrix = unsafe {
         let parameters = (*stream.as_ptr()).codecpar;
         av_packet_side_data_get(
@@ -139,7 +139,10 @@ fn rotation(stream: &format::stream::Stream) -> Rotation {
     }
 }
 
-fn pixel_aspect(input: &format::context::Input, stream: &format::stream::Stream) -> PixelAspect {
+pub(crate) fn pixel_aspect(
+    input: &format::context::Input,
+    stream: &format::stream::Stream,
+) -> PixelAspect {
     let guessed = unsafe {
         av_guess_sample_aspect_ratio(
             input.as_ptr().cast_mut(),

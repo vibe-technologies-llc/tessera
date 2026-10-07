@@ -187,7 +187,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   scaling to BGRA. The scaler converts YUV to full-range RGB with the frame's tagged matrix and
   range (`sws_setColorspaceDetails`, read before the download), reading an untagged matrix as BT.709
   from 1280×720 up and BT.601 below, and a `yuvj` format as full range. Each scaler keeps its
-  output frame, and rows are copied out of it whole. The test fixture is 128×96 so hardware accepts
+  output frame, and rows are copied out of it whole. A frame comes out in its display shape: the
+  scaler stretches the width by the stream's pixel aspect (`Shape`, read at open as probing reads
+  it), fitting bounds swapped when the rotation turns the picture on its side, and the packed rows
+  are then turned upright (`turned`), so `VideoFrame`'s size is the display size. The test fixture is 128×96 so hardware accepts
   it and can be generated at any frame rate (`generate_at_rate`), and an H.264 variant, generated
   when `libx264` is present, runs the decode tests through the preferred accelerators against
   software.
