@@ -37,11 +37,11 @@ impl Project {
         edited
     }
 
-    fn link_of(&self, id: ClipId) -> Option<LinkId> {
+    pub(super) fn link_of(&self, id: ClipId) -> Option<LinkId> {
         self.find_clip(id).and_then(|(_, clip)| clip.link)
     }
 
-    fn set_clip(&mut self, track: usize, clip: Clip) {
+    pub(super) fn set_clip(&mut self, track: usize, clip: Clip) {
         let slot = self.timeline.tracks[track]
             .clips_mut()
             .iter_mut()
@@ -257,41 +257,88 @@ impl Project {
     }
 
     fn insert_template(&mut self, template: Clip, track: usize) -> Result<Clip, EditError> {
-        template.check()?;
-        self.atomically(|project| {
-            let placed = Clip {
-                id: project.next_ids.take_clip(),
-                ..template
-            };
-            let cut = project.timeline.tracks[track]
-                .clip_at(placed.start)
-                .filter(|clip| clip.is_cut_by(placed.start))
-                .map(|clip| clip.id);
-            if let Some(cut) = cut {
-                project.split_clip(cut, placed.start)?;
-            }
-            project.shift_clips_from(track, placed.start, placed.source.duration, placed.id)?;
-            project.timeline.tracks[track].insert(placed)?;
-            project.settle_links();
-            Ok(placed)
-        })
+        let placed = self.insert_templates(&[(template, track)])?;
+        Ok(placed[0])
     }
 
     fn overwrite_template(&mut self, template: Clip, track: usize) -> Result<Clip, EditError> {
-        template.check()?;
+        let placed = self.overwrite_templates(&[(template, track)])?;
+        Ok(placed[0])
+    }
+
+    pub(super) fn insert_templates(
+        &mut self,
+        templates: &[(Clip, usize)],
+    ) -> Result<Vec<Clip>, EditError> {
+        for (template, _) in templates {
+            template.check()?;
+        }
         self.atomically(|project| {
-            let placed = Clip {
-                id: project.next_ids.take_clip(),
-                ..template
-            };
-            project.clear_range(track, placed.timeline_range())?;
-            project.timeline.tracks[track].insert(placed)?;
-            project.settle_links();
-            Ok(placed)
+            let link = (templates.len() > 1).then(|| project.next_ids.take_link());
+            let mut placed = Vec::new();
+            for &(template, track) in templates {
+                let clip = Clip {
+                    id: project.next_ids.take_clip(),
+                    link,
+                    ..template
+                };
+                let cut = project.timeline.tracks[track]
+                    .clip_at(clip.start)
+                    .filter(|other| other.is_cut_by(clip.start))
+                    .map(|other| other.id);
+                if let Some(cut) = cut {
+                    project.split_clip(cut, clip.start)?;
+                }
+                project.shift_clips_from(track, clip.start, clip.source.duration, clip.id)?;
+                project.timeline.tracks[track].insert(clip)?;
+                placed.push(clip);
+            }
+            Ok(project.settled(placed))
         })
     }
 
-    fn clear_range(&mut self, track: usize, range: TimeRange) -> Result<(), EditError> {
+    pub(super) fn overwrite_templates(
+        &mut self,
+        templates: &[(Clip, usize)],
+    ) -> Result<Vec<Clip>, EditError> {
+        for (template, _) in templates {
+            template.check()?;
+        }
+        self.atomically(|project| {
+            let link = (templates.len() > 1).then(|| project.next_ids.take_link());
+            let mut tail_links = BTreeMap::new();
+            let mut placed = Vec::new();
+            for &(template, track) in templates {
+                let clip = Clip {
+                    id: project.next_ids.take_clip(),
+                    link,
+                    ..template
+                };
+                project.clear_range(track, clip.timeline_range(), &mut tail_links)?;
+                project.timeline.tracks[track].insert(clip)?;
+                placed.push(clip);
+            }
+            Ok(project.settled(placed))
+        })
+    }
+
+    pub(super) fn settled(&mut self, clips: Vec<Clip>) -> Vec<Clip> {
+        self.settle_links();
+        clips
+            .into_iter()
+            .map(|clip| Clip {
+                link: self.link_of(clip.id),
+                ..clip
+            })
+            .collect()
+    }
+
+    fn clear_range(
+        &mut self,
+        track: usize,
+        range: TimeRange,
+        tail_links: &mut BTreeMap<LinkId, LinkId>,
+    ) -> Result<(), EditError> {
         let covered = self.timeline.tracks[track]
             .clips_overlapping(range)
             .to_vec();
@@ -307,12 +354,19 @@ impl Project {
             }
             if clip.timeline_range().end() > range.end() {
                 let cut = range.end() - clip.start;
+                let (id, link) = if kept_head {
+                    let link = clip.link.map(|link| {
+                        *tail_links
+                            .entry(link)
+                            .or_insert_with(|| self.next_ids.take_link())
+                    });
+                    (self.next_ids.take_clip(), link)
+                } else {
+                    (clip.id, clip.link)
+                };
                 let tail = Clip {
-                    id: if kept_head {
-                        self.next_ids.take_clip()
-                    } else {
-                        clip.id
-                    },
+                    id,
+                    link,
                     start: range.end(),
                     source: TimeRange::new(clip.source.start + cut, clip.source.duration - cut),
                     ..clip

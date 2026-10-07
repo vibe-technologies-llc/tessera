@@ -79,8 +79,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   same edge as far as every one of them can go, `split_clips` (and `split_clip`) splits them all
   and links the tails under a new id, and `delete_clips` and `ripple_delete_clips` (and their
   single-clip forms) take the partners too, so a ripple pulls every partner's track.
-  `paste_clips` links the copies of partners pasted together under a new id. `unlink_clips`
-  unlinks the groups of the given clips; any other edit that leaves partners out of step (an
+  `paste_clips` links the copies of partners pasted together under a new id. `insert_linked` and
+  `overwrite_linked` insert or overwrite an asset's clip and its partner on the
+  `linked_partner_track` the same way, linked, and an overwrite that cuts a linked clip in two
+  links the tails on every track under one new id. `unlink_clips` unlinks the groups of the given
+  clips, and `link_clips` links again every set of the given clips that share an asset, start and
+  source range (`NothingToLink` when none do), dropping a link that is left on one clip; any other edit that leaves partners out of step (an
   insert or overwrite that shifts or cuts one, a ripple trim, roll, slip or slide) drops their
   link (`settle_links`). Every clip has a `gain` and every track a `volume`, both a `Gain` in
   tenths of a decibel from `Gain::SILENT` (−60 dB, played as silence) to `Gain::LOUDEST` (+12 dB),
@@ -296,7 +300,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   records where the clip was grabbed. The panel drops clips that no longer exist from the
   selection whenever the project changes, and pulls the view back when the timeline shrinks under
   it. Pressing, Shift-toggling and sweeping select a linked clip together with its partners (Ctrl+L
-  unlinks the selection). Dragging a selected clip's body moves the whole selection by the same
+  unlinks the selection when it holds a linked clip and links it otherwise). Dragging a selected clip's body moves the whole selection by the same
   time (`move_clips`), carrying the clips on the dragged clip's track to the lane it is dropped on
   and leaving the others on their tracks, previewed as a ghost for every selected clip
   (`DropPreview::group`, `ghosts_on`), all red when any selected clip would collide. A plain drop
@@ -304,7 +308,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   the partner's ghost on its lane (`DropPreview::partner`), as a trim of a linked clip does. A trim keeps the offset at which its
   handle was grabbed and commits wherever the pointer is released, since only the clip's own lane
   previews it. Dropping an asset with Ctrl held inserts it and with Alt held overwrites
-  (`DropMode`, carried on the `DropPreview`); a red ghost says why it was refused. A start that
+  (`DropMode`, carried on the `DropPreview`), linked with its partner like a plain drop; a red ghost says why it was refused. A start that
   snapped by its end is floored to the frame grid. Each lane lays out only the clips overlapping
   the visible time range, and trim handles are at most a third of the clip's width. Dragging a clip's body or one of its edge handles starts a `DraggedClip`
   drag that the lanes preview and commit as a move or a trim. While snapping is on (N toggles it),

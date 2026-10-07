@@ -249,6 +249,8 @@ pub enum EditError {
     NotAdjacent { left: ClipId, right: ClipId },
     #[error("the asset has no known duration")]
     NoDuration,
+    #[error("none of the clips play the same media at the same time on another track")]
+    NothingToLink,
     #[error("the asset has no {0:?} stream")]
     MissingStream(TrackKind),
     #[error(transparent)]

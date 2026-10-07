@@ -56,6 +56,12 @@ impl Project {
         others.get(ordinal).or(others.first()).copied()
     }
 
+    pub fn linked_partner_track(&self, asset: AssetId, track: usize) -> Option<usize> {
+        let held = self.asset(asset)?;
+        self.partner_track(track)
+            .filter(|&other| self.track_accepting(held, other).is_ok())
+    }
+
     pub fn linked_clips_for(
         &self,
         asset: AssetId,
@@ -63,11 +69,7 @@ impl Project {
         start: Time,
     ) -> Result<Vec<(usize, Clip)>, EditError> {
         let clip = self.clip_for(asset, track, start)?;
-        let held = self.asset(asset).ok_or(EditError::UnknownAsset(asset))?;
-        let partner_track = self
-            .partner_track(track)
-            .filter(|&other| self.track_accepting(held, other).is_ok());
-        let Some(other) = partner_track else {
+        let Some(other) = self.linked_partner_track(asset, track) else {
             return Ok(vec![(track, clip)]);
         };
         let link = Some(self.next_ids.link);
@@ -78,6 +80,77 @@ impl Project {
         };
         self.timeline.tracks[other].check_insert(&partner)?;
         Ok(vec![(track, Clip { link, ..clip }), (other, partner)])
+    }
+
+    fn linked_templates(
+        &self,
+        asset: AssetId,
+        track: usize,
+        start: Time,
+    ) -> Result<Vec<(Clip, usize)>, EditError> {
+        let clip = self.whole_clip(asset, track, start)?;
+        let partner = self.linked_partner_track(asset, track);
+        Ok(std::iter::once(track)
+            .chain(partner)
+            .map(|track| (clip, track))
+            .collect())
+    }
+
+    pub fn insert_linked(
+        &mut self,
+        asset: AssetId,
+        track: usize,
+        start: Time,
+    ) -> Result<Vec<Clip>, EditError> {
+        let templates = self.linked_templates(asset, track, start)?;
+        self.insert_templates(&templates)
+    }
+
+    pub fn overwrite_linked(
+        &mut self,
+        asset: AssetId,
+        track: usize,
+        start: Time,
+    ) -> Result<Vec<Clip>, EditError> {
+        let templates = self.linked_templates(asset, track, start)?;
+        self.overwrite_templates(&templates)
+    }
+
+    pub fn link_clips(&mut self, ids: &[ClipId]) -> Result<Vec<Clip>, EditError> {
+        let mut groups: BTreeMap<(AssetId, Time, Time, Time), Vec<ClipId>> = BTreeMap::new();
+        for &id in ids {
+            let (_, clip) = self.located_clip(id)?;
+            let key = (
+                clip.asset,
+                clip.start,
+                clip.source.start,
+                clip.source.duration,
+            );
+            let members = groups.entry(key).or_default();
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
+        let groups: Vec<Vec<ClipId>> = groups
+            .into_values()
+            .filter(|members| members.len() > 1)
+            .collect();
+        if groups.is_empty() {
+            return Err(EditError::NothingToLink);
+        }
+        self.atomically(|project| {
+            let mut linked = Vec::new();
+            for members in groups {
+                let link = Some(project.next_ids.take_link());
+                for id in members {
+                    let (track, clip) = project.located_clip(id)?;
+                    let clip = Clip { link, ..clip };
+                    project.set_clip(track, clip);
+                    linked.push(clip);
+                }
+            }
+            Ok(project.settled(linked))
+        })
     }
 
     pub fn place_linked(
@@ -418,5 +491,100 @@ mod tests {
         project.unlink_clips(&[pair[1].id]).unwrap();
 
         assert!(project.partners(pair[0].id).is_empty());
+    }
+
+    #[test]
+    fn inserting_media_with_both_kinds_pushes_both_tracks_and_links_the_new_pair() {
+        let (mut project, asset, picture, sound) = placed_pair();
+
+        let inserted = project.insert_linked(asset, V1, seconds(3)).unwrap();
+
+        let [new_picture, new_sound] = inserted[..] else {
+            panic!("expected two clips, got {inserted:?}");
+        };
+        assert_eq!(clip(&project, new_picture.id).0, V1);
+        assert_eq!(clip(&project, new_sound.id).0, A1);
+        assert!(new_picture.link.is_some() && new_picture.link == new_sound.link);
+        assert_eq!(
+            project.partners(picture.id),
+            [(A1, clip(&project, sound.id).1)]
+        );
+
+        let tails: Vec<Clip> = [V1, A1]
+            .map(|track| *project.timeline.tracks[track].clips().last().unwrap())
+            .to_vec();
+
+        assert_eq!(tails[0].start, seconds(7));
+        assert!(tails[0].link.is_some() && tails[0].link == tails[1].link);
+        assert_ne!(tails[0].link, picture.link);
+        assert_ne!(tails[0].link, new_picture.link);
+    }
+
+    #[test]
+    fn overwriting_both_tracks_links_the_new_pair_and_keeps_the_cut_tails_together() {
+        let (mut project, _, picture, sound) = placed_pair();
+        project
+            .trim_clip(picture.id, ClipEdge::End, seconds(6))
+            .unwrap();
+        let short = project.add_asset(
+            "short.mkv".into(),
+            MediaInfo {
+                duration: Some(seconds(1)),
+                streams: vec![video(), audio()],
+            },
+        );
+
+        let placed = project.overwrite_linked(short, V1, seconds(3)).unwrap();
+
+        assert_eq!(placed.len(), 2);
+        assert!(placed[0].link.is_some() && placed[0].link == placed[1].link);
+        assert_eq!(project.partners(picture.id).len(), 1);
+        assert_eq!(clip(&project, sound.id).1.source.duration, seconds(1));
+
+        let tails: Vec<Clip> = [V1, A1]
+            .map(|track| *project.timeline.tracks[track].clips().last().unwrap())
+            .to_vec();
+
+        assert_eq!(tails[0].start, seconds(4));
+        assert!(tails[0].link.is_some() && tails[0].link == tails[1].link);
+        assert_ne!(tails[0].link, picture.link);
+    }
+
+    #[test]
+    fn unlinked_clips_link_again_when_they_are_still_in_step() {
+        let (mut project, asset, picture, sound) = placed_pair();
+        project.unlink_clips(&[picture.id]).unwrap();
+
+        let linked = project.link_clips(&[picture.id, sound.id]).unwrap();
+
+        assert_eq!(linked.len(), 2);
+        assert!(linked[0].link.is_some() && linked[0].link == linked[1].link);
+        assert_eq!(project.partners(picture.id).len(), 1);
+
+        let lone = project.place_clip(asset, A1, seconds(20)).unwrap();
+        let before = project.clone();
+
+        assert_eq!(
+            project.link_clips(&[picture.id, lone.id]),
+            Err(EditError::NothingToLink)
+        );
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn linking_one_clip_of_a_pair_elsewhere_drops_the_link_left_behind() {
+        let (mut project, _, picture, sound) = placed_pair();
+        let second_audio = project.timeline.add_track(TrackKind::Audio);
+        let copy = project
+            .paste_clips(&[(sound, second_audio, sound.start)])
+            .unwrap()[0];
+
+        project.link_clips(&[picture.id, copy.id]).unwrap();
+
+        assert_eq!(
+            project.partners(picture.id),
+            [(second_audio, clip(&project, copy.id).1)]
+        );
+        assert_eq!(clip(&project, sound.id).1.link, None);
     }
 }

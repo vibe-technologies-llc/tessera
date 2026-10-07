@@ -772,16 +772,28 @@ impl TimelinePanel {
         });
     }
 
-    pub fn unlink_selection(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_link_selection(&mut self, cx: &mut Context<Self>) {
         let ids: Vec<ClipId> = self.selection.iter().copied().collect();
         if ids.is_empty() {
             return;
         }
-        let unlinked = self.editor.apply(Command::UnlinkClips, cx, |project| {
-            project.unlink_clips(&ids)
+        let project = self.project.read(cx);
+        let any_linked = ids.iter().any(|&id| {
+            project
+                .find_clip(id)
+                .is_some_and(|(_, clip)| clip.link.is_some())
         });
-        if let Err(error) = unlinked {
-            tracing::warn!(%error, "could not unlink the clips");
+        let toggled = if any_linked {
+            self.editor.apply(Command::UnlinkClips, cx, |project| {
+                project.unlink_clips(&ids)
+            })
+        } else {
+            self.editor
+                .apply(Command::LinkClips, cx, |project| project.link_clips(&ids))
+                .map(drop)
+        };
+        if let Err(error) = toggled {
+            tracing::warn!(%error, "could not link or unlink the clips");
         }
     }
 
@@ -1325,12 +1337,8 @@ impl TimelinePanel {
                 let start = preview.range.start;
                 match preview.mode {
                     DropMode::Place => project.place_linked(asset, preview.track, start),
-                    DropMode::Insert => project
-                        .insert_asset(asset, preview.track, start)
-                        .map(|clip| vec![clip]),
-                    DropMode::Overwrite => project
-                        .overwrite_asset(asset, preview.track, start)
-                        .map(|clip| vec![clip]),
+                    DropMode::Insert => project.insert_linked(asset, preview.track, start),
+                    DropMode::Overwrite => project.overwrite_linked(asset, preview.track, start),
                 }
             },
         );
@@ -1880,6 +1888,7 @@ fn asset_drop_preview(
         let preview = placement(track, project.clip_for(asset, track, start), snap, mode)?;
         return Some(DropPreview {
             reason: preview.reason.map(|_| ASSET_OVERLAP_REASON),
+            partner: project.linked_partner_track(asset, track),
             ..preview
         });
     }
@@ -3171,12 +3180,19 @@ mod tests {
         assert_eq!(starts_on(&panel, cx, 0), seconds(&[1, 4]));
         assert_eq!(starts_on(&panel, cx, 2), seconds(&[1, 4]));
 
-        panel.update(cx, TimelinePanel::unlink_selection);
+        panel.update(cx, TimelinePanel::toggle_link_selection);
         cx.simulate_click(point(at(12.), px(V1)), Modifiers::none());
         cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
 
         assert_eq!(selected(&panel, cx), BTreeSet::from([picture.id]));
         assert_eq!(clip_of(&panel, cx, sound.id).link, None);
+
+        cx.simulate_click(point(at(2.), row_y(A1_ROW)), Modifiers::shift());
+        panel.update(cx, TimelinePanel::toggle_link_selection);
+        cx.simulate_click(point(at(12.), px(V1)), Modifiers::none());
+        cx.simulate_click(point(at(2.), px(V1)), Modifiers::none());
+
+        assert_eq!(selected(&panel, cx), BTreeSet::from([picture.id, sound.id]));
     }
 
     #[test]
@@ -3205,7 +3221,7 @@ mod tests {
         let inserting =
             asset_drop_preview(&project, asset, 0, Time::ZERO, None, DropMode::Insert).unwrap();
 
-        assert_eq!(inserting.partner, None);
+        assert_eq!(inserting.partner, Some(1));
     }
 
     #[gpui::test]

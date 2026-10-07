@@ -14,7 +14,7 @@ use crate::{
     OpenSequenceSettings, PasteClips, Pause, PlayPause, PreviousEdit, PreviousMarker,
     RaiseClipGain, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint,
     SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward,
-    ToggleSafeAreas, ToggleSnapping, Undo, UnlinkClips, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
+    ToggleClipLink, ToggleSafeAreas, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
     ZoomToFit,
     autosave::{AUTOSAVE_INTERVAL, AutosaveDirectory, Orphan, Slot, orphans},
     editor::ProjectEditor,
@@ -686,8 +686,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|workspace, _: &LowerClipGain, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::lower_clip_gain);
             }))
-            .on_action(cx.listener(|workspace, _: &UnlinkClips, _, cx| {
-                workspace.on_timeline(cx, TimelinePanel::unlink_selection);
+            .on_action(cx.listener(|workspace, _: &ToggleClipLink, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::toggle_link_selection);
             }))
             .on_action(cx.listener(|workspace, _: &SelectAll, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::select_all);

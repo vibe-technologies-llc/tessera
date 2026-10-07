@@ -1,6 +1,5 @@
 ## Model
 
-- Link the clips an insert or overwrite drop places, and link clips again after Ctrl+L unlinked them
 - Carry rotation, sample aspect ratio, pixel format, stream disposition and per-stream start time in
   `MediaInfo`, and let a clip choose which of several audio streams it plays
 
