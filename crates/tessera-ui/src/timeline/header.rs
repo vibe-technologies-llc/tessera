@@ -489,6 +489,7 @@ mod tests {
                 start: tessera_timeline::Time::ZERO,
                 link: None,
                 gain: tessera_timeline::Gain::UNITY,
+                audio_stream: None,
             })
             .unwrap();
         timeline.tracks[1] = clip_track;

@@ -80,12 +80,12 @@ mod tests {
             .unwrap();
         let info = MediaInfo {
             duration: Some(Time::from_seconds(2)),
-            streams: vec![Stream::Audio(AudioStream {
-                index: 0,
-                codec: "flac".into(),
-                sample_rate: std::num::NonZero::new(48_000).unwrap(),
-                channels: std::num::NonZero::new(2).unwrap(),
-            })],
+            streams: vec![Stream::Audio(AudioStream::new(
+                0,
+                "flac",
+                std::num::NonZero::new(48_000).unwrap(),
+                std::num::NonZero::new(2).unwrap(),
+            ))],
         };
         let mut placed = project.clone();
         let asset = placed.add_asset("/media/tone.flac".into(), info);

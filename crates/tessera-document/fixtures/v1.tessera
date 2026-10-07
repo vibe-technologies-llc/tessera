@@ -31,14 +31,24 @@
             "frame_rate": {
               "numerator": 30000,
               "denominator": 1001
-            }
+            },
+            "rotation_degrees": 90,
+            "pixel_aspect": {
+              "numerator": 4,
+              "denominator": 3
+            },
+            "pixel_format": "yuv420p",
+            "default": true,
+            "start_flicks": 23520000
           },
           {
             "kind": "audio",
             "index": 1,
             "codec": "aac",
             "sample_rate": 48000,
-            "channels": 2
+            "channels": 2,
+            "default": true,
+            "start_flicks": -11760000
           }
         ]
       }
@@ -60,7 +70,8 @@
             "source_start_flicks": 0,
             "source_duration_flicks": 7056000000,
             "link": 0,
-            "gain_tenths_db": 0
+            "gain_tenths_db": 0,
+            "audio_stream": null
           }
         ]
       },
@@ -80,7 +91,8 @@
             "source_start_flicks": 0,
             "source_duration_flicks": 7056000000,
             "link": 0,
-            "gain_tenths_db": 25
+            "gain_tenths_db": 25,
+            "audio_stream": 1
           }
         ]
       }

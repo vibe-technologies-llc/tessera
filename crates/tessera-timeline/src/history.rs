@@ -24,6 +24,7 @@ pub enum Command {
     LinkClips,
     UnlinkClips,
     SetClipGain,
+    ChooseAudioStream,
     SetTrackVolume,
     DeleteClip,
     RippleDeleteClip,
@@ -66,6 +67,7 @@ impl fmt::Display for Command {
             Self::LinkClips => "Link Clips",
             Self::UnlinkClips => "Unlink Clips",
             Self::SetClipGain => "Change Clip Gain",
+            Self::ChooseAudioStream => "Choose Audio Stream",
             Self::SetTrackVolume => "Change Track Volume",
             Self::DeleteClip => "Delete Clip",
             Self::RippleDeleteClip => "Ripple Delete Clip",
@@ -425,11 +427,13 @@ mod tests {
             MediaInfo {
                 duration: Some(Time::from_seconds(4)),
                 streams: vec![Stream::Video(VideoStream {
-                    index: 0,
-                    codec: "h264".into(),
-                    width: NonZero::new(1280).unwrap(),
-                    height: NonZero::new(720).unwrap(),
                     frame_rate: Some(FrameRate::FPS_30),
+                    ..VideoStream::new(
+                        0,
+                        "h264",
+                        NonZero::new(1280).unwrap(),
+                        NonZero::new(720).unwrap(),
+                    )
                 })],
             },
         );

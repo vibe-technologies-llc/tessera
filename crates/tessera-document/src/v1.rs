@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
     self as model, AssetId, ClipId, FrameRate, Gain, InsertError, LinkId, MarkerId, MediaInfo,
-    NextIds, Time, TimeRange, Timeline,
+    NextIds, PixelAspect, Rotation, Time, TimeRange, Timeline,
 };
 
 use crate::{FormatError, ValidationError};
@@ -78,12 +78,19 @@ enum Stream {
         width: u32,
         height: u32,
         frame_rate: Option<Rational>,
+        rotation_degrees: u16,
+        pixel_aspect: Rational,
+        pixel_format: Option<String>,
+        default: bool,
+        start_flicks: i64,
     },
     Audio {
         index: usize,
         codec: String,
         sample_rate: u32,
         channels: u16,
+        default: bool,
+        start_flicks: i64,
     },
 }
 
@@ -117,6 +124,7 @@ struct Clip {
     source_duration_flicks: i64,
     link: Option<u64>,
     gain_tenths_db: i32,
+    audio_stream: Option<usize>,
 }
 
 impl TryFrom<&model::Project> for Project {
@@ -228,12 +236,22 @@ impl From<&model::Stream> for Stream {
                 width: video.width.get(),
                 height: video.height.get(),
                 frame_rate: video.frame_rate.map(Rational::from),
+                rotation_degrees: video.rotation.degrees(),
+                pixel_aspect: Rational {
+                    numerator: video.pixel_aspect.numerator(),
+                    denominator: video.pixel_aspect.denominator(),
+                },
+                pixel_format: video.pixel_format.clone(),
+                default: video.default,
+                start_flicks: video.start.flicks(),
             },
             model::Stream::Audio(audio) => Self::Audio {
                 index: audio.index,
                 codec: audio.codec.clone(),
                 sample_rate: audio.sample_rate.get(),
                 channels: audio.channels.get(),
+                default: audio.default,
+                start_flicks: audio.start.flicks(),
             },
         }
     }
@@ -312,6 +330,7 @@ impl From<&model::Clip> for Clip {
             source_duration_flicks: clip.source.duration.flicks(),
             link: clip.link.map(|link| link.0),
             gain_tenths_db: clip.gain.tenths(),
+            audio_stream: clip.audio_stream,
         }
     }
 }
@@ -554,6 +573,11 @@ impl Stream {
                 width,
                 height,
                 frame_rate,
+                rotation_degrees,
+                pixel_aspect,
+                pixel_format,
+                default,
+                start_flicks,
             } => {
                 let (nonzero_width, nonzero_height) = NonZeroU32::new(width)
                     .zip(NonZeroU32::new(height))
@@ -578,6 +602,26 @@ impl Stream {
                             })
                         })
                         .transpose()?,
+                    rotation: Rotation::from_degrees(rotation_degrees).ok_or(
+                        ValidationError::Rotation {
+                            asset,
+                            stream: index,
+                            degrees: rotation_degrees,
+                        },
+                    )?,
+                    pixel_aspect: PixelAspect::new(
+                        pixel_aspect.numerator,
+                        pixel_aspect.denominator,
+                    )
+                    .ok_or(ValidationError::PixelAspect {
+                        asset,
+                        stream: index,
+                        numerator: pixel_aspect.numerator,
+                        denominator: pixel_aspect.denominator,
+                    })?,
+                    pixel_format,
+                    default,
+                    start: Time::from_flicks(start_flicks),
                 })
             }
             Self::Audio {
@@ -585,6 +629,8 @@ impl Stream {
                 codec,
                 sample_rate,
                 channels,
+                default,
+                start_flicks,
             } => model::Stream::Audio(model::AudioStream {
                 index,
                 codec,
@@ -598,6 +644,8 @@ impl Stream {
                     asset,
                     stream: index,
                 })?,
+                default,
+                start: Time::from_flicks(start_flicks),
             }),
         })
     }
@@ -648,6 +696,7 @@ impl Clip {
                 clip: ClipId(self.id),
                 tenths: self.gain_tenths_db,
             })?,
+            audio_stream: self.audio_stream,
         };
         let asset = project
             .asset(clip.asset)
@@ -660,6 +709,15 @@ impl Clip {
                 clip: clip.id,
                 asset: asset.id,
                 kind,
+            });
+        }
+        if let Some(stream) = clip
+            .audio_stream
+            .filter(|&stream| asset.info.audio_stream(stream).is_none())
+        {
+            return Err(ValidationError::UnknownAudioStream {
+                clip: clip.id,
+                stream,
             });
         }
         clip.check()?;
@@ -698,6 +756,7 @@ mod tests {
             "source_duration_flicks": duration * SECOND,
             "link": null,
             "gain_tenths_db": 0,
+            "audio_stream": null,
         })
     }
 
@@ -746,6 +805,11 @@ mod tests {
                             "width": 1920,
                             "height": 1080,
                             "frame_rate": { "numerator": 25, "denominator": 1 },
+                            "rotation_degrees": 0,
+                            "pixel_aspect": { "numerator": 1, "denominator": 1 },
+                            "pixel_format": "yuv420p",
+                            "default": true,
+                            "start_flicks": 0,
                         },
                     ],
                 },
@@ -760,6 +824,8 @@ mod tests {
                             "codec": "opus",
                             "sample_rate": 48000,
                             "channels": 2,
+                            "default": false,
+                            "start_flicks": 0,
                         },
                     ],
                 },
@@ -1207,5 +1273,52 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rotations_pixel_aspects_and_chosen_audio_streams_are_checked() {
+        fn video(document: &mut Value) -> &mut Value {
+            &mut document["assets"][0]["streams"][0]
+        }
+
+        assert_eq!(
+            refused(|document| video(document)["rotation_degrees"] = json!(45)),
+            ValidationError::Rotation {
+                asset: AssetId(4),
+                stream: 0,
+                degrees: 45,
+            }
+        );
+        assert_eq!(
+            refused(|document| video(document)["pixel_aspect"]["denominator"] = json!(0)),
+            ValidationError::PixelAspect {
+                asset: AssetId(4),
+                stream: 0,
+                numerator: 1,
+                denominator: 0,
+            }
+        );
+        assert_eq!(
+            refused(|document| document["tracks"][1]["clips"][0]["audio_stream"] = json!(3)),
+            ValidationError::UnknownAudioStream {
+                clip: ClipId(2),
+                stream: 3,
+            }
+        );
+
+        let mut document = valid();
+        video(&mut document)["rotation_degrees"] = json!(270);
+        document["tracks"][1]["clips"][0]["audio_stream"] = json!(0);
+        let project = rebuilt(document).unwrap();
+
+        let stream = project
+            .asset(AssetId(4))
+            .unwrap()
+            .info
+            .video()
+            .next()
+            .unwrap();
+        assert_eq!(stream.rotation, Rotation::Counterclockwise);
+        assert_eq!(project.timeline.tracks[1].clips()[0].audio_stream, Some(0));
     }
 }

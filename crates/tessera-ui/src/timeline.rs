@@ -736,6 +736,30 @@ impl TimelinePanel {
         self.adjust_clip_gain(-header::VOLUME_STEP_TENTHS, cx);
     }
 
+    pub fn cycle_audio_stream(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<ClipId> = self.selection.iter().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let cycled = self
+            .editor
+            .apply(Command::ChooseAudioStream, cx, |project| {
+                let unlocked: Vec<ClipId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        project
+                            .find_clip(id)
+                            .is_some_and(|(track, _)| !project.timeline.tracks[track].locked)
+                    })
+                    .collect();
+                project.cycle_audio_streams(&unlocked)
+            });
+        if let Err(error) = cycled {
+            tracing::warn!(%error, "could not choose another audio stream");
+        }
+    }
+
     fn adjust_clip_gain(&mut self, tenths: i32, cx: &mut Context<Self>) {
         let project = self.project.read(cx);
         let ids: Vec<ClipId> = self
@@ -1737,7 +1761,7 @@ fn track_lane(lane: Lane, project: &Project, cx: &Context<TimelinePanel>) -> imp
         }))
         .children(visible_clips(track, visible).iter().map(|clip| {
             let look = ClipLook {
-                label: clip_label(project, clip),
+                label: clip_label(project, track.kind, clip),
                 color,
                 selected: selection.contains(&clip.id),
             };
@@ -1797,15 +1821,31 @@ fn visible_clips(track: &Track, visible: Option<TimeRange>) -> &[Clip] {
     visible.map_or(track.clips(), |range| track.clips_overlapping(range))
 }
 
-fn clip_label(project: &Project, clip: &Clip) -> SharedString {
-    let name = project
-        .asset(clip.asset)
+fn clip_label(project: &Project, kind: TrackKind, clip: &Clip) -> SharedString {
+    let asset = project.asset(clip.asset);
+    let name = asset
         .map(|asset| file_name(&asset.path))
         .unwrap_or_default();
-    if clip.gain == Gain::UNITY {
+    let stream = asset
+        .filter(|asset| kind == TrackKind::Audio && asset.info.audio().count() > 1)
+        .and_then(|asset| {
+            let playing = asset.audio_stream_for(clip)?.index;
+            let ordinal = asset
+                .info
+                .audio()
+                .position(|audio| audio.index == playing)?;
+            Some(format!(" · A{}", ordinal + 1))
+        })
+        .unwrap_or_default();
+    let gain = if clip.gain == Gain::UNITY {
+        String::new()
+    } else {
+        format!(" · {}", clip.gain)
+    };
+    if stream.is_empty() && gain.is_empty() {
         name
     } else {
-        format!("{name} · {}", clip.gain).into()
+        format!("{name}{stream}{gain}").into()
     }
 }
 
@@ -2289,13 +2329,12 @@ mod tests {
         project.timeline.add_track(TrackKind::Video);
         let info = MediaInfo {
             duration: Some(Time::from_seconds(8)),
-            streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(1920).unwrap(),
-                height: NonZero::new(1080).unwrap(),
-                frame_rate: None,
-            })],
+            streams: vec![Stream::Video(VideoStream::new(
+                0,
+                "h264",
+                NonZero::new(1920).unwrap(),
+                NonZero::new(1080).unwrap(),
+            ))],
         };
         let asset = project.add_asset("a.mkv".into(), info);
         let clips = clips
@@ -2771,13 +2810,12 @@ mod tests {
             let mut project = Project::new("test");
             let info = MediaInfo {
                 duration: Some(Time::from_seconds(8)),
-                streams: vec![Stream::Video(VideoStream {
-                    index: 0,
-                    codec: "h264".into(),
-                    width: NonZero::new(1920).unwrap(),
-                    height: NonZero::new(1080).unwrap(),
-                    frame_rate: None,
-                })],
+                streams: vec![Stream::Video(VideoStream::new(
+                    0,
+                    "h264",
+                    NonZero::new(1920).unwrap(),
+                    NonZero::new(1080).unwrap(),
+                ))],
             };
             let asset = project.add_asset("a.mkv".into(), info);
             (project, asset)
@@ -2879,6 +2917,7 @@ mod tests {
                     start: Time::from_seconds(start),
                     link: None,
                     gain: tessera_timeline::Gain::UNITY,
+                    audio_stream: None,
                 })
                 .unwrap();
         }
@@ -3073,13 +3112,12 @@ mod tests {
         let mut project = Project::new("ghosts");
         let info = MediaInfo {
             duration: Some(Time::from_seconds(2)),
-            streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(64).unwrap(),
-                height: NonZero::new(64).unwrap(),
-                frame_rate: None,
-            })],
+            streams: vec![Stream::Video(VideoStream::new(
+                0,
+                "h264",
+                NonZero::new(64).unwrap(),
+                NonZero::new(64).unwrap(),
+            ))],
         };
         let asset = project.add_asset("a.mkv".into(), info);
         let first = project.place_clip(asset, 0, Time::ZERO).unwrap();
@@ -3113,12 +3151,12 @@ mod tests {
 
     fn with_sound(info: MediaInfo) -> MediaInfo {
         let mut streams = info.streams;
-        streams.push(Stream::Audio(tessera_timeline::AudioStream {
-            index: 1,
-            codec: "aac".into(),
-            sample_rate: NonZero::new(48_000).unwrap(),
-            channels: NonZero::new(2).unwrap(),
-        }));
+        streams.push(Stream::Audio(tessera_timeline::AudioStream::new(
+            1,
+            "aac",
+            NonZero::new(48_000).unwrap(),
+            NonZero::new(2).unwrap(),
+        )));
         MediaInfo { streams, ..info }
     }
 
@@ -3129,13 +3167,12 @@ mod tests {
         project.timeline.add_track(TrackKind::Video);
         let info = with_sound(MediaInfo {
             duration: Some(Time::from_seconds(8)),
-            streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(1920).unwrap(),
-                height: NonZero::new(1080).unwrap(),
-                frame_rate: None,
-            })],
+            streams: vec![Stream::Video(VideoStream::new(
+                0,
+                "h264",
+                NonZero::new(1920).unwrap(),
+                NonZero::new(1080).unwrap(),
+            ))],
         });
         let asset = project.add_asset("a.mkv".into(), info);
         let pair = project
@@ -3200,13 +3237,12 @@ mod tests {
         let mut project = Project::new("drop");
         let info = with_sound(MediaInfo {
             duration: Some(Time::from_seconds(2)),
-            streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(64).unwrap(),
-                height: NonZero::new(64).unwrap(),
-                frame_rate: None,
-            })],
+            streams: vec![Stream::Video(VideoStream::new(
+                0,
+                "h264",
+                NonZero::new(64).unwrap(),
+                NonZero::new(64).unwrap(),
+            ))],
         });
         let asset = project.add_asset("a.mkv".into(), info);
 
@@ -3268,6 +3304,43 @@ mod tests {
 
         assert_eq!(clip_of(&panel, cx, sound.id).gain.tenths(), 10);
         assert_eq!(clip_of(&panel, cx, picture.id).gain, Gain::UNITY);
+    }
+
+    #[gpui::test]
+    fn alt_s_moves_the_selected_sound_to_the_next_audio_stream(cx: &mut TestAppContext) {
+        let (panel, cx, picture, sound) = timeline_with_a_linked_pair(cx);
+        let asset = sound.asset;
+        panel.update(cx, |panel, cx| {
+            panel.project.update(cx, |project, _| {
+                let mut info = project.asset(asset).unwrap().info.clone();
+                info.streams
+                    .push(Stream::Audio(tessera_timeline::AudioStream::new(
+                        2,
+                        "opus",
+                        NonZero::new(48_000).unwrap(),
+                        NonZero::new(2).unwrap(),
+                    )));
+                let path = project.asset(asset).unwrap().path.clone();
+                project.relink_asset(asset, path, info).unwrap();
+            });
+        });
+        cx.simulate_click(point(at(4.), px(V1)), Modifiers::none());
+
+        panel.update(cx, TimelinePanel::cycle_audio_stream);
+
+        assert_eq!(clip_of(&panel, cx, sound.id).audio_stream, Some(2));
+        assert_eq!(clip_of(&panel, cx, picture.id).audio_stream, None);
+
+        let label = cx.read(|cx| {
+            let project = panel.read(cx).project.read(cx);
+            clip_label(project, TrackKind::Audio, &clip_of_in(project, sound.id))
+        });
+
+        assert_eq!(label.as_ref(), "a.mkv · A2");
+    }
+
+    fn clip_of_in(project: &Project, id: ClipId) -> Clip {
+        *project.find_clip(id).unwrap().1
     }
 
     fn viewport_of(panel: &Entity<TimelinePanel>, cx: &mut VisualTestContext) -> Viewport {

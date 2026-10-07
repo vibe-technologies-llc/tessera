@@ -320,7 +320,7 @@ impl MediaBin {
             .collect();
         let mut wanted = Vec::new();
         for asset in project.assets.iter() {
-            let video = asset.info.video().next();
+            let video = asset.info.default_video();
             let thumbnail_stale = self.thumbnail_requested.get(&asset.id) != Some(&asset.path);
             if let Some(video) = video.filter(|_| thumbnail_stale) {
                 wanted.push(Job::Thumbnail {
@@ -889,16 +889,22 @@ fn asset_row(
 }
 
 fn describe(info: &MediaInfo) -> String {
-    let video = info.video().next().map(|video| {
+    let video = info.default_video().map(|video| {
         let rate = video
             .frame_rate
             .map(|rate| format!(" {} fps", trimmed_rate(rate.as_f64())))
             .unwrap_or_default();
-        format!("{}×{} {}{rate}", video.width, video.height, video.codec)
+        let (width, height) = video.display_size();
+        format!("{width}×{height} {}{rate}", video.codec)
     });
-    let audio = info.audio().next().map(|audio| {
+    let audio_streams = info.audio().count();
+    let audio = info.default_audio().map(|audio| {
+        let more = match audio_streams {
+            0 | 1 => String::new(),
+            count => format!(" (+{} more)", count - 1),
+        };
         format!(
-            "{} {} kHz {}",
+            "{} {} kHz {}{more}",
             audio.codec,
             trimmed_rate(f64::from(audio.sample_rate.get()) / 1000.),
             channel_label(audio.channels.get())
@@ -1051,25 +1057,24 @@ mod tests {
     fn video_info() -> MediaInfo {
         MediaInfo {
             duration: Some(Time::from_seconds(4)),
-            streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(640).unwrap(),
-                height: NonZero::new(360).unwrap(),
-                frame_rate: None,
-            })],
+            streams: vec![Stream::Video(VideoStream::new(
+                0,
+                "h264",
+                NonZero::new(640).unwrap(),
+                NonZero::new(360).unwrap(),
+            ))],
         }
     }
 
     fn audio_info() -> MediaInfo {
         MediaInfo {
             duration: Some(Time::from_seconds(4)),
-            streams: vec![Stream::Audio(AudioStream {
-                index: 0,
-                codec: "opus".into(),
-                sample_rate: NonZero::new(48_000).unwrap(),
-                channels: NonZero::new(2).unwrap(),
-            })],
+            streams: vec![Stream::Audio(AudioStream::new(
+                0,
+                "opus",
+                NonZero::new(48_000).unwrap(),
+                NonZero::new(2).unwrap(),
+            ))],
         }
     }
 

@@ -215,7 +215,8 @@ mod tests {
 
     use serde_json::json;
     use tessera_timeline::{
-        AudioStream, ClipEdge, FrameRate, MediaInfo, Stream, Time, TrackKind, VideoStream,
+        AudioStream, ClipEdge, FrameRate, MediaInfo, PixelAspect, Rotation, Stream, Time,
+        TrackKind, VideoStream,
     };
 
     use super::*;
@@ -224,21 +225,41 @@ mod tests {
 
     fn video_stream(index: usize, frame_rate: Option<FrameRate>) -> Stream {
         Stream::Video(VideoStream {
-            index,
-            codec: "h264".into(),
-            width: NonZero::new(1920).unwrap(),
-            height: NonZero::new(1080).unwrap(),
             frame_rate,
+            ..VideoStream::new(
+                index,
+                "h264",
+                NonZero::new(1920).unwrap(),
+                NonZero::new(1080).unwrap(),
+            )
         })
     }
 
     fn audio_stream(index: usize, sample_rate: u32, channels: u16) -> Stream {
-        Stream::Audio(AudioStream {
+        Stream::Audio(AudioStream::new(
             index,
-            codec: "aac".into(),
-            sample_rate: NonZero::new(sample_rate).unwrap(),
-            channels: NonZero::new(channels).unwrap(),
-        })
+            "aac",
+            NonZero::new(sample_rate).unwrap(),
+            NonZero::new(channels).unwrap(),
+        ))
+    }
+
+    fn described(stream: Stream) -> Stream {
+        match stream {
+            Stream::Video(video) => Stream::Video(VideoStream {
+                rotation: Rotation::Clockwise,
+                pixel_aspect: PixelAspect::new(4, 3).unwrap(),
+                pixel_format: Some("yuv420p".into()),
+                default: true,
+                start: Time::from_flicks(23_520_000),
+                ..video
+            }),
+            Stream::Audio(audio) => Stream::Audio(AudioStream {
+                default: true,
+                start: Time::from_flicks(-11_760_000),
+                ..audio
+            }),
+        }
     }
 
     fn golden_project() -> Project {
@@ -250,8 +271,8 @@ mod tests {
             MediaInfo {
                 duration: Some(Time::from_seconds(10)),
                 streams: vec![
-                    video_stream(0, Some(FrameRate::NTSC_30)),
-                    audio_stream(1, 48_000, 2),
+                    described(video_stream(0, Some(FrameRate::NTSC_30))),
+                    described(audio_stream(1, 48_000, 2)),
                 ],
             },
         );
@@ -259,6 +280,9 @@ mod tests {
             .place_linked(asset, 0, Time::from_seconds(1))
             .unwrap();
         project.adjust_clip_gains(&[pair[1].id], 25).unwrap();
+        project
+            .set_clip_audio_streams(&[(pair[1].id, Some(1))])
+            .unwrap();
         project.timeline.tracks[1].volume = tessera_timeline::Gain::from_tenths(-60).unwrap();
         project.add_marker(Time::from_seconds(4), "Cut here");
         project.set_in_point(Time::from_seconds(1)).unwrap();
@@ -282,8 +306,8 @@ mod tests {
                 duration: Some(Time::from_seconds(30)),
                 streams: vec![
                     audio_stream(0, 48_000, 2),
-                    video_stream(1, Some(FrameRate::NTSC_60)),
-                    audio_stream(2, 44_100, 1),
+                    described(video_stream(1, Some(FrameRate::NTSC_60))),
+                    described(audio_stream(2, 44_100, 1)),
                 ],
             },
         );
@@ -321,7 +345,8 @@ mod tests {
             .iter()
             .position(|track| track.kind == TrackKind::Audio)
             .unwrap();
-        project.place_clip(camera, audio_track, Time::ZERO).unwrap();
+        let sound = project.place_clip(camera, audio_track, Time::ZERO).unwrap();
+        project.cycle_audio_streams(&[sound.id]).unwrap();
         project
             .place_clip(music, second_audio, Time::from_seconds(3))
             .unwrap();

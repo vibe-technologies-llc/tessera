@@ -89,6 +89,24 @@ pub enum ValidationError {
         width: u32,
         height: u32,
     },
+    #[error("stream {stream} of asset {} is turned by {degrees}°, which is not a quarter turn", .asset.0)]
+    Rotation {
+        asset: AssetId,
+        stream: usize,
+        degrees: u16,
+    },
+    #[error(
+        "stream {stream} of asset {} has the pixel aspect {numerator}:{denominator}, which has a part of zero",
+        .asset.0
+    )]
+    PixelAspect {
+        asset: AssetId,
+        stream: usize,
+        numerator: u32,
+        denominator: u32,
+    },
+    #[error("clip {} plays audio stream {stream}, which its asset does not have", .clip.0)]
+    UnknownAudioStream { clip: ClipId, stream: usize },
     #[error("stream {stream} of asset {} has a sample rate of zero", .asset.0)]
     ZeroStreamSampleRate { asset: AssetId, stream: usize },
     #[error("stream {stream} of asset {} has no channels", .asset.0)]

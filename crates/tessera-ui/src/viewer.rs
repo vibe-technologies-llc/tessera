@@ -545,7 +545,7 @@ fn frame_request(project: &Project, time: Time, bounds: (u32, u32)) -> Option<Fr
             Some(LayerRequest {
                 decoder: DecoderKey {
                     path: asset.path.clone(),
-                    stream: asset.info.video().next()?.index,
+                    stream: asset.info.default_video()?.index,
                     track,
                     bounds,
                 },
@@ -805,25 +805,24 @@ mod tests {
     fn video_info(seconds: i64) -> MediaInfo {
         MediaInfo {
             duration: Some(Time::from_seconds(seconds)),
-            streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(640).unwrap(),
-                height: NonZero::new(360).unwrap(),
-                frame_rate: None,
-            })],
+            streams: vec![Stream::Video(VideoStream::new(
+                0,
+                "h264",
+                NonZero::new(640).unwrap(),
+                NonZero::new(360).unwrap(),
+            ))],
         }
     }
 
     fn audio_info(seconds: i64) -> MediaInfo {
         MediaInfo {
             duration: Some(Time::from_seconds(seconds)),
-            streams: vec![Stream::Audio(AudioStream {
-                index: 0,
-                codec: "flac".into(),
-                sample_rate: NonZero::new(48_000).unwrap(),
-                channels: NonZero::new(2).unwrap(),
-            })],
+            streams: vec![Stream::Audio(AudioStream::new(
+                0,
+                "flac",
+                NonZero::new(48_000).unwrap(),
+                NonZero::new(2).unwrap(),
+            ))],
         }
     }
 

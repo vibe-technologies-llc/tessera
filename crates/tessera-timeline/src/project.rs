@@ -8,7 +8,7 @@ mod markers;
 
 use crate::{
     gain::Gain,
-    media::MediaInfo,
+    media::{AudioStream, MediaInfo},
     time::{FrameRate, Time, TimeRange},
 };
 
@@ -34,6 +34,20 @@ impl Asset {
             .duration
             .filter(|duration| *duration > Time::ZERO)
             .or_else(|| self.is_still().then_some(Self::STILL_DURATION))
+    }
+
+    pub fn audio_stream_for(&self, clip: &Clip) -> Option<&AudioStream> {
+        clip.audio_stream
+            .and_then(|index| self.info.audio_stream(index))
+            .or_else(|| self.info.default_audio())
+    }
+
+    pub fn next_audio_stream(&self, clip: &Clip) -> Option<usize> {
+        let playing = self.audio_stream_for(clip)?.index;
+        let streams: Vec<usize> = self.info.audio().map(|audio| audio.index).collect();
+        let position = streams.iter().position(|&index| index == playing)?;
+        let next = streams[(position + 1) % streams.len()];
+        (next != playing).then_some(next)
     }
 
     pub fn has_stream(&self, kind: TrackKind) -> bool {
@@ -160,6 +174,7 @@ pub struct Clip {
     pub start: Time,
     pub link: Option<LinkId>,
     pub gain: Gain,
+    pub audio_stream: Option<usize>,
 }
 
 impl Clip {
@@ -251,6 +266,8 @@ pub enum EditError {
     NoDuration,
     #[error("none of the clips play the same media at the same time on another track")]
     NothingToLink,
+    #[error("asset {asset:?} has no audio stream {stream}")]
+    UnknownAudioStream { asset: AssetId, stream: usize },
     #[error("the asset has no {0:?} stream")]
     MissingStream(TrackKind),
     #[error(transparent)]
@@ -571,6 +588,12 @@ impl Project {
                 {
                     return Err(EditError::BeyondMedia(clip.id));
                 }
+                if let Some(stream) = clip
+                    .audio_stream
+                    .filter(|&stream| relinked.info.audio_stream(stream).is_none())
+                {
+                    return Err(EditError::UnknownAudioStream { asset: id, stream });
+                }
             }
         }
         let slot = Arc::make_mut(&mut self.assets)
@@ -640,6 +663,7 @@ impl Project {
             start: start.max(Time::ZERO),
             link: None,
             gain: Gain::UNITY,
+            audio_stream: None,
         })
     }
 
@@ -872,6 +896,7 @@ mod tests {
             start: Time::from_seconds(start),
             link: None,
             gain: Gain::UNITY,
+            audio_stream: None,
         }
     }
 
@@ -1050,11 +1075,13 @@ mod tests {
         MediaInfo {
             duration: Some(Time::from_seconds(seconds)),
             streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(1280).unwrap(),
-                height: NonZero::new(720).unwrap(),
                 frame_rate: Some(FrameRate::FPS_30),
+                ..VideoStream::new(
+                    0,
+                    "h264",
+                    NonZero::new(1280).unwrap(),
+                    NonZero::new(720).unwrap(),
+                )
             })],
         }
     }
@@ -1062,12 +1089,12 @@ mod tests {
     fn audio_info(seconds: i64) -> MediaInfo {
         MediaInfo {
             duration: Some(Time::from_seconds(seconds)),
-            streams: vec![Stream::Audio(AudioStream {
-                index: 0,
-                codec: "opus".into(),
-                sample_rate: NonZero::new(48_000).unwrap(),
-                channels: NonZero::new(2).unwrap(),
-            })],
+            streams: vec![Stream::Audio(AudioStream::new(
+                0,
+                "opus",
+                NonZero::new(48_000).unwrap(),
+                NonZero::new(2).unwrap(),
+            ))],
         }
     }
 

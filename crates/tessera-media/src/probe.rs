@@ -1,17 +1,25 @@
 use std::{
     num::{NonZeroI64, NonZeroU16, NonZeroU32},
     path::Path,
+    ptr,
 };
 
 use ffmpeg_next::{
     codec,
-    ffi::AV_TIME_BASE,
+    ffi::{
+        AV_NOPTS_VALUE, AV_TIME_BASE, AVPacketSideDataType, av_display_rotation_get,
+        av_guess_sample_aspect_ratio, av_packet_side_data_get,
+    },
     format::{self, stream::Disposition},
     media,
 };
-use tessera_timeline::{AudioStream, FrameRate, MediaInfo, Stream, Time, VideoStream};
+use tessera_timeline::{
+    AudioStream, FrameRate, MediaInfo, PixelAspect, Rotation, Stream, Time, VideoStream,
+};
 
-use crate::Error;
+use crate::{Error, decode::stream_start};
+
+const DISPLAY_MATRIX_BYTES: usize = 9 * size_of::<i32>();
 
 const CONTAINER_TIME_BASE: NonZeroI64 =
     NonZeroI64::new(AV_TIME_BASE as i64).expect("FFmpeg's time base is not zero");
@@ -27,7 +35,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo, Error> {
     let streams = input
         .streams()
         .filter(|stream| !stream.disposition().contains(Disposition::ATTACHED_PIC))
-        .filter_map(|stream| match describe(&stream) {
+        .filter_map(|stream| match describe(&input, &stream) {
             Ok(described) => described,
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "skipping a stream that cannot be decoded");
@@ -38,8 +46,13 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo, Error> {
     Ok(MediaInfo { duration, streams })
 }
 
-fn describe(stream: &format::stream::Stream) -> Result<Option<Stream>, Error> {
+fn describe(
+    input: &format::context::Input,
+    stream: &format::stream::Stream,
+) -> Result<Option<Stream>, Error> {
     let index = stream.index();
+    let default = stream.disposition().contains(Disposition::DEFAULT);
+    let start = start_offset(input, stream);
     let parameters = stream.parameters();
     let medium = parameters.medium();
     let codec = parameters.id().name().to_owned();
@@ -52,13 +65,19 @@ fn describe(stream: &format::stream::Stream) -> Result<Option<Stream>, Error> {
                 .video()
                 .map_err(|source| Error::Stream { index, source })?;
             let size = NonZeroU32::new(video.width()).zip(NonZeroU32::new(video.height()));
+            let pixel_format = video
+                .format()
+                .descriptor()
+                .map(|descriptor| descriptor.name().to_owned());
             size.map(|(width, height)| {
                 Stream::Video(VideoStream {
-                    index,
-                    codec,
-                    width,
-                    height,
                     frame_rate: frame_rate(stream.avg_frame_rate()),
+                    rotation: rotation(stream),
+                    pixel_aspect: pixel_aspect(input, stream),
+                    pixel_format,
+                    default,
+                    start,
+                    ..VideoStream::new(index, codec, width, height)
                 })
             })
         }
@@ -69,16 +88,70 @@ fn describe(stream: &format::stream::Stream) -> Result<Option<Stream>, Error> {
             let layout = NonZeroU32::new(audio.rate()).zip(NonZeroU16::new(audio.channels()));
             layout.map(|(sample_rate, channels)| {
                 Stream::Audio(AudioStream {
-                    index,
-                    codec,
-                    sample_rate,
-                    channels,
+                    default,
+                    start,
+                    ..AudioStream::new(index, codec, sample_rate, channels)
                 })
             })
         }
         _ => None,
     };
     Ok(described)
+}
+
+fn start_offset(input: &format::context::Input, stream: &format::stream::Stream) -> Time {
+    let Some(time_base) = NonZeroI64::new(i64::from(stream.time_base().denominator()))
+        .filter(|_| stream.time_base().numerator() > 0)
+    else {
+        return Time::ZERO;
+    };
+    let own = stream.start_time();
+    if own == AV_NOPTS_VALUE {
+        return Time::ZERO;
+    }
+    let offset = own - stream_start(input, stream);
+    Time::from_rational(
+        offset.saturating_mul(i64::from(stream.time_base().numerator())),
+        time_base,
+    )
+}
+
+fn rotation(stream: &format::stream::Stream) -> Rotation {
+    let matrix = unsafe {
+        let parameters = (*stream.as_ptr()).codecpar;
+        av_packet_side_data_get(
+            (*parameters).coded_side_data,
+            (*parameters).nb_coded_side_data,
+            AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+        )
+        .as_ref()
+    };
+    match matrix {
+        Some(side_data) if side_data.size >= DISPLAY_MATRIX_BYTES => {
+            let counterclockwise = unsafe { av_display_rotation_get(side_data.data.cast()) };
+            if counterclockwise.is_finite() {
+                Rotation::nearest(-counterclockwise)
+            } else {
+                Rotation::Upright
+            }
+        }
+        _ => Rotation::Upright,
+    }
+}
+
+fn pixel_aspect(input: &format::context::Input, stream: &format::stream::Stream) -> PixelAspect {
+    let guessed = unsafe {
+        av_guess_sample_aspect_ratio(
+            input.as_ptr().cast_mut(),
+            stream.as_ptr().cast_mut(),
+            ptr::null_mut(),
+        )
+    };
+    u32::try_from(guessed.num)
+        .ok()
+        .zip(u32::try_from(guessed.den).ok())
+        .and_then(|(numerator, denominator)| PixelAspect::new(numerator, denominator))
+        .unwrap_or(PixelAspect::SQUARE)
 }
 
 fn frame_rate(rate: ffmpeg_next::Rational) -> Option<FrameRate> {
@@ -135,6 +208,51 @@ mod tests {
 
         assert_eq!(info.video().count(), 0);
         assert_eq!(info.audio().count(), 1);
+    }
+
+    #[test]
+    fn rotation_pixel_aspect_format_and_disposition_are_read() {
+        let plain = std::env::temp_dir().join(format!(
+            "tessera-media-{}-anamorphic.mp4",
+            std::process::id()
+        ));
+        let rotated =
+            std::env::temp_dir().join(format!("tessera-media-{}-rotated.mp4", std::process::id()));
+        let anamorphic = std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "color=c=red:s=64x48:d=1"])
+            .args(["-vf", "setsar=32/27", "-c:v", "mpeg4"])
+            .arg(&plain)
+            .status();
+        let turned = std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y", "-display_rotation", "90", "-i"])
+            .arg(&plain)
+            .args(["-c", "copy"])
+            .arg(&rotated)
+            .status();
+        let made = [anamorphic, turned]
+            .into_iter()
+            .all(|status| status.is_ok_and(|status| status.success()));
+        if !made {
+            std::fs::remove_file(&plain).ok();
+            return;
+        }
+        crate::init().unwrap();
+
+        let info = probe(&rotated).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&rotated).ok();
+
+        let video = info.video().next().unwrap();
+        assert_eq!(video.rotation, Rotation::Counterclockwise);
+        assert_eq!(video.pixel_aspect, PixelAspect::new(32, 27).unwrap());
+        assert_eq!(video.pixel_format.as_deref(), Some("yuv420p"));
+        assert!(video.default);
+        assert_eq!(video.start, Time::ZERO);
+        assert_eq!(
+            video.display_size(),
+            (NonZeroU32::new(48).unwrap(), NonZeroU32::new(76).unwrap())
+        );
     }
 
     #[test]

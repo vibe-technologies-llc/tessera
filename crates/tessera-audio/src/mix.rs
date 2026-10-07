@@ -153,7 +153,7 @@ fn spans(project: &Project, sample_rate: NonZeroU32, first: i64, frames: usize) 
         .filter(|(_, volume, clip)| *volume != Gain::SILENT && clip.gain != Gain::SILENT)
         .filter_map(|(track, volume, clip)| {
             let asset = project.asset(clip.asset)?;
-            let stream = asset.info.audio().next()?.index;
+            let stream = asset.audio_stream_for(clip)?.index;
             let covered = clip_samples(clip, sample_rate);
             let start = covered.start.max(first);
             let stop = covered.end.min(end);
@@ -209,12 +209,12 @@ mod tests {
         let mut project = Project::new("mix");
         let info = MediaInfo {
             duration: Some(Time::from_seconds(2)),
-            streams: vec![Stream::Audio(AudioStream {
-                index: TONE_STREAM,
-                codec: "pcm_s16le".into(),
-                sample_rate: RATE,
-                channels: NonZero::new(2).unwrap(),
-            })],
+            streams: vec![Stream::Audio(AudioStream::new(
+                TONE_STREAM,
+                "pcm_s16le",
+                RATE,
+                NonZero::new(2).unwrap(),
+            ))],
         };
         let asset = project.add_asset(TONE.into(), info);
         let track = project
@@ -328,6 +328,28 @@ mod tests {
         assert_eq!(spans[0].path, spans[1].path);
         assert_eq!(spans[0].stream, TONE_STREAM);
         assert_ne!(spans[0].track, spans[1].track);
+    }
+
+    #[test]
+    fn a_clip_reads_the_audio_stream_it_chose() {
+        let (mut project, asset, track) = project_with_tone();
+        let mut info = project.asset(asset).unwrap().info.clone();
+        info.streams.push(Stream::Audio(AudioStream::new(
+            TONE_STREAM + 1,
+            "flac",
+            RATE,
+            NonZero::new(2).unwrap(),
+        )));
+        project.relink_asset(asset, TONE.into(), info).unwrap();
+        let clip = project.place_clip(asset, track, Time::ZERO).unwrap();
+
+        assert_eq!(spans(&project, RATE, 0, 16)[0].stream, TONE_STREAM);
+
+        project
+            .set_clip_audio_streams(&[(clip.id, Some(TONE_STREAM + 1))])
+            .unwrap();
+
+        assert_eq!(spans(&project, RATE, 0, 16)[0].stream, TONE_STREAM + 1);
     }
 
     #[test]

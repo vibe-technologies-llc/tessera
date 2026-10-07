@@ -271,22 +271,21 @@ mod tests {
     }
 
     fn audio() -> Stream {
-        Stream::Audio(AudioStream {
-            index: 1,
-            codec: "aac".into(),
-            sample_rate: NonZero::new(48_000).unwrap(),
-            channels: NonZero::new(2).unwrap(),
-        })
+        Stream::Audio(AudioStream::new(
+            1,
+            "aac",
+            NonZero::new(48_000).unwrap(),
+            NonZero::new(2).unwrap(),
+        ))
     }
 
     fn video() -> Stream {
-        Stream::Video(VideoStream {
-            index: 0,
-            codec: "h264".into(),
-            width: NonZero::new(640).unwrap(),
-            height: NonZero::new(360).unwrap(),
-            frame_rate: None,
-        })
+        Stream::Video(VideoStream::new(
+            0,
+            "h264",
+            NonZero::new(640).unwrap(),
+            NonZero::new(360).unwrap(),
+        ))
     }
 
     fn project_with(streams: Vec<Stream>) -> (Project, AssetId) {

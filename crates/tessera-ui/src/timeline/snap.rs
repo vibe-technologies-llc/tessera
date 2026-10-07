@@ -61,6 +61,7 @@ mod tests {
                     start: seconds(start),
                     link: None,
                     gain: tessera_timeline::Gain::UNITY,
+                    audio_stream: None,
                 })
                 .unwrap();
         }

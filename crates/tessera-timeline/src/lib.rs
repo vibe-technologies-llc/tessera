@@ -7,7 +7,7 @@ mod timecode;
 
 pub use gain::Gain;
 pub use history::{Command, HISTORY_DEPTH, History, Revision};
-pub use media::{AudioStream, MediaInfo, Stream, VideoStream};
+pub use media::{AudioStream, MediaInfo, PixelAspect, Rotation, Stream, VideoStream};
 pub use project::{
     Asset, AssetId, Clip, ClipEdge, ClipId, EditError, InsertError, InvalidClip, LinkId, Marker,
     MarkerId, NextIds, OverlappingClip, Project, SequenceSettings, Timeline, Track, TrackHeight,

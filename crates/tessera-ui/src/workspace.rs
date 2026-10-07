@@ -9,13 +9,13 @@ use tessera_document::EXTENSION;
 use tessera_timeline::{Command, Project, Revision, Time};
 
 use crate::{
-    AddMarker, Cancel, ClearInOut, CopyClips, CutClips, DeleteClip, DuplicateClips, FocusSearch,
-    Import, LowerClipGain, NEW_PROJECT_NAME, NewProject, NextEdit, NextMarker, Open, OpenRecent,
-    OpenSequenceSettings, PasteClips, Pause, PlayPause, PreviousEdit, PreviousMarker,
-    RaiseClipGain, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll, SetInPoint,
-    SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward, StepForward,
-    ToggleClipLink, ToggleSafeAreas, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
-    ZoomToFit,
+    AddMarker, Cancel, ClearInOut, CopyClips, CutClips, CycleAudioStream, DeleteClip,
+    DuplicateClips, FocusSearch, Import, LowerClipGain, NEW_PROJECT_NAME, NewProject, NextEdit,
+    NextMarker, Open, OpenRecent, OpenSequenceSettings, PasteClips, Pause, PlayPause, PreviousEdit,
+    PreviousMarker, RaiseClipGain, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll,
+    SetInPoint, SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward,
+    StepForward, ToggleClipLink, ToggleSafeAreas, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn,
+    ZoomOut, ZoomToFit,
     autosave::{AUTOSAVE_INTERVAL, AutosaveDirectory, Orphan, Slot, orphans},
     editor::ProjectEditor,
     media_bin::{MediaBin, file_name},
@@ -686,6 +686,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|workspace, _: &LowerClipGain, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::lower_clip_gain);
             }))
+            .on_action(cx.listener(|workspace, _: &CycleAudioStream, _, cx| {
+                workspace.on_timeline(cx, TimelinePanel::cycle_audio_stream);
+            }))
             .on_action(cx.listener(|workspace, _: &ToggleClipLink, _, cx| {
                 workspace.on_timeline(cx, TimelinePanel::toggle_link_selection);
             }))
@@ -849,13 +852,12 @@ mod tests {
         let mut project = Project::new(name);
         let info = MediaInfo {
             duration: Some(Time::from_seconds(8)),
-            streams: vec![Stream::Video(VideoStream {
-                index: 0,
-                codec: "h264".into(),
-                width: NonZero::new(1920).unwrap(),
-                height: NonZero::new(1080).unwrap(),
-                frame_rate: None,
-            })],
+            streams: vec![Stream::Video(VideoStream::new(
+                0,
+                "h264",
+                NonZero::new(1920).unwrap(),
+                NonZero::new(1080).unwrap(),
+            ))],
         };
         let asset = project.add_asset(media.into(), info);
         for seconds in [1, 10] {

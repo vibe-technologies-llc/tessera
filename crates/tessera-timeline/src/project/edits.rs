@@ -130,6 +130,57 @@ impl Project {
         Ok(adjusted)
     }
 
+    pub fn set_clip_audio_streams(
+        &mut self,
+        streams: &[(ClipId, Option<usize>)],
+    ) -> Result<Vec<Clip>, EditError> {
+        let mut planned = Vec::new();
+        for &(id, stream) in streams {
+            let (track, clip) = self.located_clip(id)?;
+            if let Some(stream) = stream {
+                let asset = self
+                    .asset(clip.asset)
+                    .ok_or(EditError::UnknownAsset(clip.asset))?;
+                if asset.info.audio_stream(stream).is_none() {
+                    return Err(EditError::UnknownAudioStream {
+                        asset: clip.asset,
+                        stream,
+                    });
+                }
+            }
+            if clip.audio_stream != stream {
+                planned.push((
+                    track,
+                    Clip {
+                        audio_stream: stream,
+                        ..clip
+                    },
+                ));
+            }
+        }
+        for &(track, clip) in &planned {
+            self.set_clip(track, clip);
+        }
+        Ok(planned.into_iter().map(|(_, clip)| clip).collect())
+    }
+
+    pub fn cycle_audio_streams(&mut self, ids: &[ClipId]) -> Result<Vec<Clip>, EditError> {
+        let mut streams = Vec::new();
+        for &id in ids {
+            let (track, clip) = self.located_clip(id)?;
+            if self.timeline.tracks[track].kind != super::TrackKind::Audio {
+                continue;
+            }
+            let next = self
+                .asset(clip.asset)
+                .and_then(|asset| asset.next_audio_stream(&clip));
+            if let Some(next) = next {
+                streams.push((id, Some(next)));
+            }
+        }
+        self.set_clip_audio_streams(&streams)
+    }
+
     pub fn paste_clips(&mut self, pastes: &[(Clip, usize, Time)]) -> Result<Vec<Clip>, EditError> {
         self.atomically(|project| {
             let mut copies_of: BTreeMap<LinkId, usize> = BTreeMap::new();
@@ -594,11 +645,13 @@ mod tests {
             MediaInfo {
                 duration: Some(seconds(10)),
                 streams: vec![Stream::Video(VideoStream {
-                    index: 0,
-                    codec: "h264".into(),
-                    width: NonZero::new(1280).unwrap(),
-                    height: NonZero::new(720).unwrap(),
                     frame_rate: Some(FrameRate::FPS_30),
+                    ..VideoStream::new(
+                        0,
+                        "h264",
+                        NonZero::new(1280).unwrap(),
+                        NonZero::new(720).unwrap(),
+                    )
                 })],
             },
         );
@@ -624,6 +677,7 @@ mod tests {
             source: TimeRange::new(seconds(source_start), seconds(duration)),
             link: None,
             gain: crate::Gain::UNITY,
+            audio_stream: None,
         };
         project.timeline.tracks[0].insert(clip).unwrap();
         id
@@ -775,6 +829,7 @@ mod tests {
                 source: TimeRange::new(Time::ZERO, seconds(4)),
                 link: None,
                 gain: crate::Gain::UNITY,
+                audio_stream: None,
             })
             .unwrap();
 
@@ -813,6 +868,7 @@ mod tests {
             source: TimeRange::new(seconds(2), seconds(3)),
             link: None,
             gain: crate::Gain::UNITY,
+            audio_stream: None,
         };
 
         project.overwrite_clip(&copy, 0, seconds(3)).unwrap();
@@ -1024,5 +1080,73 @@ mod tests {
             Err(EditError::Overlapping(_))
         ));
         assert_eq!(project, before);
+    }
+
+    fn two_language_asset(project: &mut Project) -> AssetId {
+        let stereo = |index| {
+            Stream::Audio(crate::media::AudioStream::new(
+                index,
+                "aac",
+                NonZero::new(48_000).unwrap(),
+                NonZero::new(2).unwrap(),
+            ))
+        };
+        project.add_asset(
+            "film.mkv".into(),
+            MediaInfo {
+                duration: Some(seconds(10)),
+                streams: vec![stereo(1), stereo(2)],
+            },
+        )
+    }
+
+    #[test]
+    fn a_clip_plays_the_chosen_audio_stream_and_cycling_moves_through_them() {
+        let mut project = Project::new("streams");
+        let asset = two_language_asset(&mut project);
+        let clip = project.place_clip(asset, 1, Time::ZERO).unwrap();
+        let held = project.asset(asset).unwrap().clone();
+
+        assert_eq!(
+            held.audio_stream_for(&clip).map(|audio| audio.index),
+            Some(1)
+        );
+
+        let cycled = project.cycle_audio_streams(&[clip.id]).unwrap();
+
+        assert_eq!(cycled[0].audio_stream, Some(2));
+        assert_eq!(
+            held.audio_stream_for(&cycled[0]).map(|audio| audio.index),
+            Some(2)
+        );
+
+        let back = project.cycle_audio_streams(&[clip.id]).unwrap();
+
+        assert_eq!(back[0].audio_stream, Some(1));
+        assert_eq!(
+            project.set_clip_audio_streams(&[(clip.id, Some(7))]),
+            Err(EditError::UnknownAudioStream { asset, stream: 7 })
+        );
+        assert_eq!(
+            project.set_clip_audio_streams(&[(clip.id, Some(1))]),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn relinking_keeps_a_chosen_audio_stream_or_refuses() {
+        let mut project = Project::new("streams");
+        let asset = two_language_asset(&mut project);
+        let clip = project.place_clip(asset, 1, Time::ZERO).unwrap();
+        project
+            .set_clip_audio_streams(&[(clip.id, Some(2))])
+            .unwrap();
+        let mut single = project.asset(asset).unwrap().info.clone();
+        single.streams.truncate(1);
+
+        assert_eq!(
+            project.relink_asset(asset, "dub.mkv".into(), single),
+            Err(EditError::UnknownAudioStream { asset, stream: 2 })
+        );
     }
 }

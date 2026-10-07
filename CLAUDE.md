@@ -16,7 +16,15 @@ A Cargo workspace under `crates/`. Dependencies point one way:
 
 - **`tessera-timeline`** is the pure project model (`Project`, `Timeline`, `Track`, `Clip`,
   `Asset`). Each `Asset` carries its probed `MediaInfo` (duration and streams), so nothing outside
-  `tessera-media` has to call into FFmpeg to describe a clip. It has no IO and no GPU, and it
+  `tessera-media` has to call into FFmpeg to describe a clip. A `VideoStream` records its coded
+  size, rate, display `Rotation` (a quarter turn, clockwise), `PixelAspect` (lowest terms, `SQUARE`
+  by default), pixel format, `default` disposition and `start` (its offset from the container's
+  start); `display_size` stretches the width by the pixel aspect and then turns it. An
+  `AudioStream` records its `default` disposition and `start` too, and `default_video` and
+  `default_audio` pick the stream marked default, else the first. A clip's `audio_stream` chooses
+  which of its asset's audio streams it plays (`None` plays the default, `Asset::audio_stream_for`),
+  set through `set_clip_audio_streams` or stepped with `cycle_audio_streams`, refusing a stream the
+  asset lacks (`UnknownAudioStream`), as `relink_asset` does for media without a chosen stream. It has no IO and no GPU, and it
   depends only on `thiserror`. Time is `Time(i64)` in flicks (1/705 600 000 s). A `FrameRate` may be
   any positive rational up to one frame per flick, kept in lowest terms. Every rate in
   `FrameRate::STANDARD`, the NTSC 1000/1001 rates included, has an integral frame duration in
@@ -127,7 +135,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   Rebuilding the `Project` validates rather than trusts: clips go through `Clip::check` and
   `Track::insert`, and ids (unique, and each below the stored next id), assets, stream kinds, clip
   ranges, rates, sizes and channel counts (none zero), asset durations (positive), stream indices
-  (unique within an asset), one track of each kind and the links (each issued, held by at least two
+  (unique within an asset), rotations (quarter turns), pixel aspects (no zero part), each clip's
+  chosen audio stream (one its asset has), one track of each kind and the links (each issued, held by at least two
   clips on different tracks, in step) are checked, each failure a distinct `ValidationError`.
   `to_string` and `from_str` are pure and leave media paths as they are. `save` and `open` make them
   portable: a media path under the project file's directory (the directory of the file a symlink
@@ -141,7 +150,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
   here. Probing leaves out a stream whose size, sample rate or channel count FFmpeg reports as zero,
   which the model can't hold, an attached picture (cover art) and a stream whose decoder cannot be
-  set up (warned about), instead of failing the import. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
+  set up (warned about), instead of failing the import. It reads the rotation from the stream's
+  display matrix (`av_display_rotation_get` counts counterclockwise), the pixel aspect through
+  `av_guess_sample_aspect_ratio` and the start offset against the container's start. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
   byte-bounded LRU cache keyed by the span each frame covers; `is_cached` says whether a time would be answered
   from it, without changing the eviction order. FFmpeg types do not cross its public
@@ -163,7 +174,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   reads the whole stream ahead and drains the decoder, which is why the seek-policy test opens one
   with a single thread. `VideoDecoder::open` and `AudioDecoder::open` take the index of the stream
   to decode, the one probing recorded in `MediaInfo`, and refuse an index that isn't a stream of
-  their kind (`NoVideo`, `NoAudio`); the media bin's thumbnails decode the first probed video
+  their kind (`NoVideo`, `NoAudio`); the media bin's thumbnails decode the default video
   stream. `VideoDecoder::open` decodes in hardware through the first of
   `PREFERRED_HW_ACCELS` (VAAPI, then Vulkan Video) that the codec has a device config for and whose
   device can be created; `open_with` takes the list, and an empty one decodes in
@@ -192,7 +203,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   allowed to touch it). `Mixer::render` fills a block of interleaved stereo `f32` samples starting
   at a timeline sample index: every clip on every audible audio track (not muted, and when any audio track is soloed only the
   soloed ones) that overlaps the block (`clips_overlapping`) is read
-  from an `AudioDecoder` (decoding the asset's first probed audio stream, at the project's sample
+  from an `AudioDecoder` (decoding the clip's audio stream, `audio_stream_for`, at the project's sample
   rate), scaled by the clip's gain times its track's volume (a silent one is skipped) and summed
   into its part of the block; the sum then goes through a soft limiter that leaves samples up to ±0.9 alone
   and eases the rest toward ±1.0. A clip's first sample is the first one at or after its start
@@ -325,7 +336,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   tracks. An audio track's header shows its volume beside the toggles (not on a compact row):
   scrolling it steps a decibel up or down and a double-click resets it. Alt+Up and Alt+Down raise
   and lower the gain of the selected audio clips by a decibel, and a clip whose gain isn't unity
-  shows it after its name. Split and delete skip the clips of locked tracks. Double-clicking a track's name edits it in a `TextField`. Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+D copy, cut, paste
+  shows it after its name. Alt+S steps the selected audio clips to their asset's next audio stream,
+  and an audio clip of media with several shows which one it plays (`A2`). Split and delete skip the clips of locked tracks. Double-clicking a track's name edits it in a `TextField`. Ctrl+C, Ctrl+X, Ctrl+V and Ctrl+D copy, cut, paste
   and duplicate the selection: the panel keeps a clipboard of clips with their tracks, a paste
   lands at the playhead (a duplicate right after the selection) keeping the clips' relative
   offsets and tracks, as one `paste_clips` command that is refused whole when anything overlaps or
@@ -351,7 +363,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   composites them into a frame of that size, letterbox bars included, which becomes the GPUI image.
   The render size is the sequence scaled down uniformly (in steps of an eighth) to the viewer's
   frame, never above the sequence (`render_bounds`), and a change of it reopens the decoders. The
-  job carries one decoder per media path, stream (the asset's first probed video stream), track and
+  job carries one decoder per media path, stream (the asset's default video stream), track and
   size, closing those whose track no longer
   holds a clip of that media, so two clips of one file on different tracks never share one and
   split clips on one track do. Media that fails to open is remembered per decoder key and warned
