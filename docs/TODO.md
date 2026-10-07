@@ -1,6 +1,3 @@
-## Model
-
-
 ## Media decode
 
 - Apply the display-matrix rotation and the sample aspect ratio, so phone footage isn't sideways and
