@@ -1,6 +1,5 @@
 use anyhow::Context;
 use gpui::Application;
-use tessera_timeline::Project;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
