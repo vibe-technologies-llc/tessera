@@ -17,9 +17,13 @@ fn main() -> anyhow::Result<()> {
     Application::new().run(|cx| {
         tessera_ui::init(cx);
         tessera_ui::use_state_directory(cx);
-        if let Err(error) =
-            tessera_ui::open_main_window(Project::new(tessera_ui::NEW_PROJECT_NAME), cx)
-        {
+        if let Err(error) = tessera_ui::open_main_window(
+            tessera_document::open(std::path::Path::new(
+                "crates/tessera-document/fixtures/v1.tessera",
+            ))
+            .unwrap(),
+            cx,
+        ) {
             tracing::error!(%error, "failed to open main window");
             cx.quit();
             return;

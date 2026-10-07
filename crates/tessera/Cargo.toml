@@ -11,5 +11,6 @@ gpui.workspace = true
 tessera-media.workspace = true
 tessera-timeline.workspace = true
 tessera-ui.workspace = true
+tessera-document.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
