@@ -4,14 +4,15 @@ use std::{
 };
 
 use crate::{
-    Error, Frame, Layer,
+    Error, Frame, Layer, Placement,
     fit::{Rect, Size, fit_rect},
 };
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const BYTES_PER_PIXEL: u32 = 4;
 const QUAD_CORNERS: u32 = 4;
-type PlacementBytes = [[u8; size_of::<f32>()]; 4];
+const PLACEMENT_FLOATS: usize = 16;
+type PlacementBytes = [[u8; size_of::<f32>()]; PLACEMENT_FLOATS];
 const PLACEMENT_BYTES: u64 = size_of::<PlacementBytes>() as u64;
 
 pub struct Compositor {
@@ -206,7 +207,8 @@ impl Compositor {
             },
             extent(layer.size()),
         );
-        let placement = placement_bytes(fit_rect(layer.size(), sequence), sequence);
+        let placement =
+            placement_bytes(fit_rect(layer.size(), sequence), sequence, &layer.placement);
         self.queue
             .write_buffer(&texture.placement, 0, placement.as_flattened());
     }
@@ -338,7 +340,7 @@ fn create_layer_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -413,16 +415,43 @@ fn extent(size: Size) -> wgpu::Extent3d {
     }
 }
 
-fn placement_bytes(rect: Rect, sequence: Size) -> PlacementBytes {
-    let clip_x = |pixel: u32| pixel as f32 / sequence.width as f32 * 2.0 - 1.0;
-    let clip_y = |pixel: u32| 1.0 - pixel as f32 / sequence.height as f32 * 2.0;
-    [
-        clip_x(rect.x),
-        clip_y(rect.y),
-        clip_x(rect.x + rect.width),
-        clip_y(rect.y + rect.height),
+fn placement_bytes(rect: Rect, sequence: Size, placement: &Placement) -> PlacementBytes {
+    let [left, top, right, bottom] = placement.crop.map(|side| side.clamp(0.0, 1.0));
+    let (width, height) = (rect.width as f32, rect.height as f32);
+    let centre = [
+        rect.x as f32 + width / 2.0 + placement.offset[0] * sequence.width as f32,
+        rect.y as f32 + height / 2.0 + placement.offset[1] * sequence.height as f32,
+    ];
+    let (sin, cos) = placement.rotation_degrees.to_radians().sin_cos();
+    let corner = |u: f32, v: f32| {
+        let local = [
+            (u - 0.5) * width * placement.scale,
+            (v - 0.5) * height * placement.scale,
+        ];
+        let turned = [
+            local[0] * cos - local[1] * sin,
+            local[0] * sin + local[1] * cos,
+        ];
+        [
+            (centre[0] + turned[0]) / sequence.width as f32 * 2.0 - 1.0,
+            1.0 - (centre[1] + turned[1]) / sequence.height as f32 * 2.0,
+        ]
+    };
+    let (u0, v0, u1, v1) = (left, top, 1.0 - right, 1.0 - bottom);
+    let floats: [f32; PLACEMENT_FLOATS] = [
+        corner(u0, v0),
+        corner(u1, v0),
+        corner(u0, v1),
+        corner(u1, v1),
+        [u0, v0],
+        [u1, v1],
+        [placement.opacity.clamp(0.0, 1.0), 0.0],
+        [0.0, 0.0],
     ]
-    .map(f32::to_le_bytes)
+    .as_flattened()
+    .try_into()
+    .expect("a placement is sixteen floats");
+    floats.map(f32::to_le_bytes)
 }
 
 fn strip_row_padding(padded: &[u8], row_bytes: u32, padded_bytes_per_row: u32) -> Vec<u8> {
@@ -456,7 +485,12 @@ mod tests {
             width,
             height,
             bgra,
+            placement: Placement::FIT,
         }
+    }
+
+    fn placed(layer: Layer<'_>, placement: Placement) -> Layer<'_> {
+        Layer { placement, ..layer }
     }
 
     fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
@@ -663,5 +697,71 @@ mod tests {
             compositor.composite(u32::MAX, 4, &[]),
             Err(Error::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn a_layer_moves_scales_and_fades_by_its_placement() {
+        let green = solid(32, 32, GREEN);
+        let mut compositor = compositor();
+        let moved = Placement {
+            offset: [0.25, 0.0],
+            scale: 0.5,
+            ..Placement::FIT
+        };
+
+        let frame = compositor
+            .composite(32, 32, &[placed(layer(32, 32, &green), moved)])
+            .unwrap();
+
+        assert_eq!(pixel(&frame, 24, 16), GREEN);
+        assert_eq!(pixel(&frame, 8, 16), OPAQUE_BLACK);
+        assert_eq!(pixel(&frame, 24, 4), OPAQUE_BLACK);
+
+        let faded = Placement {
+            opacity: 0.5,
+            ..Placement::FIT
+        };
+        let frame = compositor
+            .composite(32, 32, &[placed(layer(32, 32, &green), faded)])
+            .unwrap();
+
+        assert_near(pixel(&frame, 16, 16), [0, 128, 0, 255]);
+    }
+
+    #[test]
+    fn a_crop_removes_the_edges_where_they_were() {
+        let halves: Vec<u8> = (0..2)
+            .flat_map(|_| [RED, RED, BLUE, BLUE])
+            .flatten()
+            .collect();
+        let cropped = Placement {
+            crop: [0.5, 0.0, 0.0, 0.0],
+            ..Placement::FIT
+        };
+
+        let frame = compositor()
+            .composite(40, 20, &[placed(layer(4, 2, &halves), cropped)])
+            .unwrap();
+
+        assert_eq!(pixel(&frame, 5, 10), OPAQUE_BLACK);
+        assert_eq!(pixel(&frame, 34, 10), BLUE);
+    }
+
+    #[test]
+    fn a_quarter_turn_stands_a_wide_layer_on_its_end() {
+        let green = solid(64, 16, GREEN);
+        let turned = Placement {
+            rotation_degrees: 90.0,
+            ..Placement::FIT
+        };
+
+        let frame = compositor()
+            .composite(64, 64, &[placed(layer(64, 16, &green), turned)])
+            .unwrap();
+
+        assert_eq!(pixel(&frame, 32, 4), GREEN);
+        assert_eq!(pixel(&frame, 32, 60), GREEN);
+        assert_eq!(pixel(&frame, 4, 32), OPAQUE_BLACK);
+        assert_eq!(pixel(&frame, 60, 32), OPAQUE_BLACK);
     }
 }

@@ -18,6 +18,7 @@ use crate::{
     ZoomOut, ZoomToFit,
     autosave::{AUTOSAVE_INTERVAL, AutosaveDirectory, Orphan, Slot, orphans},
     editor::ProjectEditor,
+    inspector::Inspector,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
     recent::{self, RecentDialogEvent, RecentProjects, RecentProjectsDialog},
@@ -29,6 +30,7 @@ use crate::{
 };
 
 const UNSAVED_MARK: &str = "• ";
+const INSPECTOR_WIDTH: f32 = 240.;
 const RECOVER: &str = "Recover";
 const DISCARD_RECOVERY: &str = "Discard";
 const RECOVERY_CHOICES: [&str; 3] = [RECOVER, DISCARD_RECOVERY, "Not Now"];
@@ -59,6 +61,7 @@ pub struct Workspace {
     media_bin: Entity<MediaBin>,
     viewer: Entity<Viewer>,
     timeline: Entity<TimelinePanel>,
+    inspector: Entity<Inspector>,
     file: Option<PathBuf>,
     file_io: Shared<Task<()>>,
     asking_to_discard: bool,
@@ -112,6 +115,17 @@ impl Workspace {
         });
         let timeline_focus_return = focus_handle.clone();
         let bin_focus_return = focus_handle.clone();
+        let inspector_focus_return = focus_handle.clone();
+        let timeline = cx.new(|cx| {
+            let mut timeline = TimelinePanel::new(editor.clone(), playhead.clone(), cx);
+            timeline.return_focus_to(timeline_focus_return);
+            timeline
+        });
+        let inspector = cx.new(|cx| {
+            let mut inspector = Inspector::new(editor.clone(), timeline.clone(), cx);
+            inspector.return_focus_to(inspector_focus_return);
+            inspector
+        });
         Self {
             focus_handle,
             media_bin: cx.new(|cx| {
@@ -120,11 +134,8 @@ impl Workspace {
                 bin
             }),
             viewer: cx.new(|cx| Viewer::new(project, playhead.clone(), window, cx)),
-            timeline: cx.new(|cx| {
-                let mut timeline = TimelinePanel::new(editor.clone(), playhead.clone(), cx);
-                timeline.return_focus_to(timeline_focus_return);
-                timeline
-            }),
+            timeline,
+            inspector,
             playhead,
             editor,
             file: None,
@@ -783,7 +794,15 @@ impl Render for Workspace {
                             .border_color(theme::border())
                             .child(self.media_bin.clone()),
                     )
-                    .child(div().flex_1().min_w_0().child(self.viewer.clone())),
+                    .child(div().flex_1().min_w_0().child(self.viewer.clone()))
+                    .child(
+                        div()
+                            .w(px(INSPECTOR_WIDTH))
+                            .flex_none()
+                            .border_l_1()
+                            .border_color(theme::border())
+                            .child(self.inspector.clone()),
+                    ),
             )
             .child(
                 div()

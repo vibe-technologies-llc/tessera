@@ -9,6 +9,7 @@ mod markers;
 use crate::{
     gain::Gain,
     media::{AudioStream, MediaInfo},
+    picture::{InvalidTransform, Opacity, Transform},
     time::{FrameRate, Time, TimeRange},
 };
 
@@ -175,6 +176,8 @@ pub struct Clip {
     pub link: Option<LinkId>,
     pub gain: Gain,
     pub audio_stream: Option<usize>,
+    pub transform: Transform,
+    pub opacity: Opacity,
 }
 
 impl Clip {
@@ -274,6 +277,8 @@ pub enum EditError {
     Invalid(#[from] InvalidClip),
     #[error(transparent)]
     Overlapping(#[from] OverlappingClip),
+    #[error(transparent)]
+    InvalidTransform(#[from] InvalidTransform),
 }
 
 impl From<InsertError> for EditError {
@@ -664,6 +669,8 @@ impl Project {
             link: None,
             gain: Gain::UNITY,
             audio_stream: None,
+            transform: crate::Transform::IDENTITY,
+            opacity: crate::Opacity::OPAQUE,
         })
     }
 
@@ -897,6 +904,8 @@ mod tests {
             link: None,
             gain: Gain::UNITY,
             audio_stream: None,
+            transform: crate::Transform::IDENTITY,
+            opacity: crate::Opacity::OPAQUE,
         }
     }
 

@@ -62,6 +62,8 @@ mod tests {
                     link: None,
                     gain: tessera_timeline::Gain::UNITY,
                     audio_stream: None,
+                    transform: tessera_timeline::Transform::IDENTITY,
+                    opacity: tessera_timeline::Opacity::OPAQUE,
                 })
                 .unwrap();
         }

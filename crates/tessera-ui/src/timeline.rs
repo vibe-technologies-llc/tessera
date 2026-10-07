@@ -370,6 +370,10 @@ impl TimelinePanel {
         self.focus_return = Some(handle);
     }
 
+    pub fn selection(&self) -> &BTreeSet<ClipId> {
+        &self.selection
+    }
+
     fn start_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.project.read(cx);
         let (current, placeholder) = match target {
@@ -2918,6 +2922,8 @@ mod tests {
                     link: None,
                     gain: tessera_timeline::Gain::UNITY,
                     audio_stream: None,
+                    transform: tessera_timeline::Transform::IDENTITY,
+                    opacity: tessera_timeline::Opacity::OPAQUE,
                 })
                 .unwrap();
         }

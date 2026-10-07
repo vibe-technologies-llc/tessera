@@ -2,7 +2,7 @@ use std::{io, path::PathBuf};
 
 use serde_json::Value;
 use tessera_timeline::{
-    AssetId, ClipId, InvalidClip, LinkId, MarkerId, OverlappingClip, TrackKind,
+    AssetId, ClipId, InvalidClip, InvalidTransform, LinkId, MarkerId, OverlappingClip, TrackKind,
 };
 use thiserror::Error;
 
@@ -105,6 +105,14 @@ pub enum ValidationError {
         numerator: u32,
         denominator: u32,
     },
+    #[error("clip {}: {source}", .clip.0)]
+    ClipTransform {
+        clip: ClipId,
+        #[source]
+        source: InvalidTransform,
+    },
+    #[error("clip {} has an opacity of {permille}‰, more than opaque", .clip.0)]
+    ClipOpacity { clip: ClipId, permille: u16 },
     #[error("clip {} plays audio stream {stream}, which its asset does not have", .clip.0)]
     UnknownAudioStream { clip: ClipId, stream: usize },
     #[error("stream {stream} of asset {} has a sample rate of zero", .asset.0)]

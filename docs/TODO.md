@@ -36,7 +36,6 @@
 
 - Import hardware-decoded frames into the compositor without a copy, through dmabuf and Vulkan
   external memory
-- Per-clip transform (position, scale, rotation, crop) and opacity
 - Cross-dissolve and dip-to-colour transitions
 
 ## Export

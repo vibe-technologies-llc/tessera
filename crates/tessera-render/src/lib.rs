@@ -36,6 +36,36 @@ pub struct Layer<'a> {
     pub width: u32,
     pub height: u32,
     pub bgra: &'a [u8],
+    pub placement: Placement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    pub offset: [f32; 2],
+    pub scale: f32,
+    pub rotation_degrees: f32,
+    pub crop: [f32; 4],
+    pub opacity: f32,
+}
+
+impl Placement {
+    pub const FIT: Self = Self {
+        offset: [0.0; 2],
+        scale: 1.0,
+        rotation_degrees: 0.0,
+        crop: [0.0; 4],
+        opacity: 1.0,
+    };
+
+    pub fn is_fit(&self) -> bool {
+        *self == Self::FIT
+    }
+}
+
+impl Default for Placement {
+    fn default() -> Self {
+        Self::FIT
+    }
 }
 
 impl Layer<'_> {

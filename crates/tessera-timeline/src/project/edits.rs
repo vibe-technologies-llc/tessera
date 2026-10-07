@@ -4,7 +4,10 @@ use std::{
 };
 
 use super::{Clip, ClipEdge, ClipId, EditError, LinkId, Project, TimeRange};
-use crate::time::Time;
+use crate::{
+    picture::{Opacity, Transform},
+    time::Time,
+};
 
 impl Project {
     fn source_limit(&self, clip: &Clip) -> Time {
@@ -153,6 +156,31 @@ impl Project {
                     track,
                     Clip {
                         audio_stream: stream,
+                        ..clip
+                    },
+                ));
+            }
+        }
+        for &(track, clip) in &planned {
+            self.set_clip(track, clip);
+        }
+        Ok(planned.into_iter().map(|(_, clip)| clip).collect())
+    }
+
+    pub fn set_clip_pictures(
+        &mut self,
+        pictures: &[(ClipId, Transform, Opacity)],
+    ) -> Result<Vec<Clip>, EditError> {
+        let mut planned = Vec::new();
+        for &(id, transform, opacity) in pictures {
+            transform.check()?;
+            let (track, clip) = self.located_clip(id)?;
+            if (clip.transform, clip.opacity) != (transform, opacity) {
+                planned.push((
+                    track,
+                    Clip {
+                        transform,
+                        opacity,
                         ..clip
                     },
                 ));
@@ -678,6 +706,8 @@ mod tests {
             link: None,
             gain: crate::Gain::UNITY,
             audio_stream: None,
+            transform: crate::Transform::IDENTITY,
+            opacity: crate::Opacity::OPAQUE,
         };
         project.timeline.tracks[0].insert(clip).unwrap();
         id
@@ -830,6 +860,8 @@ mod tests {
                 link: None,
                 gain: crate::Gain::UNITY,
                 audio_stream: None,
+                transform: crate::Transform::IDENTITY,
+                opacity: crate::Opacity::OPAQUE,
             })
             .unwrap();
 
@@ -869,6 +901,8 @@ mod tests {
             link: None,
             gain: crate::Gain::UNITY,
             audio_stream: None,
+            transform: crate::Transform::IDENTITY,
+            opacity: crate::Opacity::OPAQUE,
         };
 
         project.overwrite_clip(&copy, 0, seconds(3)).unwrap();
@@ -1147,6 +1181,42 @@ mod tests {
         assert_eq!(
             project.relink_asset(asset, "dub.mkv".into(), single),
             Err(EditError::UnknownAudioStream { asset, stream: 2 })
+        );
+    }
+
+    #[test]
+    fn a_clip_picture_changes_only_within_range_and_off_locked_tracks() {
+        let (mut project, asset) = project_with_asset();
+        let first = place(&mut project, asset, 0);
+        let moved = Transform {
+            x: 40,
+            scale: 500,
+            ..Transform::IDENTITY
+        };
+        let faded = Opacity::from_permille(250).unwrap();
+
+        let changed = project.set_clip_pictures(&[(first, moved, faded)]).unwrap();
+
+        assert_eq!((changed[0].transform, changed[0].opacity), (moved, faded));
+        assert_eq!(
+            project.set_clip_pictures(&[(first, moved, faded)]),
+            Ok(Vec::new())
+        );
+
+        let invalid = Transform { scale: 0, ..moved };
+
+        assert_eq!(
+            project.set_clip_pictures(&[(first, invalid, faded)]),
+            Err(EditError::InvalidTransform(
+                crate::picture::InvalidTransform::Scale(0)
+            ))
+        );
+
+        project.timeline.tracks[0].locked = true;
+
+        assert_eq!(
+            project.set_clip_pictures(&[(first, Transform::IDENTITY, faded)]),
+            Err(EditError::TrackLocked(0))
         );
     }
 }

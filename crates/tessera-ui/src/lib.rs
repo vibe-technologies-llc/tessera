@@ -1,6 +1,7 @@
 mod autosave;
 mod editor;
 mod frame_image;
+mod inspector;
 mod media_bin;
 mod playhead;
 mod recent;

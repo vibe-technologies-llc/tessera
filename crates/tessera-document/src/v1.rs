@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tessera_timeline::{
     self as model, AssetId, ClipId, FrameRate, Gain, InsertError, LinkId, MarkerId, MediaInfo,
-    NextIds, PixelAspect, Rotation, Time, TimeRange, Timeline,
+    NextIds, Opacity, PixelAspect, Rotation, Time, TimeRange, Timeline,
 };
 
 use crate::{FormatError, ValidationError};
@@ -125,6 +125,67 @@ struct Clip {
     link: Option<u64>,
     gain_tenths_db: i32,
     audio_stream: Option<usize>,
+    transform: Transform,
+    opacity_permille: u16,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transform {
+    x: i32,
+    y: i32,
+    scale_permille: u32,
+    rotation_tenths_deg: i32,
+    crop_permille: Crop,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Crop {
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+}
+
+impl From<model::Transform> for Transform {
+    fn from(transform: model::Transform) -> Self {
+        Self {
+            x: transform.x,
+            y: transform.y,
+            scale_permille: transform.scale,
+            rotation_tenths_deg: transform.rotation,
+            crop_permille: Crop {
+                left: transform.crop.left,
+                top: transform.crop.top,
+                right: transform.crop.right,
+                bottom: transform.crop.bottom,
+            },
+        }
+    }
+}
+
+impl From<Transform> for model::Transform {
+    fn from(transform: Transform) -> Self {
+        let Crop {
+            left,
+            top,
+            right,
+            bottom,
+        } = transform.crop_permille;
+        Self {
+            x: transform.x,
+            y: transform.y,
+            scale: transform.scale_permille,
+            rotation: transform.rotation_tenths_deg,
+            crop: model::Crop {
+                left,
+                top,
+                right,
+                bottom,
+            },
+        }
+    }
 }
 
 impl TryFrom<&model::Project> for Project {
@@ -331,6 +392,8 @@ impl From<&model::Clip> for Clip {
             link: clip.link.map(|link| link.0),
             gain_tenths_db: clip.gain.tenths(),
             audio_stream: clip.audio_stream,
+            transform: clip.transform.into(),
+            opacity_permille: clip.opacity.permille(),
         }
     }
 }
@@ -697,7 +760,20 @@ impl Clip {
                 tenths: self.gain_tenths_db,
             })?,
             audio_stream: self.audio_stream,
+            transform: self.transform.into(),
+            opacity: Opacity::from_permille(self.opacity_permille).ok_or(
+                ValidationError::ClipOpacity {
+                    clip: ClipId(self.id),
+                    permille: self.opacity_permille,
+                },
+            )?,
         };
+        clip.transform
+            .check()
+            .map_err(|source| ValidationError::ClipTransform {
+                clip: clip.id,
+                source,
+            })?;
         let asset = project
             .asset(clip.asset)
             .ok_or(ValidationError::UnknownAsset {
@@ -757,6 +833,14 @@ mod tests {
             "link": null,
             "gain_tenths_db": 0,
             "audio_stream": null,
+            "transform": {
+                "x": 0,
+                "y": 0,
+                "scale_permille": 1000,
+                "rotation_tenths_deg": 0,
+                "crop_permille": { "left": 0, "top": 0, "right": 0, "bottom": 0 },
+            },
+            "opacity_permille": 1000,
         })
     }
 
@@ -1320,5 +1404,36 @@ mod tests {
             .unwrap();
         assert_eq!(stream.rotation, Rotation::Counterclockwise);
         assert_eq!(project.timeline.tracks[1].clips()[0].audio_stream, Some(0));
+    }
+
+    #[test]
+    fn clip_transforms_and_opacities_must_lie_in_range() {
+        fn first_clip(document: &mut Value) -> &mut Value {
+            &mut document["tracks"][0]["clips"][0]
+        }
+
+        assert_eq!(
+            refused(|document| first_clip(document)["transform"]["scale_permille"] = json!(0)),
+            ValidationError::ClipTransform {
+                clip: ClipId(0),
+                source: tessera_timeline::InvalidTransform::Scale(0),
+            }
+        );
+        assert_eq!(
+            refused(|document| first_clip(document)["opacity_permille"] = json!(1001)),
+            ValidationError::ClipOpacity {
+                clip: ClipId(0),
+                permille: 1001,
+            }
+        );
+
+        let mut document = valid();
+        first_clip(&mut document)["transform"]["rotation_tenths_deg"] = json!(-900);
+        first_clip(&mut document)["opacity_permille"] = json!(0);
+        let project = rebuilt(document).unwrap();
+        let clip = project.timeline.tracks[0].clips()[0];
+
+        assert_eq!(clip.transform.rotation, -900);
+        assert_eq!(clip.opacity, Opacity::TRANSPARENT);
     }
 }

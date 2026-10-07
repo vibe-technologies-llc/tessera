@@ -97,7 +97,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   link (`settle_links`). Every clip has a `gain` and every track a `volume`, both a `Gain` in
   tenths of a decibel from `Gain::SILENT` (−60 dB, played as silence) to `Gain::LOUDEST` (+12 dB),
   `UNITY` by default; `adjust_clip_gains` moves the gain of several clips at once, saturating at
-  those ends. A `Track` carries a `name`
+  those ends. Every clip also has a `Transform` (`picture.rs`: `x` and `y` in sequence pixels
+  moving its centre, `scale` in per-mille of the fitted size, `rotation` in tenths of a degree
+  clockwise, a `Crop` in per-mille of each side) and an `Opacity` in per-mille. `Transform::check`
+  refuses a scale outside 1‰–10 000‰, a rotation past a whole turn, a position past 100 000 pixels
+  and a crop that leaves nothing (`InvalidTransform`), `Transform::with` sets one `TransformField`
+  clamped into range, and `set_clip_pictures` sets several clips' transform and opacity at once.
+  A `Track` carries a `name`
   (empty shows the default label), `locked`, `muted`, `solo`, its `volume` and a `TrackHeight`; a locked track
   refuses every edit of its clips and every placement onto it (`TrackLocked`), through
   `located_clip` and `track_accepting`. A muted video track is left out of the composite
@@ -136,7 +142,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   `Track::insert`, and ids (unique, and each below the stored next id), assets, stream kinds, clip
   ranges, rates, sizes and channel counts (none zero), asset durations (positive), stream indices
   (unique within an asset), rotations (quarter turns), pixel aspects (no zero part), each clip's
-  chosen audio stream (one its asset has), one track of each kind and the links (each issued, held by at least two
+  chosen audio stream (one its asset has), clip transforms (`Transform::check`) and opacities (at
+  most opaque), one track of each kind and the links (each issued, held by at least two
   clips on different tracks, in step) are checked, each failure a distinct `ValidationError`.
   `to_string` and `from_str` are pure and leave media paths as they are. `save` and `open` make them
   portable: a media path under the project file's directory (the directory of the file a symlink
@@ -237,7 +244,10 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   blended over with their alpha, and reads the target back with its rows unpadded. Each layer is
   scaled uniformly to fit inside the sequence and centred (`fit::fit_rect`, letterboxing or
   pillarboxing), with linear filtering, and a layer of the sequence's size comes back byte for
-  byte. The target and readback buffer are kept while the sequence size holds, and layer
+  byte. A layer's `Placement` then moves its centre (in fractions of the sequence), scales and
+  turns it about that centre, crops its edges in place and fades it; the CPU computes the four
+  corners and the cropped texture rectangle into the layer's uniform (`placement_bytes`), and the
+  fragment shader multiplies the alpha by the opacity. The target and readback buffer are kept while the sequence size holds, and layer
   textures, each with its own placement uniform and bind group, are pooled by size, keeping only
   those the last call used. The `Viewer` is its only user.
 - **`tessera-ui`** holds the GPUI views. `Workspace` owns an `Entity<Project>` through its `ProjectEditor`, and each panel
@@ -361,7 +371,9 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   the view, faster the closer to the edge, up to a visible width past the timeline's end. Panel interactions are tested
   headlessly with GPUI's `test-support` (`#[gpui::test]` and `VisualTestContext` mouse
   simulation). The `Viewer` requests every video clip under the
-  playhead as a layer, bottom to top (`Timeline::video_layers_at`, which leaves out muted tracks).
+  playhead as a layer, bottom to top (`Timeline::video_layers_at`, which leaves out muted tracks),
+  each with its clip's transform and opacity (`Look`, turned into a `Placement` by
+  `viewer::placement`).
   A background job decodes the layers in parallel, one thread each, at the render size and
   composites them into a frame of that size, letterbox bars included, which becomes the GPUI image.
   The render size is the sequence scaled down uniformly (in steps of an eighth) to the viewer's
@@ -371,7 +383,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   holds a clip of that media, so two clips of one file on different tracks never share one and
   split clips on one track do. Media that fails to open is remembered per decoder key and warned
   about once, and the layers that did decode still show. A single layer that already has the
-  render size skips the compositor. The job creates a `Compositor` on first use off the UI thread;
+  render size and no transform skips the compositor. The job creates a `Compositor` on first use off the UI thread;
   if that fails it warns once and shows the top layer's decoded frame alone from then on, and
   after a compositing error it shows that frame, recreates the compositor and gives up after three
   errors in a row. A panic in a job is caught: the viewer shows a failure and starts a new
@@ -387,6 +399,11 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   timeline (`presentation_time`). A frame that lands early is held until the playhead reaches it,
   one overtaken by a newer frame is dropped, and a change of speed drops a held frame
   (`fate`), so a slow decode or composite shows fewer frames rather than lagging the audio.
+  The `Inspector` (`inspector.rs`), right of the viewer, edits the picture of the selected video
+  clips (the timeline's `selection`): each `Property` (the transform fields and opacity) shows the
+  first clip's value in its unit, steps one unit per wheel notch (ten with Shift), takes a typed
+  value on click through a `TextField`, and resets with ↺; every change applies to all selected
+  video clips as one `TransformClip` or `SetClipOpacity` command, and Reset Picture restores them.
   `TextField` (`text_field.rs`) is a single-line text input built on key events: it appends the
   typed character, backspace deletes, Enter submits and Escape cancels, emitting
   `TextFieldEvent`s, and it ignores keys with Ctrl or Alt. Every workspace binding is scoped to

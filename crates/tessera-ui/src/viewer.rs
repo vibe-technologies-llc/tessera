@@ -14,8 +14,8 @@ use gpui::{
     canvas, div, img, relative,
 };
 use tessera_media::{VideoDecoder, VideoFrame};
-use tessera_render::{Compositor, Frame, Layer};
-use tessera_timeline::{FrameRate, Project, Time, Timecode};
+use tessera_render::{Compositor, Frame, Layer, Placement};
+use tessera_timeline::{FrameRate, Opacity, Project, Time, Timecode, Transform};
 
 use crate::{
     frame_image::render_image,
@@ -45,7 +45,54 @@ const NO_VIDEO: &str = "No video clip is under the playhead";
 struct LayerRequest {
     decoder: DecoderKey,
     time: Time,
+    look: Look,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Look {
+    transform: Transform,
+    opacity: Opacity,
+    sequence: (u32, u32),
+}
+
+impl Look {
+    #[cfg(test)]
+    const FIT: Self = Self {
+        transform: Transform::IDENTITY,
+        opacity: Opacity::OPAQUE,
+        sequence: (1, 1),
+    };
+
+    fn placement(self) -> Placement {
+        placement(self.transform, self.opacity, self.sequence)
+    }
+}
+
+pub(crate) fn placement(
+    transform: Transform,
+    opacity: Opacity,
+    (width, height): (u32, u32),
+) -> Placement {
+    let permille = |value: u16| f32::from(value) / 1000.;
+    Placement {
+        offset: [
+            transform.x as f32 / width.max(1) as f32,
+            transform.y as f32 / height.max(1) as f32,
+        ],
+        scale: transform.scale as f32 / Transform::FULL_SCALE as f32,
+        rotation_degrees: transform.rotation as f32 / 10.,
+        crop: [
+            transform.crop.left,
+            transform.crop.top,
+            transform.crop.right,
+            transform.crop.bottom,
+        ]
+        .map(permille),
+        opacity: opacity.fraction(),
+    }
+}
+
+type PlacedFrame = (Arc<VideoFrame>, Placement);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FrameRequest {
@@ -140,7 +187,7 @@ impl Renderer {
     fn assemble(
         &mut self,
         bounds: (u32, u32),
-        frames: Vec<Arc<VideoFrame>>,
+        frames: Vec<PlacedFrame>,
         first_failure: Option<SharedString>,
     ) -> Picture {
         if frames.is_empty() {
@@ -550,6 +597,11 @@ fn frame_request(project: &Project, time: Time, bounds: (u32, u32)) -> Option<Fr
                     bounds,
                 },
                 time: clip.source_time_at(time)?,
+                look: Look {
+                    transform: clip.transform,
+                    opacity: clip.opacity,
+                    sequence: sequence_bounds(project),
+                },
             })
         })
         .collect();
@@ -599,7 +651,7 @@ fn speed_label(speed: Speed) -> Option<String> {
 }
 
 struct Decoded {
-    frames: Vec<Arc<VideoFrame>>,
+    frames: Vec<PlacedFrame>,
     first_failure: Option<SharedString>,
     decoded_anew: bool,
 }
@@ -662,7 +714,7 @@ fn decode_layers(
         }
         let path = layer.decoder.path.display();
         match outcome.frame {
-            Ok(frame) => decoded.frames.push(frame),
+            Ok(frame) => decoded.frames.push((frame, layer.look.placement())),
             Err(failure) => {
                 let reason = match failure {
                     LayerFailure::Remembered(reason) => reason,
@@ -739,14 +791,17 @@ struct Assembled {
     compositing_failed: bool,
 }
 
-fn fills_the_sequence(frames: &[Arc<VideoFrame>], (width, height): (u32, u32)) -> bool {
-    matches!(frames, [only] if only.width == width && only.height == height)
+fn fills_the_sequence(frames: &[PlacedFrame], (width, height): (u32, u32)) -> bool {
+    matches!(
+        frames,
+        [(only, placement)] if only.width == width && only.height == height && placement.is_fit()
+    )
 }
 
 fn assemble_image(
     compositor: Option<&mut Compositor>,
     bounds: (u32, u32),
-    mut frames: Vec<Arc<VideoFrame>>,
+    mut frames: Vec<PlacedFrame>,
 ) -> Assembled {
     let mut compositing_failed = false;
     let composited = match compositor {
@@ -764,7 +819,7 @@ fn assemble_image(
     };
     let image = match composited {
         Some(composited) => render_image(composited),
-        None => frames.pop().and_then(render_image),
+        None => frames.pop().and_then(|(frame, _)| render_image(frame)),
     };
     Assembled {
         image: image.ok_or_else(|| SharedString::from("The decoded frame has an unexpected size")),
@@ -775,14 +830,15 @@ fn assemble_image(
 fn composite_frames(
     compositor: &mut Compositor,
     (width, height): (u32, u32),
-    frames: &[Arc<VideoFrame>],
+    frames: &[PlacedFrame],
 ) -> Result<Frame, tessera_render::Error> {
     let layers: Vec<Layer<'_>> = frames
         .iter()
-        .map(|frame| Layer {
+        .map(|(frame, placement)| Layer {
             width: frame.width,
             height: frame.height,
             bgra: &frame.bgra,
+            placement: *placement,
         })
         .collect();
     compositor.composite(width, height, &layers)
@@ -886,13 +942,14 @@ mod tests {
         cx.read(|cx| layer_paths(viewer.read(cx).wanted.request.as_ref()))
     }
 
-    fn solid(width: u32, height: u32, bgra: [u8; 4]) -> Arc<VideoFrame> {
-        Arc::new(VideoFrame {
+    fn solid(width: u32, height: u32, bgra: [u8; 4]) -> PlacedFrame {
+        let frame = Arc::new(VideoFrame {
             width,
             height,
             time: Time::ZERO,
             bgra: bgra.repeat(width as usize * height as usize),
-        })
+        });
+        (frame, Placement::FIT)
     }
 
     fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
@@ -1159,6 +1216,14 @@ mod tests {
         ));
         assert!(!fills_the_sequence(&[], sequence));
 
+        let (frame, _) = solid(8, 4, RED);
+        let moved = Placement {
+            offset: [0.5, 0.],
+            ..Placement::FIT
+        };
+
+        assert!(!fills_the_sequence(&[(frame, moved)], sequence));
+
         let image = assemble_image(None, sequence, vec![solid(8, 4, BLUE)]);
 
         assert!(!image.compositing_failed);
@@ -1211,10 +1276,12 @@ mod tests {
             LayerRequest {
                 decoder: key("/missing/first.mkv", 0),
                 time: Time::ZERO,
+                look: Look::FIT,
             },
             LayerRequest {
                 decoder: key("/missing/second.mkv", 1),
                 time: Time::ZERO,
+                look: Look::FIT,
             },
         ];
         let mut decoders = Decoders::new();
@@ -1279,5 +1346,34 @@ mod tests {
 
         assert!(cx.read(|cx| viewer.read(cx).shown.is_none()));
         assert!(cx.read(|cx| matches!(viewer.read(cx).picture, Picture::Black)));
+    }
+
+    #[test]
+    fn a_clip_transform_becomes_a_placement_in_fractions_of_the_sequence() {
+        let transform = Transform {
+            x: 480,
+            y: -270,
+            scale: 1_500,
+            rotation: -450,
+            crop: tessera_timeline::Crop {
+                left: 100,
+                top: 0,
+                right: 250,
+                bottom: 0,
+            },
+        };
+
+        let placed = placement(
+            transform,
+            Opacity::from_permille(600).unwrap(),
+            (1920, 1080),
+        );
+
+        assert_eq!(placed.offset, [0.25, -0.25]);
+        assert_eq!(placed.scale, 1.5);
+        assert_eq!(placed.rotation_degrees, -45.);
+        assert_eq!(placed.crop, [0.1, 0., 0.25, 0.]);
+        assert_eq!(placed.opacity, 0.6);
+        assert!(placement(Transform::IDENTITY, Opacity::OPAQUE, (1920, 1080)).is_fit());
     }
 }

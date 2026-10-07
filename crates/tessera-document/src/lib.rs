@@ -215,8 +215,8 @@ mod tests {
 
     use serde_json::json;
     use tessera_timeline::{
-        AudioStream, ClipEdge, FrameRate, MediaInfo, PixelAspect, Rotation, Stream, Time,
-        TrackKind, VideoStream,
+        AudioStream, ClipEdge, Crop, FrameRate, MediaInfo, Opacity, PixelAspect, Rotation, Stream,
+        Time, TrackKind, Transform, VideoStream,
     };
 
     use super::*;
@@ -282,6 +282,21 @@ mod tests {
         project.adjust_clip_gains(&[pair[1].id], 25).unwrap();
         project
             .set_clip_audio_streams(&[(pair[1].id, Some(1))])
+            .unwrap();
+        let framed = Transform {
+            x: 12,
+            y: -8,
+            scale: 750,
+            rotation: -150,
+            crop: Crop {
+                left: 20,
+                top: 0,
+                right: 35,
+                bottom: 100,
+            },
+        };
+        project
+            .set_clip_pictures(&[(pair[0].id, framed, Opacity::from_permille(800).unwrap())])
             .unwrap();
         project.timeline.tracks[1].volume = tessera_timeline::Gain::from_tenths(-60).unwrap();
         project.add_marker(Time::from_seconds(4), "Cut here");
