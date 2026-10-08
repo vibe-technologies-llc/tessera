@@ -8,8 +8,9 @@ use std::{
 use ffmpeg_next::{
     Packet, Rational, Rescale, codec, color, decoder,
     ffi::{
-        AV_NOPTS_VALUE, AVColorSpace, AVSEEK_FLAG_BACKWARD, FF_THREAD_FRAME, FF_THREAD_SLICE,
-        SWS_CS_ITU601, SWS_CS_ITU709, avformat_index_get_entries_count, avformat_index_get_entry,
+        AV_NOPTS_VALUE, AV_PIX_FMT_FLAG_PAL, AVColorSpace, AVSEEK_FLAG_BACKWARD, FF_THREAD_FRAME,
+        FF_THREAD_SLICE, SWS_CS_ITU601, SWS_CS_ITU709, av_frame_ref,
+        avformat_index_get_entries_count, avformat_index_get_entry,
         avformat_index_get_entry_from_timestamp, sws_getCoefficients, sws_setColorspaceDetails,
     },
     format::{self, Pixel},
@@ -20,15 +21,15 @@ use tessera_timeline::{FLICKS_PER_SECOND, PixelAspect, Rotation, Time};
 
 use crate::{
     Error,
-    cache::FrameCache,
+    cache::{FrameCache, FramePool},
     hw::{self, HwAccel, PREFERRED_HW_ACCELS},
     probe,
 };
 
 const OUTPUT_FORMAT: Pixel = Pixel::BGRA;
 const BYTES_PER_PIXEL: usize = 4;
-const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const UNINDEXED_FORWARD_WINDOW: Time = Time::from_seconds(1);
+const BACKWARD_RUN: Time = Time::from_seconds(1);
 const HELD_FRAMES: i32 = 2;
 const HIGH_DEFINITION: (u32, u32) = (1280, 720);
 const FULL_RANGE_OUTPUT: c_int = 1;
@@ -59,6 +60,7 @@ pub struct VideoDecoder {
     ahead: Option<frame::Video>,
     drained: bool,
     seeks: usize,
+    run_from: Option<i64>,
     cache: FrameCache,
 }
 
@@ -172,7 +174,8 @@ impl VideoDecoder {
             ahead: None,
             drained: false,
             seeks: 0,
-            cache: FrameCache::new(DEFAULT_CACHE_BYTES),
+            run_from: None,
+            cache: FrameCache::new(&FramePool::shared(), usize::MAX),
         })
     }
 
@@ -187,7 +190,7 @@ impl VideoDecoder {
     }
 
     pub fn cache_capacity(mut self, bytes: usize) -> Self {
-        self.cache = FrameCache::new(bytes);
+        self.cache = FrameCache::new(&FramePool::shared(), bytes);
         self
     }
 
@@ -204,6 +207,10 @@ impl VideoDecoder {
         if let Some(cached) = self.cache.get(target) {
             return Ok(cached);
         }
+        self.run_from = self
+            .position()
+            .filter(|&position| target < position)
+            .map(|_| target.saturating_sub(self.time_base.to_ts(BACKWARD_RUN)));
         if self.needs_seek(target) {
             self.seek(target)?;
         }
@@ -264,10 +271,14 @@ impl VideoDecoder {
         Ok(())
     }
 
-    fn needs_seek(&self, target: i64) -> bool {
+    fn position(&self) -> Option<i64> {
         let timestamp = |frame: &Option<frame::Video>| frame.as_ref().and_then(|f| f.timestamp());
-        let (current, ahead) = (timestamp(&self.current), timestamp(&self.ahead));
-        let Some(position) = current.or(ahead) else {
+        timestamp(&self.current).or(timestamp(&self.ahead))
+    }
+
+    fn needs_seek(&self, target: i64) -> bool {
+        let current = self.current.as_ref().and_then(|frame| frame.timestamp());
+        let Some(position) = self.position() else {
             return true;
         };
         if target < position {
@@ -308,12 +319,7 @@ impl VideoDecoder {
 
     fn seek(&mut self, target: i64) -> Result<(), Error> {
         let seek_ts = target.rescale(self.time_base.rational(), rescale::TIME_BASE);
-        self.input
-            .seek(seek_ts, ..seek_ts)
-            .map_err(|source| Error::Seek {
-                path: self.path.clone(),
-                source,
-            })?;
+        seek_or_rewind(&mut self.input, &self.path, seek_ts)?;
         self.decoder.flush();
         self.current = None;
         self.ahead = None;
@@ -334,13 +340,30 @@ impl VideoDecoder {
                     self.ahead = Some(frame);
                     return Ok(());
                 }
-                Some(_) => self.current = Some(frame),
+                Some(pts) => {
+                    if let Some(passed) = self.current.replace(frame) {
+                        self.keep_in_run(&passed, pts)?;
+                    }
+                }
                 None => {
                     self.current = Some(frame);
                     return Ok(());
                 }
             }
         }
+        Ok(())
+    }
+
+    fn keep_in_run(&mut self, frame: &frame::Video, next: i64) -> Result<(), Error> {
+        let Some(pts) = frame.timestamp() else {
+            return Ok(());
+        };
+        if self.run_from.is_none_or(|from| pts < from) || pts >= next {
+            return Ok(());
+        }
+        let time = self.time_base.to_time(pts - self.start);
+        let converted = self.converter.convert(frame, time)?;
+        self.cache.insert(pts..next, Arc::new(converted));
         Ok(())
     }
 
@@ -399,6 +422,22 @@ pub(crate) fn read_packet(
             Err(error) => return Err(error),
         }
     }
+}
+
+pub(crate) fn seek_or_rewind(
+    input: &mut format::context::Input,
+    path: &Path,
+    seek_ts: i64,
+) -> Result<(), Error> {
+    let Err(refused) = input.seek(seek_ts, ..seek_ts) else {
+        return Ok(());
+    };
+    tracing::debug!(path = %path.display(), %refused, "the input cannot seek, reading it again from the start");
+    *input = format::input(path).map_err(|source| Error::Seek {
+        path: path.to_owned(),
+        source,
+    })?;
+    Ok(())
 }
 
 pub(crate) fn is_again(error: &ffmpeg_next::Error) -> bool {
@@ -471,6 +510,7 @@ fn forward_seek_needed(
 impl Converter {
     fn convert(&mut self, frame: &frame::Video, time: Time) -> Result<VideoFrame, Error> {
         let (matrix, range) = (frame.color_space(), frame.color_range());
+        let field = Field::of(frame);
         let downloaded;
         let frame = if hw::is_hardware_frame(frame) {
             downloaded = hw::download(frame).map_err(|source| Error::Decode { source })?;
@@ -478,13 +518,23 @@ impl Converter {
         } else {
             frame
         };
-        let source = Source::new(frame.format(), frame.width(), frame.height(), matrix, range);
-        let stretched = self.shape.stretched_width(source.width);
+        let stretched = self.shape.stretched_width(frame.width());
         let (width, height) = fitted_size(
             stretched,
-            source.height,
+            frame.height(),
             self.shape.scaled_bounds(self.bounds),
         );
+        let field_view;
+        let frame = match field {
+            Some(field) => {
+                field_view = field
+                    .view(frame)
+                    .map_err(|source| Error::Decode { source })?;
+                &field_view
+            }
+            None => frame,
+        };
+        let source = Source::new(frame.format(), frame.width(), frame.height(), matrix, range);
         let scaler = match self.scaler.take() {
             Some(scaler) if scaler.source == source => scaler,
             _ => Scaler::new(source, width, height).map_err(|source| Error::Decode { source })?,
@@ -537,7 +587,10 @@ impl Scaler {
             OUTPUT_FORMAT,
             width,
             height,
-            scaling::Flags::BILINEAR,
+            scaling::Flags::BILINEAR
+                | scaling::Flags::FULL_CHR_H_INT
+                | scaling::Flags::FULL_CHR_H_INP
+                | scaling::Flags::ACCURATE_RND,
         )?;
         let applied = unsafe {
             let coefficients = sws_getCoefficients(source.matrix);
@@ -560,6 +613,51 @@ impl Scaler {
             source,
             scaled: frame::Video::empty(),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Top,
+    Bottom,
+}
+
+impl Field {
+    fn of(frame: &frame::Video) -> Option<Self> {
+        let paletted = frame.format().descriptor().is_some_and(
+            |descriptor| unsafe { (*descriptor.as_ptr()).flags } & AV_PIX_FMT_FLAG_PAL as u64 != 0,
+        );
+        let interlaced = frame.is_interlaced() && frame.height() >= 2 && !paletted;
+        interlaced.then(|| {
+            if frame.is_top_first() {
+                Self::Top
+            } else {
+                Self::Bottom
+            }
+        })
+    }
+
+    fn view(self, frame: &frame::Video) -> Result<frame::Video, ffmpeg_next::Error> {
+        let mut field = frame::Video::empty();
+        let referenced = unsafe { av_frame_ref(field.as_mut_ptr(), frame.as_ptr()) };
+        if referenced < 0 {
+            return Err(ffmpeg_next::Error::from(referenced));
+        }
+        unsafe {
+            let raw = field.as_mut_ptr();
+            for plane in 0..(*raw).data.len() {
+                if (*raw).data[plane].is_null() {
+                    break;
+                }
+                let stride = (*raw).linesize[plane];
+                if self == Self::Bottom {
+                    (*raw).data[plane] = (*raw).data[plane].offset(stride as isize);
+                }
+                (*raw).linesize[plane] = stride * 2;
+            }
+            (*raw).height /= 2;
+        }
+        Ok(field)
     }
 }
 
@@ -695,6 +793,7 @@ impl TimeBase {
 
 #[cfg(test)]
 mod tests {
+    use ffmpeg_next::ffi::{AV_FRAME_FLAG_INTERLACED, AV_FRAME_FLAG_TOP_FIELD_FIRST};
     use tessera_timeline::FrameRate;
 
     use super::*;
@@ -1227,5 +1326,140 @@ mod tests {
         assert!(is_again(&again));
         assert!(!is_again(&ffmpeg_next::Error::InvalidData));
         assert!(!is_again(&ffmpeg_next::Error::Eof));
+    }
+
+    #[test]
+    fn stepping_through_frames_reordered_by_b_frames() {
+        let fixture = Fixture::generate_with_b_frames("b_frames");
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM)
+            .unwrap()
+            .cache_capacity(0);
+        let forward = 0..fixture::FRAME_COUNT;
+        for index in forward.clone().chain(forward.rev()).chain([7, 2, 16]) {
+            let frame = decoder
+                .frame_at(fixture::FRAME_RATE.frame_to_time(index))
+                .unwrap();
+            assert_eq!(frame.time, fixture::FRAME_RATE.frame_to_time(index));
+            assert_shows(&frame, index);
+        }
+    }
+
+    #[test]
+    fn a_still_image_shows_at_every_time() {
+        let fixture = Fixture::generate_still("still");
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::STILL_STREAM).unwrap();
+        for time in [Time::ZERO, Time::from_seconds(5), Time::from_seconds(-1)] {
+            let frame = decoder.frame_at(time).unwrap();
+            assert_eq!(
+                (frame.width, frame.height),
+                (fixture::WIDTH, fixture::HEIGHT)
+            );
+            assert!(
+                frame.bgra[..3]
+                    .iter()
+                    .all(|&channel| channel.abs_diff(fixture::expected_grey(0)) <= 1)
+            );
+        }
+    }
+
+    #[test]
+    fn stepping_back_keeps_the_run_decoded_on_the_way() {
+        let fixture = Fixture::generate("backward_run");
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
+        let at = |index| fixture::FRAME_RATE.frame_to_time(index);
+
+        decoder.frame_at(at(14)).unwrap();
+        decoder.frame_at(at(13)).unwrap();
+        let seeks = decoder.seeks();
+
+        for index in [12, 11, 10] {
+            assert!(decoder.is_cached(at(index)), "frame {index}");
+            assert_shows(&decoder.frame_at(at(index)).unwrap(), index);
+        }
+
+        assert_eq!(decoder.seeks(), seeks);
+    }
+
+    #[test]
+    fn decoding_forward_keeps_only_the_frames_asked_for() {
+        let fixture = Fixture::generate("forward_no_run");
+        let mut decoder = VideoDecoder::open(fixture.path(), fixture::VIDEO_STREAM).unwrap();
+        let at = |index| fixture::FRAME_RATE.frame_to_time(index);
+
+        decoder.frame_at(at(3)).unwrap();
+
+        assert!(decoder.is_cached(at(3)));
+        assert!(!decoder.is_cached(at(2)));
+        assert!(!decoder.is_cached(at(1)));
+    }
+
+    fn converted(frame: &frame::Video) -> VideoFrame {
+        let mut converter = Converter {
+            bounds: None,
+            shape: Shape::default(),
+            scaler: None,
+        };
+        converter.convert(frame, Time::ZERO).unwrap()
+    }
+
+    fn striped_rows(top_first: bool) -> frame::Video {
+        let mut frame = frame::Video::new(Pixel::YUV420P, 16, 16);
+        let stride = frame.stride(0);
+        for (row, line) in frame.data_mut(0).chunks_mut(stride).enumerate() {
+            line.fill(if row % 2 == 0 { 200 } else { 40 });
+        }
+        frame.data_mut(1).fill(128);
+        frame.data_mut(2).fill(128);
+        let mut flags = AV_FRAME_FLAG_INTERLACED;
+        if top_first {
+            flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        }
+        unsafe { (*frame.as_mut_ptr()).flags |= flags as c_int };
+        frame
+    }
+
+    #[test]
+    fn interlaced_frames_show_their_first_field_at_full_height() {
+        crate::init().unwrap();
+        let rows = |frame: &VideoFrame| -> Vec<u8> {
+            (0..frame.height).map(|y| brightness(frame, 3, y)).collect()
+        };
+
+        let top = converted(&striped_rows(true));
+        let bottom = converted(&striped_rows(false));
+
+        assert_eq!((top.width, top.height), (16, 16));
+        assert!(
+            rows(&top).iter().all(|&grey| grey > 180),
+            "{:?}",
+            rows(&top)
+        );
+        assert!(
+            rows(&bottom).iter().all(|&grey| grey < 60),
+            "{:?}",
+            rows(&bottom)
+        );
+    }
+
+    #[test]
+    fn chroma_is_interpolated_between_samples() {
+        crate::init().unwrap();
+        let mut frame = frame::Video::new(Pixel::YUV420P, 16, 16);
+        frame.data_mut(0).fill(81);
+        for (plane, [left, right]) in [(1, [90, 240]), (2, [240, 110])] {
+            let stride = frame.stride(plane);
+            for line in frame.data_mut(plane).chunks_mut(stride) {
+                line[..4].fill(left);
+                line[4..8].fill(right);
+            }
+        }
+        frame.set_color_space(color::Space::BT709);
+        frame.set_color_range(color::Range::MPEG);
+
+        let converted = converted(&frame);
+
+        let red = |x: u32| converted.bgra[(x * 4 + 2) as usize];
+        assert!(red(0) > red(7), "{} {}", red(0), red(7));
+        assert!(red(7) > red(9), "{} {}", red(7), red(9));
     }
 }

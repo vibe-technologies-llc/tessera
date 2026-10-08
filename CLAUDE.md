@@ -161,8 +161,13 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   display matrix (`av_display_rotation_get` counts counterclockwise), the pixel aspect through
   `av_guess_sample_aspect_ratio` and the start offset against the container's start. `VideoDecoder::frame_at` returns a shared packed BGRA `VideoFrame`: it decodes forward from the
   current position unless the stream index shows a keyframe past it, and keeps recent frames in a
-  byte-bounded LRU cache keyed by the span each frame covers; `is_cached` says whether a time would be answered
-  from it, without changing the eviction order. FFmpeg types do not cross its public
+  cache keyed by the span each frame covers; `is_cached` says whether a time would be answered
+  from it, without changing the eviction order. Every decoder's `FrameCache` draws on one
+  process-wide `FramePool` (`FRAME_CACHE_BUDGET_BYTES`), which evicts the least recently used frame
+  of any decoder, and `cache_capacity` caps one decoder within it. A request behind the current
+  frame (a backward step or reverse shuttle) seeks and keeps every frame it decodes within
+  `BACKWARD_RUN` of the target in the cache, so the steps after it need no seek. An input that
+  refuses to seek (a single image) is opened again and read from its start (`seek_or_rewind`). FFmpeg types do not cross its public
   API, apart from the `FfmpegError` re-export. A decoder refuses a stream whose time base has a
   part that isn't positive (`InvalidTimeBase`), and converts through the checked `TimeBase`.
   `VideoDecoder` is `Send` so it can move to a background task: ffmpeg-next leaves its scaler
@@ -193,20 +198,28 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   decoder holds, and only the frame being shown is downloaded (`av_hwframe_transfer_data`) before
   scaling to BGRA. The scaler converts YUV to full-range RGB with the frame's tagged matrix and
   range (`sws_setColorspaceDetails`, read before the download), reading an untagged matrix as BT.709
-  from 1280×720 up and BT.601 below, and a `yuvj` format as full range. Each scaler keeps its
+  from 1280×720 up and BT.601 below, and a `yuvj` format as full range, interpolating chroma at
+  full resolution (`FULL_CHR_H_INT`, `FULL_CHR_H_INP`). An interlaced frame is deinterlaced by
+  scaling only its temporally first `Field` up to the full height: the field is a view of the
+  frame with every plane's stride doubled (offset by a row for the bottom field). Each scaler keeps its
   output frame, and rows are copied out of it whole. A frame comes out in its display shape: the
   scaler stretches the width by the stream's pixel aspect (`Shape`, read at open as probing reads
   it), fitting bounds swapped when the rotation turns the picture on its side, and the packed rows
   are then turned upright (`turned`), so `VideoFrame`'s size is the display size. The test fixture is 128×96 so hardware accepts
   it and can be generated at any frame rate (`generate_at_rate`), and an H.264 variant, generated
   when `libx264` is present, runs the decode tests through the preferred accelerators against
-  software.
+  software. The fixture recipes also make B-frames, a PNG still, audio-only Matroska, planar
+  stereo PCM (in NUT, which Matroska can't hold), two audio streams of different levels and audio
+  with a gap in its timestamps; each file name carries a counter so tests never share one.
   `AudioDecoder::samples` returns an `AudioBuffer` of exactly the requested number of interleaved
   stereo `f32` frames at the rate the decoder was opened with, silent before the stream starts and
   past its end. It resamples through swresample, whose context ffmpeg-next already makes `Send`:
   mono is resampled alone and duplicated to both channels, more channels are downmixed. The first
   frame after a seek is placed by its pts, and the output then continues sample by sample, so a
-  read starting where the last one ended never seeks. A read behind the last one, or more than a
+  read starting where the last one ended never seeks. Decoded samples are kept as `Run`s: a frame
+  whose pts lands more than `JUMP_TOLERANCE` (20 ms) away from where the samples so far end
+  (counting what the resampler still holds) flushes the resampler and starts a new run there, so a
+  gap reads as silence without being filled in and a jump backwards replaces what followed it. A read behind the last one, or more than a
   second past what is decoded, seeks 100 ms early (flushing the decoder and the resampler) and
   discards up to the target.
 - **`tessera-audio`** plays the timeline's sound through PipeWire (`pipewire`, the only crate

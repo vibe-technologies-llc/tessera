@@ -216,11 +216,13 @@ mod tests {
     #[test]
     fn rotation_pixel_aspect_format_and_disposition_are_read() {
         let plain = std::env::temp_dir().join(format!(
-            "tessera-media-{}-anamorphic.mp4",
+            "tessera-media-{}-probe-anamorphic.mp4",
             std::process::id()
         ));
-        let rotated =
-            std::env::temp_dir().join(format!("tessera-media-{}-rotated.mp4", std::process::id()));
+        let rotated = std::env::temp_dir().join(format!(
+            "tessera-media-{}-probe-rotated.mp4",
+            std::process::id()
+        ));
         let anamorphic = std::process::Command::new("ffmpeg")
             .args(["-loglevel", "error", "-y"])
             .args(["-f", "lavfi", "-i", "color=c=red:s=64x48:d=1"])
@@ -286,5 +288,47 @@ mod tests {
             frame_rate(ffmpeg_next::Rational::new(44, 1)),
             FrameRate::new(44, 1)
         );
+    }
+
+    #[test]
+    fn several_audio_streams_are_all_listed() {
+        let fixture = Fixture::generate_with_two_audio_streams("probe_two_audio_streams");
+        let info = probe(fixture.path()).unwrap();
+        let indices: Vec<_> = info.audio().map(|audio| audio.index).collect();
+        assert_eq!(
+            indices,
+            [fixture::AUDIO_STREAM, fixture::SECOND_AUDIO_STREAM]
+        );
+    }
+
+    #[test]
+    fn audio_only_files_have_a_duration_and_no_video() {
+        let fixture = Fixture::generate_audio_only("probe_audio_only");
+        let info = probe(fixture.path()).unwrap();
+        assert_eq!(info.video().count(), 0);
+        assert_eq!(info.audio().count(), 1);
+        assert!(info.duration.is_some_and(|duration| duration > Time::ZERO));
+    }
+
+    #[test]
+    fn planar_stereo_is_probed_with_both_channels() {
+        let fixture = Fixture::generate_planar_stereo("probe_planar_stereo");
+        let info = probe(fixture.path()).unwrap();
+        let audio = info.audio().next().unwrap();
+        assert_eq!(audio.channels.get(), 2);
+        assert_eq!(audio.codec, "pcm_s16le_planar");
+    }
+
+    #[test]
+    fn a_still_image_has_a_video_stream_and_no_duration() {
+        let fixture = Fixture::generate_still("probe_still");
+        let info = probe(fixture.path()).unwrap();
+        let video = info.video().next().unwrap();
+        assert_eq!(video.index, fixture::STILL_STREAM);
+        assert_eq!(
+            (video.width.get(), video.height.get()),
+            (fixture::WIDTH, fixture::HEIGHT)
+        );
+        assert_eq!(info.duration, None);
     }
 }

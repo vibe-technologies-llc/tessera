@@ -1,10 +1,3 @@
-## Media decode
-
-- Re-anchor audio on packet timestamps after gaps and jumps, not only after a seek
-- Keep a decoded run of frames for backward stepping and reverse shuttle, and budget frame caches
-  across decoders instead of 256 MiB each
-- Deinterlace interlaced sources, and interpolate chroma fully in the scaler
-
 ## Playback and audio
 
 - Keep one PipeWire connection for the session instead of connecting on every play, blocking the UI
@@ -27,8 +20,6 @@
 
 - A CI workflow running the format check, clippy and the tests on every push, with the Vulkan tests
   on lavapipe or skipped without an adapter
-- Test fixtures of small generated media files for decode and export tests: B-frames, 30000/1001 in
-  a 1/1000 time base, stereo and planar audio, several audio streams, stills and audio-only files
 - Tests for `Mixer::render`, the `Output` lifecycle, `PlaybackClock`, `ProjectEditor` undo and redo,
   the bin's import path and cross-track clip moves
 

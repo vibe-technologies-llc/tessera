@@ -15,12 +15,13 @@ use tessera_timeline::{FLICKS_PER_SECOND, Time};
 
 use crate::{
     Error,
-    decode::{TimeBase, is_again, read_packet, stream_of_kind, stream_start},
+    decode::{TimeBase, is_again, read_packet, seek_or_rewind, stream_of_kind, stream_start},
 };
 
 const OUTPUT_FORMAT: format::Sample = format::Sample::F32(sample::Type::Packed);
 const FORWARD_DECODE_WINDOW: Time = Time::from_seconds(1);
 const SEEK_PREROLL: Time = Time::from_flicks(FLICKS_PER_SECOND / 10);
+const JUMP_TOLERANCE: Time = Time::from_flicks(FLICKS_PER_SECOND / 50);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioBuffer {
@@ -72,7 +73,11 @@ enum ResampledChannels {
 
 #[derive(Default)]
 struct DecodedSamples {
-    start: Option<i64>,
+    runs: VecDeque<Run>,
+}
+
+struct Run {
+    start: i64,
     interleaved: VecDeque<f32>,
 }
 
@@ -162,12 +167,7 @@ impl AudioDecoder {
             (Time::from_samples(target, self.sample_rate) - SEEK_PREROLL).max(Time::ZERO);
         let stream_ts = self.start + self.time_base.to_ts(preroll_start);
         let seek_ts = stream_ts.rescale(self.time_base.rational(), rescale::TIME_BASE);
-        self.input
-            .seek(seek_ts, ..seek_ts)
-            .map_err(|source| Error::Seek {
-                path: self.path.clone(),
-                source,
-            })?;
+        seek_or_rewind(&mut self.input, &self.path, seek_ts)?;
         self.decoder.flush();
         self.resampler = None;
         self.decoded = DecodedSamples::default();
@@ -211,12 +211,10 @@ impl AudioDecoder {
         {
             self.flush_resampler()?;
         }
-        let index = frame
-            .timestamp()
-            .map(|pts| self.sample_index(pts))
-            .or(self.position)
-            .unwrap_or(0);
-        self.decoded.anchor(index);
+        match frame.timestamp() {
+            Some(pts) => self.place(self.sample_index(pts))?,
+            None => self.decoded.anchor(self.position.unwrap_or(0)),
+        }
         let resampler = match self.resampler.take() {
             Some(resampler) => resampler,
             None => Resampler::new(frame, source, self.sample_rate)?,
@@ -224,6 +222,21 @@ impl AudioDecoder {
         self.resampler
             .insert(resampler)
             .run(frame, &mut self.decoded)
+    }
+
+    fn place(&mut self, index: i64) -> Result<(), Error> {
+        let Some(end) = self.decoded.end() else {
+            self.decoded.anchor(index);
+            return Ok(());
+        };
+        let buffered = self.resampler.as_ref().map_or(0, Resampler::buffered);
+        let drift = index - (end + buffered);
+        if drift.abs() <= JUMP_TOLERANCE.to_samples(self.sample_rate) {
+            return Ok(());
+        }
+        self.flush_resampler()?;
+        self.decoded.restart_at(index);
+        Ok(())
     }
 
     fn flush_resampler(&mut self) -> Result<bool, Error> {
@@ -332,6 +345,10 @@ impl Resampler {
         }
     }
 
+    fn buffered(&self) -> i64 {
+        self.context.delay().map_or(0, |delay| delay.output)
+    }
+
     fn output_frame(&mut self, input_samples: usize) -> frame::Audio {
         let input_samples = i32::try_from(input_samples).unwrap_or(i32::MAX);
         let bound = unsafe { swr_get_out_samples(self.context.as_mut_ptr(), input_samples) };
@@ -341,43 +358,86 @@ impl Resampler {
 }
 
 impl DecodedSamples {
-    fn frames(&self) -> usize {
-        self.interleaved.len() / AudioBuffer::CHANNELS
-    }
-
     fn end(&self) -> Option<i64> {
-        self.start.map(|start| start + self.frames() as i64)
+        self.runs.back().map(Run::end)
     }
 
     fn anchor(&mut self, index: i64) {
-        self.start.get_or_insert(index);
+        if self.runs.is_empty() {
+            self.runs.push_back(Run::starting_at(index));
+        }
+    }
+
+    fn restart_at(&mut self, index: i64) {
+        while let Some(last) = self.runs.back_mut() {
+            if last.start < index {
+                last.truncate_to(index);
+                break;
+            }
+            self.runs.pop_back();
+        }
+        self.runs.push_back(Run::starting_at(index));
     }
 
     fn push(&mut self, channels: ResampledChannels, samples: &[f32]) {
+        let Some(run) = self.runs.back_mut() else {
+            return;
+        };
         match channels {
-            ResampledChannels::Mono => self
+            ResampledChannels::Mono => run
                 .interleaved
                 .extend(samples.iter().flat_map(|&sample| [sample, sample])),
-            ResampledChannels::Stereo => self.interleaved.extend(samples),
+            ResampledChannels::Stereo => run.interleaved.extend(samples),
         }
     }
 
     fn discard_before(&mut self, index: i64) {
-        let Some(start) = self.start else {
-            return;
-        };
-        let excess = (index - start).clamp(0, self.frames() as i64);
-        self.interleaved
-            .drain(..excess as usize * AudioBuffer::CHANNELS);
-        self.start = Some(start + excess);
+        while self.runs.len() > 1 && self.runs.front().is_some_and(|run| run.end() <= index) {
+            self.runs.pop_front();
+        }
+        if let Some(first) = self.runs.front_mut() {
+            first.discard_before(index);
+        }
     }
 
     fn copy_into(&self, output: &mut [f32], first: i64) {
-        let Some(start) = self.start else {
-            return;
-        };
-        let leading_silence = usize::try_from(start - first).unwrap_or(0);
-        let skipped = usize::try_from(first - start).unwrap_or(0);
+        for run in &self.runs {
+            run.copy_into(output, first);
+        }
+    }
+}
+
+impl Run {
+    fn starting_at(start: i64) -> Self {
+        Self {
+            start,
+            interleaved: VecDeque::new(),
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.interleaved.len() / AudioBuffer::CHANNELS
+    }
+
+    fn end(&self) -> i64 {
+        self.start + self.frames() as i64
+    }
+
+    fn truncate_to(&mut self, index: i64) {
+        let kept = (index - self.start).clamp(0, self.frames() as i64) as usize;
+        self.interleaved.truncate(kept * AudioBuffer::CHANNELS);
+    }
+
+    fn discard_before(&mut self, index: i64) {
+        let excess = (index - self.start).clamp(0, self.frames() as i64);
+        self.interleaved
+            .drain(..excess as usize * AudioBuffer::CHANNELS);
+        self.start += excess;
+    }
+
+    fn copy_into(&self, output: &mut [f32], first: i64) {
+        let leading_silence = usize::try_from(self.start - first).unwrap_or(0);
+        let skipped = usize::try_from(first - self.start).unwrap_or(0);
         let Some(output) = output.get_mut(leading_silence.saturating_mul(AudioBuffer::CHANNELS)..)
         else {
             return;
@@ -395,7 +455,7 @@ impl DecodedSamples {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{self, Fixture};
+    use crate::fixture::{self, AudioGap, Fixture};
 
     const OUTPUT_RATE: NonZeroU32 = NonZeroU32::new(48_000).unwrap();
     const BLOCK: usize = 256;
@@ -612,5 +672,139 @@ mod tests {
             &audible[50 * AudioBuffer::CHANNELS..],
             fixture::audio_level(0),
         );
+    }
+
+    fn frames_of(samples: &[f32], channel: usize) -> Vec<f32> {
+        samples
+            .iter()
+            .copied()
+            .skip(channel)
+            .step_by(AudioBuffer::CHANNELS)
+            .collect()
+    }
+
+    fn block_at(whole: &AudioBuffer, start: Time) -> &[f32] {
+        let first = start.to_samples(OUTPUT_RATE) as usize * AudioBuffer::CHANNELS;
+        &whole.samples[first..first + BLOCK * AudioBuffer::CHANNELS]
+    }
+
+    #[test]
+    fn a_gap_in_the_packet_timestamps_is_heard_as_silence() {
+        let gap = AudioGap {
+            after: 10,
+            frames: 3,
+        };
+        let fixture = Fixture::generate_with_audio_gap("audio_gap", gap);
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_STREAM, OUTPUT_RATE).unwrap();
+        let length = fixture::audio_frame_start(fixture::FRAME_COUNT + gap.frames, OUTPUT_RATE);
+
+        let whole = decoder.samples(Time::ZERO, length as usize).unwrap();
+
+        let at = |index| block_inside_frame(index, OUTPUT_RATE);
+        assert_level(block_at(&whole, at(9)), fixture::audio_level(9));
+        for silent in 10..13 {
+            assert_silent(block_at(&whole, at(silent)));
+        }
+        for index in 10..fixture::FRAME_COUNT {
+            assert_level(
+                block_at(&whole, at(index + gap.frames)),
+                fixture::audio_level(index),
+            );
+        }
+    }
+
+    #[test]
+    fn a_timestamp_jump_backwards_replaces_what_follows_it() {
+        let mut decoded = DecodedSamples::default();
+        decoded.anchor(100);
+        decoded.push(ResampledChannels::Mono, &[1.0; 10]);
+
+        decoded.restart_at(105);
+        decoded.push(ResampledChannels::Mono, &[2.0; 10]);
+
+        let mut output = [0.0; 30 * AudioBuffer::CHANNELS];
+        decoded.copy_into(&mut output, 100);
+
+        assert_eq!(decoded.end(), Some(115));
+        assert_eq!(
+            frames_of(&output, 0)[..15],
+            [[1.0; 5], [2.0; 5], [2.0; 5]].concat()
+        );
+        assert!(
+            frames_of(&output, 0)[15..]
+                .iter()
+                .all(|&sample| sample == 0.0)
+        );
+
+        decoded.restart_at(50);
+        decoded.push(ResampledChannels::Mono, &[3.0; 2]);
+
+        assert_eq!(decoded.end(), Some(52));
+        assert_eq!(decoded.runs.len(), 1);
+    }
+
+    #[test]
+    fn runs_with_a_hole_between_them_are_discarded_and_copied_in_place() {
+        let mut decoded = DecodedSamples::default();
+        decoded.anchor(0);
+        decoded.push(ResampledChannels::Mono, &[1.0; 4]);
+        decoded.restart_at(10);
+        decoded.push(ResampledChannels::Mono, &[2.0; 4]);
+
+        let mut output = [0.0; 6 * AudioBuffer::CHANNELS];
+        decoded.copy_into(&mut output, 2);
+
+        assert_eq!(frames_of(&output, 1), [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+
+        decoded.discard_before(11);
+
+        assert_eq!(decoded.runs.len(), 1);
+        assert_eq!(decoded.runs[0].start, 11);
+        assert_eq!(decoded.end(), Some(14));
+    }
+
+    #[test]
+    fn planar_stereo_keeps_its_channels_apart() {
+        let fixture = Fixture::generate_planar_stereo("audio_planar_stereo");
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_ONLY_STREAM, OUTPUT_RATE).unwrap();
+
+        let block = decoder
+            .samples(block_inside_frame(9, OUTPUT_RATE), BLOCK)
+            .unwrap();
+
+        assert_level(&frames_of(&block.samples, 0), fixture::audio_level(9));
+        assert_level(&frames_of(&block.samples, 1), fixture::right_level(9));
+    }
+
+    #[test]
+    fn each_audio_stream_of_a_file_is_decoded_on_its_own() {
+        let fixture = Fixture::generate_with_two_audio_streams("audio_two_streams");
+        let open = |stream| AudioDecoder::open(fixture.path(), stream, OUTPUT_RATE).unwrap();
+        let (mut first, mut second) = (
+            open(fixture::AUDIO_STREAM),
+            open(fixture::SECOND_AUDIO_STREAM),
+        );
+        let start = block_inside_frame(6, OUTPUT_RATE);
+
+        assert_frame_level(&first.samples(start, BLOCK).unwrap(), 6);
+        assert_level(
+            &second.samples(start, BLOCK).unwrap().samples,
+            fixture::second_stream_level(6),
+        );
+    }
+
+    #[test]
+    fn audio_only_files_decode() {
+        let fixture = Fixture::generate_audio_only("audio_only");
+        let mut decoder =
+            AudioDecoder::open(fixture.path(), fixture::AUDIO_ONLY_STREAM, OUTPUT_RATE).unwrap();
+        for index in [3, 15, 0] {
+            let block = decoder
+                .samples(block_inside_frame(index, OUTPUT_RATE), BLOCK)
+                .unwrap();
+            assert_frame_level(&block, index);
+        }
     }
 }
