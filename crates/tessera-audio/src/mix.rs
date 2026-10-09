@@ -69,6 +69,10 @@ impl Mixer {
         self.failed.retain(held);
     }
 
+    pub fn failed_media(&self) -> impl Iterator<Item = &Path> {
+        self.failed.iter().map(|source| source.path.as_path())
+    }
+
     pub fn render(&mut self, first: i64, out: &mut [f32]) {
         out.fill(0.0);
         let sample_rate = self.sample_rate();

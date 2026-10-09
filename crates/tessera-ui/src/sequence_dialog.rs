@@ -104,7 +104,7 @@ fn rate_label(rate: f64) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
-fn choice(
+pub(crate) fn choice(
     id: impl Into<gpui::ElementId>,
     label: String,
     selected: bool,

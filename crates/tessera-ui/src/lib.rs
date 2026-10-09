@@ -1,5 +1,6 @@
 mod autosave;
 mod editor;
+mod export_dialog;
 mod frame_image;
 mod inspector;
 mod media_bin;
@@ -43,6 +44,7 @@ actions!(
         Import,
         FocusSearch,
         OpenSequenceSettings,
+        Export,
         PlayPause,
         ShuttleBackward,
         Pause,
@@ -97,6 +99,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-i", Import, None),
         KeyBinding::new("ctrl-f", FocusSearch, Some(SHORTCUT_CONTEXT)),
         KeyBinding::new("ctrl-,", OpenSequenceSettings, Some(SHORTCUT_CONTEXT)),
+        KeyBinding::new("ctrl-e", Export, Some(SHORTCUT_CONTEXT)),
         KeyBinding::new("space", PlayPause, Some(SHORTCUT_CONTEXT)),
         KeyBinding::new("j", ShuttleBackward, Some(SHORTCUT_CONTEXT)),
         KeyBinding::new("k", Pause, Some(SHORTCUT_CONTEXT)),

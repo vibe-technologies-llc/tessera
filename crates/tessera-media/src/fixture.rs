@@ -249,16 +249,20 @@ impl Fixture {
         )
     }
 
-    fn generate_with(name: &str, recipe: Recipe) -> Self {
+    pub fn reserve(name: &str, extension: &str) -> Self {
         crate::init().unwrap();
         let path = std::env::temp_dir().join(format!(
-            "tessera-media-{}-{}-{name}.{}",
+            "tessera-media-{}-{}-{name}.{extension}",
             std::process::id(),
             GENERATED.fetch_add(1, Ordering::Relaxed),
-            recipe.extension
         ));
-        encode(&path, &recipe).unwrap();
         Self { path }
+    }
+
+    fn generate_with(name: &str, recipe: Recipe) -> Self {
+        let fixture = Self::reserve(name, recipe.extension);
+        encode(&fixture.path, &recipe).unwrap();
+        fixture
     }
 
     pub fn path(&self) -> &Path {

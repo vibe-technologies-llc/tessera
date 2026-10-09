@@ -80,7 +80,7 @@ fn created_device(accel: HwAccel) -> Device {
     create_device(accel).map_or_else(|| Device::Failed(Instant::now()), Device::Ready)
 }
 
-fn device_reference(accel: HwAccel) -> Option<*mut AVBufferRef> {
+pub(crate) fn device_reference(accel: HwAccel) -> Option<*mut AVBufferRef> {
     let mut devices = DEVICES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

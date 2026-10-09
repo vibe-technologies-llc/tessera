@@ -12,7 +12,8 @@ parse or keep stable.
 
 A Cargo workspace under `crates/`. Dependencies point one way:
 `tessera-timeline` ← `tessera-media`, `tessera-document`; `tessera-media` ← `tessera-audio`;
-`tessera-render` stands alone; all of them ← `tessera-ui` ← `tessera` (the binary).
+`tessera-render` stands alone; `tessera-media`, `tessera-render`, `tessera-audio` ←
+`tessera-export`; all of them ← `tessera-ui` ← `tessera` (the binary).
 
 - **`tessera-timeline`** is the pure project model (`Project`, `Timeline`, `Track`, `Clip`,
   `Asset`). Each `Asset` carries its probed `MediaInfo` (duration and streams), so nothing outside
@@ -154,8 +155,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   syncs the directory. `open` and `save` errors carry the path. A fixture in
   `fixtures/v1.tessera` pins the v1 format.
 - **`tessera-media`** is the only crate allowed to touch FFmpeg (`ffmpeg-next`, bindgen against the
-  system FFmpeg). It covers probing, hwaccel discovery and video and audio decode, and encode goes
-  here. Probing leaves out a stream whose size, sample rate or channel count FFmpeg reports as zero,
+  system FFmpeg). It covers probing, hwaccel discovery, video and audio decode and
+  encode. Probing leaves out a stream whose size, sample rate or channel count FFmpeg reports as zero,
   which the model can't hold, an attached picture (cover art) and a stream whose decoder cannot be
   set up (warned about), instead of failing the import. It reads the rotation from the stream's
   display matrix (`av_display_rotation_get` counts counterclockwise), the pixel aspect through
@@ -210,7 +211,19 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   when `libx264` is present, runs the decode tests through the preferred accelerators against
   software. The fixture recipes also make B-frames, a PNG still, audio-only Matroska, planar
   stereo PCM (in NUT, which Matroska can't hold), two audio streams of different levels and audio
-  with a gap in its timestamps; each file name carries a counter so tests never share one.
+  with a gap in its timestamps; each file name carries a counter so tests never share one
+  (`Fixture::reserve` names an output path the same way). The `fixtures` feature makes the module
+  public, so other crates' tests can use it as a dev-dependency.
+  `Encoder` (`encode.rs`) writes an MP4 or Matroska file (`Container`) with one video stream
+  (`VideoCodec`: H.264, HEVC or AV1) and one stereo audio stream. `create` tries each
+  `EncodeBackend` of the list in turn (`PREFERRED_ENCODE_BACKENDS`: VAAPI, NVENC, Vulkan Video,
+  then software libx264, libx265, libsvtav1 or libaom-av1) and keeps the first encoder that opens,
+  refusing with `NoVideoEncoder` when none does. Packed BGRA frames go through swscale to BT.709
+  limited-range YUV 4:2:0 (tagged so), NV12 uploaded into a hardware frame pool for VAAPI and
+  Vulkan. Audio is AAC in MP4 and Opus in Matroska, falling back to AAC where libopus lacks the
+  sample rate; interleaved stereo `f32` is buffered into the encoder's frame size, and the last
+  frame is padded with silence when the encoder needs whole frames. MP4 is written with
+  `+faststart`.
   `AudioDecoder::samples` returns an `AudioBuffer` of exactly the requested number of interleaved
   stereo `f32` frames at the rate the decoder was opened with, silent before the stream starts and
   past its end. It resamples through swresample, whose context ffmpeg-next already makes `Send`:
@@ -250,6 +263,16 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   replacement changes what is heard (timeline, assets or settings; markers and in and out points
   don't), so an edit is heard within about 20 ms. Dropping the `Output` stops the
   stream thread and joins it, and the feeder exits after its current block.
+- **`tessera-export`** renders a project to a file. `export` takes a `Span` (the whole timeline,
+  or in to out when both points are set; `EmptyRange` when there is nothing) and a `Preset` (one of
+  six codec and container pairs). Every frame covering the range is decoded at sequence size
+  (`VideoDecoder::fit_within`, no frame cache), composited on the GPU with each clip's
+  `placement` (`picture.rs`, shared with the viewer) and handed with its share of the `Mixer`'s
+  samples to an encoder thread through a short bounded queue. It writes to a hidden sibling
+  `.<name>.<pid>.part` file and renames it over the target only when the encoder has finished; a
+  cancel (`Control::cancel`, checked every frame), a media file that fails to open or decode, or
+  sound the mixer cannot play (`Mixer::failed_media`) removes it. `Control` also reports progress
+  in frames.
 - **`tessera-render`** owns a `wgpu` Vulkan `Compositor` for compositing timeline frames. It
   doesn't depend on `tessera-media`: a `Layer` borrows a packed straight-alpha BGRA8 image shaped
   like `VideoFrame`, and `Compositor::composite` returns an owned sequence-sized `Frame`. It clears a
@@ -386,7 +409,7 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   simulation). The `Viewer` requests every video clip under the
   playhead as a layer, bottom to top (`Timeline::video_layers_at`, which leaves out muted tracks),
   each with its clip's transform and opacity (`Look`, turned into a `Placement` by
-  `viewer::placement`).
+  `tessera_export::placement`).
   A background job decodes the layers in parallel, one thread each, at the render size and
   composites them into a frame of that size, letterbox bars included, which becomes the GPUI image.
   The render size is the sequence scaled down uniformly (in steps of an eighth) to the viewer's
@@ -417,6 +440,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   first clip's value in its unit, steps one unit per wheel notch (ten with Shift), takes a typed
   value on click through a `TextField`, and resets with ↺; every change applies to all selected
   video clips as one `TransformClip` or `SetClipOpacity` command, and Reset Picture restores them.
+  Ctrl+E opens the `ExportDialog` (`export_dialog.rs`), which picks a preset (remembered for the
+  next export) and a range (in to out preselected when set); confirming asks for a file, appending
+  the container's extension, and `start_export` runs `tessera_export::export` on a snapshot of the
+  project on the background executor. One export runs at a time; while it does, a status strip
+  under the timeline shows its progress and a Cancel button, and editing goes on. A finished
+  export reports its encoders in a prompt, and a failure in a failure prompt.
   `TextField` (`text_field.rs`) is a single-line text input built on key events: it appends the
   typed character, backspace deletes, Enter submits and Escape cancels, emitting
   `TextFieldEvent`s, and it ignores keys with Ctrl or Alt. Every workspace binding is scoped to

@@ -1,15 +1,17 @@
 [package]
-name = "tessera-media"
+name = "tessera-export"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-ffmpeg-next.workspace = true
+tessera-audio.workspace = true
+tessera-media.workspace = true
+tessera-render.workspace = true
 tessera-timeline.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-[features]
-fixtures = []
+[dev-dependencies]
+tessera-media = { workspace = true, features = ["fixtures"] }

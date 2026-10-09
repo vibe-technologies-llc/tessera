@@ -1,28 +1,31 @@
-use std::{ffi::OsStr, path::PathBuf};
+use std::{ffi::OsStr, path::PathBuf, sync::Arc, time::Duration};
 
 use futures::{FutureExt, channel::oneshot, future::Shared};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, PromptLevel, Render, Styled, Subscription, Task, Window, div, px,
+    PathPromptOptions, PromptLevel, Render, StatefulInteractiveElement, Styled, Subscription, Task,
+    Window, div, px,
 };
 use tessera_document::EXTENSION;
+use tessera_export::{Control, Preset, Span};
 use tessera_timeline::{Command, Project, Revision, Time};
 
 use crate::{
     AddMarker, Cancel, ClearInOut, CopyClips, CutClips, CycleAudioStream, DeleteClip,
-    DuplicateClips, FocusSearch, Import, LowerClipGain, NEW_PROJECT_NAME, NewProject, NextEdit,
-    NextMarker, Open, OpenRecent, OpenSequenceSettings, PasteClips, Pause, PlayPause, PreviousEdit,
-    PreviousMarker, RaiseClipGain, Redo, RemoveMarker, RippleDeleteClip, Save, SaveAs, SelectAll,
-    SetInPoint, SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead, StepBackward,
-    StepForward, ToggleClipLink, ToggleSafeAreas, ToggleSnapping, Undo, WORKSPACE_CONTEXT, ZoomIn,
-    ZoomOut, ZoomToFit,
+    DuplicateClips, Export, FocusSearch, Import, LowerClipGain, NEW_PROJECT_NAME, NewProject,
+    NextEdit, NextMarker, Open, OpenRecent, OpenSequenceSettings, PasteClips, Pause, PlayPause,
+    PreviousEdit, PreviousMarker, RaiseClipGain, Redo, RemoveMarker, RippleDeleteClip, Save,
+    SaveAs, SelectAll, SetInPoint, SetOutPoint, ShuttleBackward, ShuttleForward, SplitAtPlayhead,
+    StepBackward, StepForward, ToggleClipLink, ToggleSafeAreas, ToggleSnapping, Undo,
+    WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomToFit,
     autosave::{AUTOSAVE_INTERVAL, AutosaveDirectory, Orphan, Slot, orphans},
     editor::ProjectEditor,
+    export_dialog::{ExportDialog, ExportDialogEvent},
     inspector::Inspector,
     media_bin::{MediaBin, file_name},
     playhead::Playhead,
     recent::{self, RecentDialogEvent, RecentProjects, RecentProjectsDialog},
-    sequence_dialog::{SequenceDialogEvent, SequenceSettingsDialog},
+    sequence_dialog::{SequenceDialogEvent, SequenceSettingsDialog, choice},
     theme,
     timeline::TimelinePanel,
     viewer::Viewer,
@@ -34,6 +37,9 @@ const INSPECTOR_WIDTH: f32 = 240.;
 const RECOVER: &str = "Recover";
 const DISCARD_RECOVERY: &str = "Discard";
 const RECOVERY_CHOICES: [&str; 3] = [RECOVER, DISCARD_RECOVERY, "Not Now"];
+const EXPORT_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const STATUS_HEIGHT: f32 = 28.;
+const PROGRESS_WIDTH: f32 = 240.;
 
 #[derive(Clone, Copy)]
 enum UnsavedChanges {
@@ -69,11 +75,20 @@ pub struct Workspace {
     autosave: Option<Slot>,
     autosaved: Option<Revision>,
     _autosave_timer: Option<Task<()>>,
+    export_preset: Preset,
+    export: Option<ExportJob>,
+}
+
+struct ExportJob {
+    path: PathBuf,
+    control: Arc<Control>,
+    _progress: Task<()>,
 }
 
 enum Dialog {
     SequenceSettings(Entity<SequenceSettingsDialog>),
     RecentProjects(Entity<RecentProjectsDialog>),
+    Export(Entity<ExportDialog>),
 }
 
 impl Dialog {
@@ -81,6 +96,7 @@ impl Dialog {
         match self {
             Self::SequenceSettings(dialog) => dialog.clone().into(),
             Self::RecentProjects(dialog) => dialog.clone().into(),
+            Self::Export(dialog) => dialog.clone().into(),
         }
     }
 }
@@ -145,6 +161,8 @@ impl Workspace {
             autosave,
             autosaved: None,
             _autosave_timer: autosave_timer,
+            export_preset: Preset::default(),
+            export: None,
         }
     }
 
@@ -316,6 +334,216 @@ impl Workspace {
         });
         self.dialog = Some((Dialog::RecentProjects(dialog), subscription));
         cx.notify();
+    }
+
+    fn open_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() || self.export.is_some() {
+            return;
+        }
+        let project = self.project().read(cx).clone();
+        let preset = self.export_preset;
+        let dialog = cx.new(|cx| ExportDialog::new(project, preset, window, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |workspace, _, event, window, cx| {
+            workspace.close_dialog(window, cx);
+            if let ExportDialogEvent::Export { preset, span } = *event {
+                workspace.export_preset = preset;
+                workspace.prompt_export(preset, span, window, cx);
+            }
+        });
+        self.dialog = Some((Dialog::Export(dialog), subscription));
+        cx.notify();
+    }
+
+    fn prompt_export(
+        &mut self,
+        preset: Preset,
+        span: Span,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let suggested_name = format!("{}.{}", self.name_without_extension(cx), preset.extension());
+        let directory = self
+            .file
+            .as_deref()
+            .and_then(|file| file.parent())
+            .map_or_else(default_directory, ToOwned::to_owned);
+        let chosen = cx.prompt_for_new_path(&directory, Some(&suggested_name));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(chosen) = chosen.await else {
+                return;
+            };
+            let chosen = match chosen {
+                Ok(Some(path)) => path,
+                Ok(None) => return,
+                Err(error) => {
+                    this.update_in(cx, |_, window, cx| {
+                        report_failure(
+                            "Could not show the export dialog",
+                            &format!("{error:#}"),
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let target = with_extension(chosen.clone(), preset.extension());
+            if target != chosen && target.exists() {
+                let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &format!("“{}” already exists. Replace it?", file_name(&target)),
+                        Some(
+                            "The dialog did not ask about this file, because Tessera added its extension.",
+                        ),
+                        &["Replace", "Cancel"],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                if answer.await.ok() != Some(0) {
+                    return;
+                }
+            }
+            this.update_in(cx, |workspace, window, cx| {
+                workspace.start_export(target, preset, span, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn start_export(
+        &mut self,
+        path: PathBuf,
+        preset: Preset,
+        span: Span,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.export.is_some() {
+            return;
+        }
+        let project = self.project().read(cx).clone();
+        let control = Arc::new(Control::default());
+        let exporting = cx.background_spawn({
+            let control = control.clone();
+            let path = path.clone();
+            async move { tessera_export::export(&project, span, preset, &path, &control) }
+        });
+        let progress = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(EXPORT_PROGRESS_INTERVAL)
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+        tracing::info!(path = %path.display(), preset = %preset.label(), "export started");
+        self.export = Some(ExportJob {
+            path,
+            control,
+            _progress: progress,
+        });
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let exported = exporting.await;
+            this.update_in(cx, |workspace, window, cx| {
+                workspace.export = None;
+                cx.notify();
+                match exported {
+                    Ok(exported) => {
+                        tracing::info!(
+                            path = %exported.path.display(),
+                            frames = exported.frames,
+                            encoder = exported.video_encoder,
+                            "export finished"
+                        );
+                        let detail = format!(
+                            "{} frames, encoded with {} ({}) and {}.",
+                            exported.frames,
+                            exported.video_encoder,
+                            exported.backend.label(),
+                            exported.audio_encoder
+                        );
+                        drop(window.prompt(
+                            PromptLevel::Info,
+                            &format!("Exported “{}”", file_name(&exported.path)),
+                            Some(&detail),
+                            &["OK"],
+                            cx,
+                        ));
+                    }
+                    Err(tessera_export::Error::Cancelled) => {
+                        tracing::info!("export cancelled");
+                    }
+                    Err(error) => {
+                        report_failure("Could not export", &error.to_string(), window, cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn cancel_export(&mut self, cx: &mut Context<Self>) {
+        if let Some(export) = &self.export {
+            export.control.cancel();
+            cx.notify();
+        }
+    }
+
+    fn export_status(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let export = self.export.as_ref()?;
+        let progress = export.control.progress();
+        let cancelling = export.control.is_cancelled();
+        let label = if cancelling {
+            format!("Cancelling the export of {}", file_name(&export.path))
+        } else {
+            format!("Exporting {}", file_name(&export.path))
+        };
+        Some(
+            div()
+                .h(px(STATUS_HEIGHT))
+                .flex_none()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .border_t_1()
+                .border_color(theme::border())
+                .bg(theme::panel())
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .child(
+                    div()
+                        .w(px(PROGRESS_WIDTH))
+                        .h(px(6.))
+                        .rounded_sm()
+                        .bg(theme::background())
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded_sm()
+                                .bg(theme::playhead())
+                                .w(gpui::relative(progress.fraction())),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(96.))
+                        .text_color(theme::text_muted())
+                        .child(format!("{} / {}", progress.done, progress.total)),
+                )
+                .child(
+                    choice("export-status-cancel", "Cancel".into(), false)
+                        .on_click(cx.listener(|workspace, _, _, cx| workspace.cancel_export(cx))),
+                ),
+        )
     }
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -600,6 +828,15 @@ impl Workspace {
         }
     }
 
+    fn name_without_extension(&self, cx: &App) -> String {
+        match &self.file {
+            Some(path) => path
+                .file_stem()
+                .map_or_else(|| self.name(cx), |stem| stem.to_string_lossy().into_owned()),
+            None => self.project().read(cx).name.clone(),
+        }
+    }
+
     fn title(&self, cx: &App) -> String {
         let name = self.name(cx);
         if self.editor.history().read(cx).is_saved() {
@@ -651,6 +888,9 @@ impl Render for Workspace {
                     workspace.open_sequence_settings(window, cx);
                 }),
             )
+            .on_action(cx.listener(|workspace, _: &Export, window, cx| {
+                workspace.open_export(window, cx);
+            }))
             .on_action(cx.listener(|workspace, _: &FocusSearch, window, cx| {
                 workspace
                     .media_bin
@@ -812,6 +1052,7 @@ impl Render for Workspace {
                     .border_color(theme::border())
                     .child(self.timeline.clone()),
             )
+            .children(self.export_status(cx))
     }
 }
 
@@ -827,11 +1068,15 @@ fn default_directory() -> PathBuf {
 }
 
 fn with_project_extension(path: PathBuf) -> PathBuf {
-    if path.extension() == Some(OsStr::new(EXTENSION)) {
+    with_extension(path, EXTENSION)
+}
+
+fn with_extension(path: PathBuf, extension: &str) -> PathBuf {
+    if path.extension() == Some(OsStr::new(extension)) {
         return path;
     }
     let mut path = path.into_os_string();
-    path.push(format!(".{EXTENSION}"));
+    path.push(format!(".{extension}"));
     path.into()
 }
 
@@ -1130,6 +1375,91 @@ mod tests {
         assert!(!crashed.project().exists());
         assert!(autosave_path(&workspace, cx).exists());
         assert!(orphans(&directory).is_empty());
+    }
+
+    fn fixture_project(fixture: &tessera_media::fixture::Fixture) -> Project {
+        let mut project = Project::new("Exported");
+        let mut settings = project.settings;
+        settings.width = NonZero::new(tessera_media::fixture::WIDTH).unwrap();
+        settings.height = NonZero::new(tessera_media::fixture::HEIGHT).unwrap();
+        settings.frame_rate = tessera_media::fixture::FRAME_RATE;
+        project.set_settings(settings);
+        let info = tessera_media::probe(fixture.path()).unwrap();
+        let asset = project.add_asset(fixture.path().to_owned(), info);
+        project.place_linked(asset, 0, Time::ZERO).unwrap();
+        project
+    }
+
+    #[gpui::test]
+    fn an_export_runs_in_the_background_and_reports_when_it_is_done(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("export");
+        let path = dir.0.join("cut.mp4");
+        let source = tessera_media::fixture::Fixture::generate("ui-export");
+        let project = cx.new(|_| fixture_project(&source));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.start_export(path.clone(), Preset::default(), Span::Timeline, window, cx);
+        });
+
+        assert!(cx.read(|cx| workspace.read(cx).export.is_some()));
+
+        cx.run_until_parked();
+
+        let (message, _) = cx.pending_prompt().unwrap();
+
+        assert_eq!(message, "Exported “cut.mp4”");
+        assert!(cx.read(|cx| workspace.read(cx).export.is_none()));
+
+        cx.simulate_prompt_answer("Ok");
+        let info = tessera_media::probe(&path).unwrap();
+
+        assert_eq!(info.video().count(), 1);
+        assert_eq!(info.audio().count(), 1);
+    }
+
+    #[gpui::test]
+    fn a_cancelled_export_leaves_nothing_behind(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let dir = ScratchDir::new("export-cancel");
+        let path = dir.0.join("cut.mp4");
+        let source = tessera_media::fixture::Fixture::generate("ui-export-cancel");
+        let project = cx.new(|_| fixture_project(&source));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.start_export(path.clone(), Preset::default(), Span::Timeline, window, cx);
+            workspace.cancel_export(cx);
+        });
+        cx.run_until_parked();
+
+        assert!(!cx.has_pending_prompt());
+        assert!(cx.read(|cx| workspace.read(cx).export.is_none()));
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[gpui::test]
+    fn ctrl_e_opens_the_export_dialog_with_the_last_format(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let project = cx.new(|_| sample_project("test", "a.mkv"));
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::new(project, window, cx));
+        workspace.update(cx, |workspace, _| {
+            workspace.export_preset = Preset::ALL[4];
+        });
+
+        cx.simulate_keystrokes("ctrl-e");
+
+        let preset = cx.read(|cx| match &workspace.read(cx).dialog {
+            Some((Dialog::Export(dialog), _)) => Some(dialog.read(cx).preset()),
+            _ => None,
+        });
+
+        assert_eq!(preset, Some(Preset::ALL[4]));
+
+        cx.simulate_keystrokes("escape");
+
+        assert!(cx.read(|cx| workspace.read(cx).dialog.is_none()));
     }
 
     #[gpui::test]

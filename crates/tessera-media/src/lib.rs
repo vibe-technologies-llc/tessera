@@ -1,13 +1,17 @@
 mod audio;
 mod cache;
 mod decode;
-#[cfg(test)]
-mod fixture;
+mod encode;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixture;
 mod hw;
 mod probe;
 
 pub use audio::{AudioBuffer, AudioDecoder};
 pub use decode::{VideoDecoder, VideoFrame};
+pub use encode::{
+    Container, EncodeBackend, EncodeSettings, Encoder, PREFERRED_ENCODE_BACKENDS, VideoCodec,
+};
 pub use ffmpeg_next::Error as FfmpegError;
 pub use hw::{HwAccel, PREFERRED_HW_ACCELS, available_hw_accels};
 pub use probe::probe;
@@ -66,6 +70,38 @@ pub enum Error {
     },
     #[error("no video frame could be decoded from {path}")]
     NoFrame { path: std::path::PathBuf },
+    #[error("failed to create {path}: {source}")]
+    CreateOutput {
+        path: std::path::PathBuf,
+        #[source]
+        source: FfmpegError,
+    },
+    #[error("no {} encoder could be opened", codec.label())]
+    NoVideoEncoder { codec: VideoCodec },
+    #[error("no audio encoder for {} at {sample_rate} Hz could be opened", container.label())]
+    NoAudioEncoder {
+        container: Container,
+        sample_rate: std::num::NonZeroU32,
+    },
+    #[error("no {accel:?} device is available for encoding")]
+    HardwareDevice { accel: HwAccel },
+    #[error("failed to upload a frame to the hardware encoder: {source}")]
+    HardwareUpload {
+        #[source]
+        source: FfmpegError,
+    },
+    #[error("a frame of {actual} bytes was given where {expected} were expected")]
+    FrameSize { expected: usize, actual: usize },
+    #[error("failed to encode: {source}")]
+    Encode {
+        #[source]
+        source: FfmpegError,
+    },
+    #[error("failed to write the output: {source}")]
+    Mux {
+        #[source]
+        source: FfmpegError,
+    },
 }
 
 pub fn init() -> Result<(), Error> {

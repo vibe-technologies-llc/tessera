@@ -11,6 +11,7 @@ gpui.workspace = true
 image.workspace = true
 tessera-audio.workspace = true
 tessera-document.workspace = true
+tessera-export.workspace = true
 tessera-timeline.workspace = true
 tessera-media.workspace = true
 tessera-render.workspace = true
@@ -19,3 +20,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+tessera-media = { workspace = true, features = ["fixtures"] }

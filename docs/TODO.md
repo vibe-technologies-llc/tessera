@@ -29,14 +29,6 @@
   external memory
 - Cross-dissolve and dip-to-colour transitions
 
-## Export
-
-- Encode the composited timeline with hardware encoders (VAAPI, NVENC, Vulkan Video), falling back
-  to software
-- Mux the mixed audio alongside the video
-- An export dialog with presets for H.264, HEVC and AV1 in MP4 and MKV
-- Run exports in the background with progress and cancellation
-
 ## Direction
 
 - Keyframed clip properties with an easing curve editor

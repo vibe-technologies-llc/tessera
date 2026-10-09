@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 tessera-audio.path = "crates/tessera-audio"
 tessera-document.path = "crates/tessera-document"
+tessera-export.path = "crates/tessera-export"
 tessera-media.path = "crates/tessera-media"
 tessera-render.path = "crates/tessera-render"
 tessera-timeline.path = "crates/tessera-timeline"
