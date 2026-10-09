@@ -29,6 +29,10 @@
   external memory
 - Cross-dissolve and dip-to-colour transitions
 
+## Export
+
+- An FFV1 preset in MKV for lossless archival exports
+
 ## Direction
 
 - Keyframed clip properties with an easing curve editor
