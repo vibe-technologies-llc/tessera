@@ -21,6 +21,7 @@ ffmpeg-next = "=9.0.0"
 futures = { version = "=0.3.34", default-features = false, features = ["std"] }
 gpui = "=0.2.2"
 image = "=0.25.10"
+libc = "=0.2.189"
 pipewire = { version = "=0.10.1", features = ["v0_3_50"] }
 pollster = "=1.0.1"
 serde = { version = "=1.0.229", features = ["derive"] }

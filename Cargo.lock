@@ -5855,6 +5855,7 @@ dependencies = [
  "futures",
  "gpui",
  "image",
+ "libc",
  "tessera-audio",
  "tessera-document",
  "tessera-export",

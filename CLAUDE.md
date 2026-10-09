@@ -503,7 +503,9 @@ needs clang) and a Vulkan driver.
   bumped. Check the registry for the current version (`cargo search`, `cargo info`) rather than writing one
   from memory. Every version lives in root `[workspace.dependencies]`, and member crates use
   `name.workspace = true`. `rust-formatter` also formats the `Cargo.toml` files (dotted keys, and
-  long inline tables wrapped), so let it decide the layout.
+  long inline tables wrapped), so let it decide the layout. The one exception to the newest
+  release is `libc`, held at `=0.2.189` through `tessera-ui` because newer releases drop the
+  `ENOATTR` that GPUI's `xattr` 0.2.3 needs; move it only once GPUI no longer pulls that `xattr`.
 - **Imports are grouped std, external, crate**, with one merged `use` per crate. `rust-formatter`
   enforces this (`StdExternalCrate` grouping, `Crate` granularity), so write imports that way and
   let it settle the rest.
