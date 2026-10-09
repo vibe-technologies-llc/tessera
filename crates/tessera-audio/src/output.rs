@@ -401,6 +401,7 @@ mod tests {
 
         assert_eq!(firsts, [0]);
 
+        wait_for_queue(&shared, BLOCK_FRAMES - 1);
         {
             let mut state = shared.lock();
             state.queue.drain(..100 * CHANNELS);
