@@ -1,6 +1,6 @@
 use gpui::{
     AnyView, App, AppContext, ClickEvent, Context, ElementId, Entity, InteractiveElement,
-    IntoElement, ParentElement, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    IntoElement, ParentElement, Render, ScrollEvent, SharedString, StatefulInteractiveElement,
     Styled, Window, div, prelude::FluentBuilder, px,
 };
 use tessera_timeline::{Gain, Timeline, Track, TrackHeight, TrackKind};
@@ -309,8 +309,8 @@ fn volume_readout(index: usize, volume: Gain, cx: &Context<TimelinePanel>) -> im
         .tooltip(tooltip(
             "Scroll to change the volume, double-click to reset it",
         ))
-        .on_scroll_wheel(cx.listener(
-            move |panel: &mut TimelinePanel, event: &ScrollWheelEvent, window, cx| {
+        .on_scroll(cx.listener(
+            move |panel: &mut TimelinePanel, event: &ScrollEvent, window, cx| {
                 cx.stop_propagation();
                 let delta = event.delta.pixel_delta(window.line_height()).y;
                 let step = match f32::from(delta) {

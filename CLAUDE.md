@@ -297,7 +297,8 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   existing file the dialog did not know about), Ctrl+Shift+S always asks, Ctrl+O opens one and
   Ctrl+N starts an empty `NEW_PROJECT_NAME` project (after the same unsaved-changes prompt); the
   `Workspace` does the file IO on the background executor through `save_to` and `open_from`, one
-  job at a time in the order they were asked for (`queue_file_io`), reports failures in a prompt,
+  job at a time in the order they were asked for (`queue_file_io`, where a job starts only once
+  the `FileIo` of the one before, held while its result is handled, is dropped), reports failures in a prompt,
   and titles the window after the file. A save marks the revision it snapshotted, not the one
   current when it finishes, and the `Workspace` observes the history to mark the title (`• `)
   while the project differs from that revision. While it does, Ctrl+Q, closing the window and
@@ -473,9 +474,12 @@ A Cargo workspace under `crates/`. Dependencies point one way:
   project in, takes the orphan over as the session's own slot and leaves the project marked
   unsaved (`History::mark_unsaved`) under the file it came from.
 - **`tessera`** sets up tracing (`RUST_LOG`, `info` by default), initialises the media backend,
-  points the UI at the state directory and opens the main window.
+  points the UI at the state directory and opens the main window through
+  `gpui_platform::application()`.
 
-GPUI 0.2.2 renders through blade and cannot share a `wgpu` device. Until that changes, composited
+GPUI comes from Zed's git repository (`gpui` and `gpui_platform` at one `rev`, the platform with
+its `wayland` and `x11` features). It renders through `gpui_wgpu` on a git revision of `wgpu`, not
+the release `tessera-render` uses, so it cannot share a `wgpu` device. Until it can, composited
 frames reach the viewer as a GPUI image read back to the CPU, not through a shared GPU texture.
 
 ## Commands
@@ -503,9 +507,8 @@ needs clang) and a Vulkan driver.
   bumped. Check the registry for the current version (`cargo search`, `cargo info`) rather than writing one
   from memory. Every version lives in root `[workspace.dependencies]`, and member crates use
   `name.workspace = true`. `rust-formatter` also formats the `Cargo.toml` files (dotted keys, and
-  long inline tables wrapped), so let it decide the layout. The one exception to the newest
-  release is `libc`, held at `=0.2.189` through `tessera-ui` because newer releases drop the
-  `ENOATTR` that GPUI's `xattr` 0.2.3 needs; move it only once GPUI no longer pulls that `xattr`.
+  long inline tables wrapped), so let it decide the layout. GPUI's git `rev` moves to the head of
+  Zed's `main` when dependencies are bumped (`git ls-remote https://github.com/zed-industries/zed main`).
 - **Imports are grouped std, external, crate**, with one merged `use` per crate. `rust-formatter`
   enforces this (`StdExternalCrate` grouping, `Crate` granularity), so write imports that way and
   let it settle the rest.

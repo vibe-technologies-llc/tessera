@@ -42,7 +42,7 @@ impl ExportDialog {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
         let span = if Span::InToOut.range(&project).is_some() {
             Span::InToOut
         } else {

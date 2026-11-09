@@ -9,7 +9,6 @@ publish.workspace = true
 futures.workspace = true
 gpui.workspace = true
 image.workspace = true
-libc.workspace = true
 tessera-audio.workspace = true
 tessera-document.workspace = true
 tessera-export.workspace = true

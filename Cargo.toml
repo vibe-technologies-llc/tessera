@@ -19,13 +19,22 @@ tessera-ui.path = "crates/tessera-ui"
 anyhow = "=1.0.104"
 ffmpeg-next = "=9.0.0"
 futures = { version = "=0.3.34", default-features = false, features = ["std"] }
-gpui = "=0.2.2"
+gpui = {
+    git = "https://github.com/zed-industries/zed",
+    rev = "4ed72e0135aaab74a43914491c915dd6cbd10c67",
+    default-features = false
+}
+gpui_platform = {
+    git = "https://github.com/zed-industries/zed",
+    rev = "4ed72e0135aaab74a43914491c915dd6cbd10c67",
+    default-features = false,
+    features = ["wayland", "x11"]
+}
 image = "=0.25.10"
-libc = "=0.2.189"
 pipewire = { version = "=0.10.1", features = ["v0_3_50"] }
 pollster = "=1.0.1"
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 thiserror = "=2.0.21"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }

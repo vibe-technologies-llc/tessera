@@ -1,5 +1,4 @@
 use anyhow::Context;
-use gpui::Application;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
@@ -13,7 +12,7 @@ fn main() -> anyhow::Result<()> {
         "media backend ready"
     );
 
-    Application::new().run(|cx| {
+    gpui_platform::application().run(|cx| {
         tessera_ui::init(cx);
         tessera_ui::use_state_directory(cx);
         if let Err(error) = tessera_ui::open_main_window(

@@ -203,7 +203,7 @@ fn quit(_: &Quit, cx: &mut App) {
                 return;
             }
         }
-        cx.update(|cx| cx.quit()).ok();
+        cx.update(|cx| cx.quit());
     })
     .detach();
 }

@@ -261,7 +261,7 @@ impl MediaBin {
 
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let field = self.search_field(window, cx);
-        field.read(cx).focus(window);
+        field.update(cx, |field, cx| field.focus(window, cx));
     }
 
     fn search_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextField> {
@@ -277,10 +277,10 @@ impl MediaBin {
                     bin.query = query.clone();
                     cx.notify();
                 }
-                TextFieldEvent::Submitted(_) => bin.give_focus_back(window),
+                TextFieldEvent::Submitted(_) => bin.give_focus_back(window, cx),
                 TextFieldEvent::Cancelled => {
                     field.update(cx, |field, cx| field.clear(cx));
-                    bin.give_focus_back(window);
+                    bin.give_focus_back(window, cx);
                 }
             },
         ));
@@ -288,9 +288,9 @@ impl MediaBin {
         field
     }
 
-    fn give_focus_back(&self, window: &mut Window) {
+    fn give_focus_back(&self, window: &mut Window, cx: &mut App) {
         if let Some(handle) = &self.focus_return {
-            window.focus(handle);
+            window.focus(handle, cx);
         }
     }
 

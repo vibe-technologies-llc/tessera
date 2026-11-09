@@ -85,6 +85,17 @@ struct ExportJob {
     _progress: Task<()>,
 }
 
+struct FileIo<R> {
+    result: oneshot::Receiver<R>,
+    _handled: oneshot::Sender<()>,
+}
+
+impl<R> FileIo<R> {
+    fn result(&mut self) -> &mut oneshot::Receiver<R> {
+        &mut self.result
+    }
+}
+
 enum Dialog {
     SequenceSettings(Entity<SequenceSettingsDialog>),
     RecentProjects(Entity<RecentProjectsDialog>),
@@ -104,7 +115,7 @@ impl Dialog {
 impl Workspace {
     pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
         let playhead = cx.new(|cx| Playhead::new(project.clone(), cx));
         let editor = ProjectEditor::new(project.clone(), cx);
         cx.observe_in(editor.history(), window, |workspace, _, window, cx| {
@@ -182,9 +193,9 @@ impl Workspace {
         self.autosaved = Some(revision);
         let project = self.project().read(cx).clone();
         let file = self.file.clone();
-        let writing = self.queue_file_io(cx, move || slot.write(&project, file.as_deref()));
+        let mut writing = self.queue_file_io(cx, move || slot.write(&project, file.as_deref()));
         cx.spawn(async move |this, cx| {
-            if let Ok(Err(error)) = writing.await {
+            if let Ok(Err(error)) = writing.result().await {
                 tracing::warn!(%error, "could not autosave the project");
                 this.update(cx, |workspace, _| {
                     if workspace.autosaved == Some(revision) {
@@ -291,9 +302,9 @@ impl Workspace {
             return;
         };
         self.autosaved = Some(self.editor.revision(cx));
-        let adopting = self.queue_file_io(cx, move || slot.adopt(&orphan));
+        let mut adopting = self.queue_file_io(cx, move || slot.adopt(&orphan));
         cx.spawn(async move |_, _| {
-            if let Ok(Err(error)) = adopting.await {
+            if let Ok(Err(error)) = adopting.result().await {
                 tracing::warn!(%error, "could not take over the recovered autosave");
             }
         })
@@ -548,7 +559,7 @@ impl Workspace {
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = None;
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -698,12 +709,12 @@ impl Workspace {
     ) -> Task<bool> {
         let project = self.project().read(cx).clone();
         let revision = self.editor.revision(cx);
-        let saving = self.queue_file_io(cx, {
+        let mut saving = self.queue_file_io(cx, {
             let path = path.clone();
             move || tessera_document::save(&project, &path)
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(saved) = saving.await else {
+            let Ok(saved) = saving.result().await else {
                 return false;
             };
             this.update_in(cx, |workspace, window, cx| match saved {
@@ -756,12 +767,12 @@ impl Workspace {
     }
 
     pub fn open_from(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let opening = self.queue_file_io(cx, {
+        let mut opening = self.queue_file_io(cx, {
             let path = path.clone();
             move || tessera_document::open(&path)
         });
         cx.spawn_in(window, async move |this, cx| {
-            let project = match opening.await {
+            let project = match opening.result().await {
                 Ok(Ok(project)) => project,
                 Ok(Err(error)) => {
                     this.update_in(cx, |_, window, cx| {
@@ -773,6 +784,7 @@ impl Workspace {
                 }
                 Err(oneshot::Canceled) => return,
             };
+            drop(opening);
             let Ok(confirming) = this.update_in(cx, |workspace, window, cx| {
                 workspace.confirm_discard(window, cx)
             }) else {
@@ -795,16 +807,21 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
         job: impl FnOnce() -> R + Send + 'static,
-    ) -> oneshot::Receiver<R> {
-        let (sender, receiver) = oneshot::channel();
+    ) -> FileIo<R> {
+        let (sender, result) = oneshot::channel();
+        let (handled, awaiting_handling) = oneshot::channel::<()>();
         let previous = self.file_io.clone();
         self.file_io = cx
             .background_spawn(async move {
                 previous.await;
                 sender.send(job()).ok();
+                awaiting_handling.await.ok();
             })
             .shared();
-        receiver
+        FileIo {
+            result,
+            _handled: handled,
+        }
     }
 
     fn replace_project(&mut self, project: Project, cx: &mut Context<Self>) {
@@ -1286,7 +1303,7 @@ mod tests {
             workspace.open_from(second.clone(), window, cx);
         });
         cx.run_until_parked();
-        cx.simulate_prompt_answer("Ok");
+        cx.simulate_prompt_answer("OK");
 
         assert_eq!(recent_paths(cx), [first]);
     }
@@ -1412,7 +1429,7 @@ mod tests {
         assert_eq!(message, "Exported “cut.mp4”");
         assert!(cx.read(|cx| workspace.read(cx).export.is_none()));
 
-        cx.simulate_prompt_answer("Ok");
+        cx.simulate_prompt_answer("OK");
         let info = tessera_media::probe(&path).unwrap();
 
         assert_eq!(info.video().count(), 1);
@@ -1484,7 +1501,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        assert!(!cx.has_pending_prompt());
+        assert_eq!(cx.pending_prompt(), None);
         assert_eq!(tessera_document::open(&path).unwrap(), edited);
         assert_eq!(current(&workspace, cx), edited);
         assert_eq!(cx.window_title().as_deref(), Some("cut.tessera — Tessera"));

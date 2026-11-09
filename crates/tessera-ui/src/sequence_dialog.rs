@@ -41,7 +41,9 @@ impl SequenceSettingsDialog {
         let subscriptions = vec![
             cx.subscribe_in(&width, window, |dialog, _, event, window, cx| match event {
                 TextFieldEvent::Changed(_) => cx.notify(),
-                TextFieldEvent::Submitted(_) => dialog.height.read(cx).focus(window),
+                TextFieldEvent::Submitted(_) => dialog
+                    .height
+                    .update(cx, |field, cx| field.focus(window, cx)),
                 TextFieldEvent::Cancelled => cx.emit(SequenceDialogEvent::Cancelled),
             }),
             cx.subscribe_in(&height, window, |dialog, _, event, _, cx| match event {
@@ -50,7 +52,7 @@ impl SequenceSettingsDialog {
                 TextFieldEvent::Cancelled => cx.emit(SequenceDialogEvent::Cancelled),
             }),
         ];
-        width.read(cx).focus(window);
+        width.update(cx, |field, cx| field.focus(window, cx));
         Self {
             width,
             height,

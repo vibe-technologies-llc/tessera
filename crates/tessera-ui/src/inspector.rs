@@ -1,6 +1,6 @@
 use gpui::{
     AppContext, ClickEvent, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    ParentElement, Render, ScrollEvent, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Window, div, px,
 };
 use tessera_timeline::{Clip, Command, Opacity, Project, TrackKind, Transform, TransformField};
@@ -231,7 +231,7 @@ impl Inspector {
                 inspector.finish_editing(None, window, cx);
             }),
         ];
-        field.read(cx).focus(window);
+        field.update(cx, |field, cx| field.focus(window, cx));
         self.editing = Some(Editing {
             property,
             field,
@@ -254,7 +254,7 @@ impl Inspector {
             self.set(editing.property, |_| raw, cx);
         }
         if let Some(handle) = &self.focus_return {
-            window.focus(handle);
+            window.focus(handle, cx);
         }
         cx.notify();
     }
@@ -275,8 +275,8 @@ impl Inspector {
                 .rounded_sm()
                 .cursor_ns_resize()
                 .hover(|style| style.bg(theme::hover()))
-                .on_scroll_wheel(cx.listener(
-                    move |inspector, event: &ScrollWheelEvent, window, cx| {
+                .on_scroll(
+                    cx.listener(move |inspector, event: &ScrollEvent, window, cx| {
                         cx.stop_propagation();
                         let delta = event.delta.pixel_delta(window.line_height()).y;
                         let direction = match f32::from(delta) {
@@ -290,8 +290,8 @@ impl Inspector {
                             1
                         };
                         inspector.step(property, direction * steps, cx);
-                    },
-                ))
+                    }),
+                )
                 .on_click(cx.listener(move |inspector, _: &ClickEvent, window, cx| {
                     inspector.start_editing(property, window, cx);
                 }))

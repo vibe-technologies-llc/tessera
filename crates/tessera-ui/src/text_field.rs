@@ -1,5 +1,5 @@
 use gpui::{
-    Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    App, Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, SharedString, Styled, Window, div, px,
 };
 
@@ -41,8 +41,8 @@ impl TextField {
         &self.focus_handle
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        window.focus(&self.focus_handle);
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus_handle, cx);
     }
 
     pub fn value(&self) -> &str {
@@ -132,7 +132,7 @@ mod tests {
     ) -> (gpui::Entity<TextField>, &'a mut VisualTestContext) {
         let value = value.to_owned();
         let (field, cx) = cx.add_window_view(|_, cx| TextField::new(value, "type here", cx));
-        field.update_in(cx, |field, window, _| field.focus(window));
+        field.update_in(cx, |field, window, cx| field.focus(window, cx));
         (field, cx)
     }
 

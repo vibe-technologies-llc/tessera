@@ -9,7 +9,7 @@ use gpui::{
     App, AppContext, Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity,
     FocusHandle, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, Rgba,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, TextAlign, Window,
     canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use tessera_timeline::{
@@ -402,7 +402,7 @@ impl TimelinePanel {
                 panel.finish_rename(None, window, cx);
             }),
         ];
-        field.read(cx).focus(window);
+        field.update(cx, |field, cx| field.focus(window, cx));
         self.renaming = Some(Rename {
             target,
             field,
@@ -430,7 +430,7 @@ impl TimelinePanel {
             (None, _) => {}
         }
         if let Some(handle) = &self.focus_return {
-            window.focus(handle);
+            window.focus(handle, cx);
         }
         cx.notify();
     }
@@ -954,7 +954,7 @@ impl TimelinePanel {
         self.set_viewport(viewport, cx);
     }
 
-    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+    fn scroll_wheel(&mut self, event: &ScrollEvent, window: &Window, cx: &mut Context<Self>) {
         let delta = event.delta.pixel_delta(window.line_height());
         cx.stop_propagation();
         if event.modifiers.shift {
@@ -1602,7 +1602,7 @@ impl Render for TimelinePanel {
             .on_drop(cx.listener(|panel, dragged: &DraggedClip, _, cx| {
                 panel.drop_clip_edge(dragged, cx);
             }))
-            .on_scroll_wheel(cx.listener(|panel, event, window, cx| {
+            .on_scroll(cx.listener(|panel, event, window, cx| {
                 panel.scroll_wheel(event, window, cx);
             }))
             .child(
@@ -2087,7 +2087,7 @@ fn paint_ticks(
                 .text_system()
                 .shape_line(label, font_size, &[run], None);
             let origin = point(x + px(LABEL_INSET), bounds.top());
-            if let Err(error) = line.paint(origin, line_height, window, cx) {
+            if let Err(error) = line.paint(origin, line_height, TextAlign::Left, None, window, cx) {
                 tracing::warn!(%error, "failed to paint a ruler label");
             }
         }
@@ -2250,7 +2250,9 @@ fn ruler_step(pixels_per_second: f32, frame_rate: FrameRate) -> RulerStep {
 mod tests {
     use std::num::{NonZero, NonZeroI64};
 
-    use gpui::{Modifiers, Point, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext};
+    use gpui::{
+        Modifiers, Point, ScrollDelta, ScrollSource, TestAppContext, TouchPhase, VisualTestContext,
+    };
     use tessera_timeline::{MediaInfo, Stream, TrackHeight, VideoStream};
 
     use super::{header::*, *};
@@ -2572,11 +2574,12 @@ mod tests {
             panel.update(cx, |panel, cx| panel.add_track(TrackKind::Audio, cx));
         }
         let wheel = |cx: &mut VisualTestContext, pixels: f32| {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: point(at(4.), px(V1)),
                 delta: ScrollDelta::Pixels(point(px(0.), px(pixels))),
                 modifiers: Modifiers::shift(),
                 touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
             });
         };
         let scroll = |cx: &mut VisualTestContext| cx.read(|cx| panel.read(cx).track_scroll);
@@ -2755,14 +2758,14 @@ mod tests {
     fn a_trim_released_over_another_lane_or_the_ruler_still_commits(cx: &mut TestAppContext) {
         let (panel, cx, clip) = timeline_with_a_clip(cx);
 
-        drag_to(cx, at(9.) - px(2.), point(at(7.) - px(2.), row_y(0)));
+        drag_to(cx, at(9.) - px(4.), point(at(7.) - px(4.), row_y(0)));
 
         assert_eq!(
             clip_of(&panel, cx, clip).timeline_range().end(),
             Time::from_seconds(7)
         );
 
-        drag_to(cx, at(7.) - px(2.), point(at(5.) - px(2.), px(4.)));
+        drag_to(cx, at(7.) - px(4.), point(at(5.) - px(4.), px(4.)));
 
         assert_eq!(
             clip_of(&panel, cx, clip).timeline_range().end(),
@@ -3276,11 +3279,12 @@ mod tests {
             header_line_y(A1_ROW, 1),
         );
         let scroll = |cx: &mut VisualTestContext, lines: f32| {
-            cx.simulate_event(ScrollWheelEvent {
+            cx.simulate_event(ScrollEvent {
                 position: readout,
                 delta: ScrollDelta::Lines(point(0., lines)),
                 modifiers: Modifiers::none(),
                 touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
             });
         };
         let volume = |cx: &mut VisualTestContext| track_of(&panel, cx, 2).volume.tenths();
